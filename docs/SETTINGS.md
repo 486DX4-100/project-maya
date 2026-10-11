@@ -112,7 +112,8 @@ reports N as its concurrency.
   CPU lane off: checked with 2 and 4 at once). Real chat questions on a V100 32 GB that streams most of Maya-S's
   experts from RAM: 21.2 tok/s in all for two at once against 15.0 one after another (x1.41), x1.35 for four. Each
   conversation brings its own experts, so on a card that holds only part of them they share its VRAM; the more of the
-  model VRAM holds, the less they compete.
+  model VRAM holds, the less they compete. With every expert in GPU memory (a Strix Halo with Maya-S): x1.67 for two at
+  once and x2.02 for four.
 - **Two GPUs or more:** each card works on a different request, one behind the other.
 - **A request alone** decodes as fast as before (on a split, with the speculative decode).
 
