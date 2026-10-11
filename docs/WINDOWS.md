@@ -53,7 +53,7 @@ and measured on Linux; on Windows 11 a user runs Maya-L on an RTX 4090, built wi
 - After setup, stop any running Maya server and run `.\START-MAYA.bat --calibrate --no-start` to tune the CPU/PCIe
   split and thread count for your PC. Then start Maya normally. See [Tuning](SETTINGS.md) for the optional RAM-resident
   tier and other settings, and [Something went wrong?](../README.md#something-went-wrong) for `--bench` / `--report`.
-- Not WSL2: Strata measured that WSL2's GPU driver pins only about 1 GB of RAM, and Maya pins tens of GB. Run
+- Not WSL2: WSL2's GPU driver pins only about 1 GB of RAM, and Maya pins tens of GB. Run
   `START-MAYA.bat` in Windows itself.
 - A Tesla V100 runs it too, built with CUDA 12.4 ([#57](https://github.com/mw00/project-maya/issues/57)). Run
   `--calibrate` once: it tunes Maya for your PC, and a setup for another context keeps its settings.
