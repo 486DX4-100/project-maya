@@ -1848,13 +1848,13 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     if (!cached) {
     // ---- calibration, each lane alone: the CPU after 100 ms of the same work (an idle CPU's clocks take tens of ms to
     //      ramp up - a decode keeps them up), then five rounds of 16 runs ~100 ms apart (the same work between them
-    //      keeps the clocks up), and an expert's time is the middle round's median.  One round takes ~40 ms, so a
+    //      keeps the clocks up), and an expert's time is the fastest round's median.  One round takes ~40 ms, so a
     //      burst of other work on the CPU (the OS reclaiming memory after the RAM tier was pinned, a desktop's
     //      background jobs) covered all of its runs at once: one start timed 0.63 ms an expert against the usual 0.32,
-    //      its CPU lane took half its share and decode lost 16% for the engine's life (#56) - the middle of five
-    //      leaves out a burst over one or two.  Not the fastest round: that is the CPU alone, as a decode never has it
-    //      (a split's other lanes, the disk reads), and it gave a 2x RTX 3080 split's lanes two thirds of the RAM-tier
-    //      experts where v1.0.32's timing gave them half - the lane 25% slower a token (#105)
+    //      its CPU lane took half its share and decode lost 16% for the engine's life (#56).  Interference only adds
+    //      time, so the fastest round is the CPU's own speed.  (The middle round instead gave a 2x V100 split's first
+    //      lane 0.85 ms an expert against the fastest round's 0.74, a plan with one RAM-tier expert less on the CPU,
+    //      twice the PCIe fetches and decode 5-10% slower)
     const auto median16 = [](std::array<double, 16>& v) {
         std::sort(v.begin(), v.end());
         return 0.5 * (v[7] + v[8]);
@@ -1870,7 +1870,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     };
     busy(100);
     std::array<double, 16> runs{};
-    std::array<double, 5> rounds{};
+    double best = 0.0;
     for (int round = 0; round < 5; ++round) {
         if (round > 0) busy(100);
         for (int rep = 0; rep < 16; ++rep) {
@@ -1879,10 +1879,10 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             fast_cpu_experts(il_cal, n_cal, cals, w4, x.data(), out.data());
             runs[(size_t) rep] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         }
-        rounds[(size_t) round] = median16(runs);
+        const double med = median16(runs);
+        best = round == 0 ? med : std::min(best, med);
     }
-    std::sort(rounds.begin(), rounds.end());
-    c_ms = rounds[2] / n_cal;   // an expert's share of a call
+    c_ms = best / n_cal;   // an expert's share of a call
     cudaEvent_t e0 = nullptr, e1 = nullptr;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
