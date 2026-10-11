@@ -54,6 +54,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 #endif
 #ifdef __linux__
 #include <sched.h>
@@ -367,6 +368,50 @@ static void numa_pinned_free(void* p, size_t bytes) {
 #else
     (void) p;
     (void) bytes;
+#endif
+}
+
+// Windows with two NUMA nodes or more (#56): each start of the engine runs in ONE processor group (a socket's CPUs,
+// on a PC with more than 64 logical ones) - the next start often in the other - while the driver places the RAM tier's
+// pinned pages where it will, and a CPU lane on the far socket reads them slower (two Xeon E5-2696 v3: 0.85 ms an
+// expert against 0.71, start by start).  Said at start: the group and node the engine runs in, and the nodes of 256
+// of the tier's pages (those Windows reports)
+static void numa_report_win(int dev, const std::vector<std::pair<const uint8_t*, size_t>>& tiers) {
+#ifdef _WIN32
+    ULONG hi = 0;
+    if (!GetNumaHighestNodeNumber(&hi) || hi == 0) return;
+    PROCESSOR_NUMBER pn{};
+    GetCurrentProcessorNumberEx(&pn);
+    USHORT node = 0xffff;
+    GetNumaProcessorNodeEx(&pn, &node);
+    size_t total = 0;
+    for (const auto& t : tiers) total += t.second;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> q;
+    for (size_t i = 0; i < 256 && total > 0; ++i) {
+        size_t at = total / 256 * i, k = 0;
+        while (k < tiers.size() && at >= tiers[k].second) at -= tiers[k++].second;
+        if (k == tiers.size()) break;
+        PSAPI_WORKING_SET_EX_INFORMATION e{};
+        e.VirtualAddress = (PVOID) (tiers[k].first + at);
+        q.push_back(e);
+    }
+    int on[64] = {}, unknown = 0;
+    if (!q.empty() && QueryWorkingSetEx(GetCurrentProcess(), q.data(), (DWORD) (q.size() * sizeof q[0]))) {
+        for (const auto& e : q)
+            if (e.VirtualAttributes.Valid) ++on[e.VirtualAttributes.Node & 63];
+            else ++unknown;
+    } else {
+        unknown = (int) q.size();
+    }
+    std::string where;
+    for (ULONG n = 0; n <= hi && n < 64; ++n) where += (n ? ", node " : "node ") + std::to_string(n) + ": " + std::to_string(on[n]);
+    std::fprintf(stderr, "glm fast: CUDA%d Windows NUMA: %lu nodes, %u processor groups; the engine runs in group %u (node "
+                         "%u); the RAM tier's pages, a sample of %zu: %s%s\n", dev, (unsigned long) hi + 1,
+                 (unsigned) GetActiveProcessorGroupCount(), (unsigned) pn.Group, (unsigned) node, q.size(), where.c_str(),
+                 unknown > 0 ? (", not reported " + std::to_string(unknown)).c_str() : "");
+#else
+    (void) dev;
+    (void) tiers;
 #endif
 }
 
@@ -1398,6 +1443,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             for (int i = 0; i < 2; ++i) F->ah_th.emplace_back([this] { fast_ahead_reader(); });
         const char* wv = getenv("STRATA_GLM_WARM");
         if ((wv == nullptr || std::atoi(wv) != 0) && !fast_warm(err)) return false;
+        {
+            std::vector<std::pair<const uint8_t*, size_t>> tiers;
+            for (const auto& R : F->rc) tiers.push_back({R.base, (size_t) R.n * R.stride});
+            numa_report_win(dev_, tiers);
+        }
         // RAM-resident mode is all-or-nothing: after the warm, every expert must be in VRAM or the RAM tier -
         // one that fits neither would be read from disk at runtime (STRATA_GLM_WARM=0 fills on demand: no check)
         if (F->ram_resident && (wv == nullptr || std::atoi(wv) != 0)) {
