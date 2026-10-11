@@ -187,6 +187,11 @@ int bench(cudaStream_t s) {
         std::printf("  %d activation%s: %7.1f us  (%.2f of one activation's time, %.2f per activation)\n", nt,
                     nt == 1 ? " " : "s", us, us / one, us / one / nt);
     }
+    check(cudaGetLastError(), "the timed launches");
+    if (gf::launch_errors() > 0) {
+        std::fprintf(stderr, "glm_mv_nt_test: %d launch(es) failed: the times above are not real\n", gf::launch_errors());
+        return 1;
+    }
     return 0;
 }
 }  // namespace

@@ -157,7 +157,6 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     RowsState* S = rows_;
     const Glm5Geometry& g = g_;
     const int E = g.n_embd, DI = g.d_inner(), FFs = g.n_ff_exp * g.n_shared;
-    const size_t xq_row = (size_t) E / 32 * kQ8;
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
         err = "glm rows: no embedding dequantizer";

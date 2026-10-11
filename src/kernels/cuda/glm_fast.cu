@@ -977,6 +977,20 @@ struct MvBatch {
 };
 constexpr int MV_ROWS = 8;   // rows (warps) per block
 
+// a GEMV's output: alpha * s + bias, the product rounded and then the sum, in every GEMV kernel alike - left to the
+// compiler, the two were fused in some kernels and not in others (CUDA: none of the one-activation ones; ROCm: it
+// depended on the instantiation), so a batched output could differ in its last bit from the same one alone.  Without a
+// bias (every call of the decode) both ways give the same bits.
+__device__ __forceinline__ float mv_out(float alpha, float s, float bias) {
+#if defined(STRATA_USE_HIP)
+    float m = alpha * s;
+    asm volatile("" : "+v"(m));   // the product materialised: never fused with the sum
+    return m + bias;
+#else
+    return __fadd_rn(__fmul_rn(alpha, s), bias);
+#endif
+}
+
 __global__ void __launch_bounds__(256) mv_kernel(const __grid_constant__ MvBatch b) {
     const int bid = blockIdx.x;
     int ji = 0;
@@ -987,7 +1001,7 @@ __global__ void __launch_bounds__(256) mv_kernel(const __grid_constant__ MvBatch
     const int lane = threadIdx.x & 31;
     if (row >= J.n_out) return;
     const float s = any_row_dot(J.type, J.w, row, J.xq, J.xf, J.n_in, lane);
-    if (lane == 0) J.y[row] = J.alpha * s + (J.bias ? J.bias[row] : 0.0f);
+    if (lane == 0) J.y[row] = mv_out(J.alpha, s, J.bias ? J.bias[row] : 0.0f);
 }
 
 // ... the same for jobs of ONE quantized type: compiled for that type alone (the switch over every type costs the
@@ -1004,7 +1018,7 @@ __global__ void __launch_bounds__(256) mv_kernel_t(const __grid_constant__ MvBat
     if (row >= J.n_out) return;
     const float s = row_dot<T>((const uint8_t*) J.w + (size_t) row * rbytes<T>(J.n_in), (const block_q8_1*) J.xq,
                                J.n_in, lane);
-    if (lane == 0) J.y[row] = J.alpha * s + (J.bias ? J.bias[row] : 0.0f);
+    if (lane == 0) J.y[row] = mv_out(J.alpha, s, J.bias ? J.bias[row] : 0.0f);
 }
 
 // ---------------------------------------------------------------- the same GEMVs for NT activations at once (mv_nt)
@@ -1085,16 +1099,6 @@ __device__ __forceinline__ void any_row_dot_nt(int type, const void* w, int row,
 #pragma unroll
             for (int t = 0; t < NT; ++t) s[t] = 0.0f;
     }
-}
-// alpha * s + bias as the one-activation kernels compile it: the product rounded, then the sum (their bias is chosen
-// after the product, so the compiler does not fuse the two; here it would, one rounding fewer and a different last bit)
-__device__ __forceinline__ float mv_out(float alpha, float s, float bias) {
-#if defined(STRATA_USE_HIP)
-#pragma clang fp contract(off)
-    return alpha * s + bias;
-#else
-    return __fadd_rn(__fmul_rn(alpha, s), bias);
-#endif
 }
 template<int NT>
 __global__ void __launch_bounds__(256) mv_kernel_nt(const __grid_constant__ MvBatch b) {
