@@ -370,6 +370,20 @@ static void numa_pinned_free(void* p, size_t bytes) {
 #endif
 }
 
+// a start-time upload of pageable host data through a pinned buffer of ours (the disk staging): a pageable copy needs
+// pinned buffers of the driver's own, and with the RAM tiers just under a pinning cap (Windows) the warmed tables'
+// upload found none and stopped the start (#105).  No staging: the plain copy
+static cudaError_t upload_staged(uint8_t* stage, size_t stage_bytes, void* dst, const void* src, size_t bytes) {
+    if (stage == nullptr || stage_bytes == 0) return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    cudaError_t e = cudaSuccess;
+    for (size_t o = 0; e == cudaSuccess && o < bytes; o += stage_bytes) {
+        const size_t len = std::min(stage_bytes, bytes - o);
+        std::memcpy(stage, (const uint8_t*) src + o, len);
+        e = cudaMemcpy((uint8_t*) dst + o, stage, len, cudaMemcpyHostToDevice);
+    }
+    return e;
+}
+
 namespace glmfast {
 
 // [off, off + len) of a shard into dst: O_DIRECT through an aligned per-thread bounce buffer when the shard has a
@@ -1257,6 +1271,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             unpinned += planned;
             split_load_->pass(part_);
             split_load_->wait(n_parts_);
+            // ... and then pin one after another, in part order: near a pinning cap (Windows) parts pinning at once
+            // raced for the room under it - a 2x RTX 3080 box's first part shrank to 13.1 of its planned 21.5 GB while
+            // the second pinned all of its 22.5 (#105).  In turn, only the part that reaches the cap gives way
+            split_load_->wait_pin(part_);
         }
         // the small pinned buffers first - the table updates and the disk reads' staging (an expert a routed entry):
         // where the driver caps what can be pinned (Windows: an RTX 5090 Laptop with 64 GB, the cap reached at a 45.3
@@ -1275,6 +1293,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 err = "glm fast: pinned disk staging did not allocate";
                 return false;
             }
+        F->stage_bytes = sstride;
         for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
             auto& R = F->rc[c];
             R.stride = cls_stride[c];
@@ -1289,7 +1308,18 @@ bool Glm5Model::fast_setup(std::string& err) {
                     R.registered = true;
                     break;
                 }
-                if (cudaHostAlloc(&p, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess) break;
+                if (cudaHostAlloc(&p, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess) {
+                    // ... and leave room under the cap: a pageable copy needs pinned buffers of the driver's own, and
+                    // with two tiers pinned right up to it the warmed tables' upload failed (#105).  512 MB more that
+                    // will not pin: a step less
+                    void* room = nullptr;
+                    if (cudaHostAlloc(&room, (size_t) 512 << 20, cudaHostAllocDefault) == cudaSuccess) {
+                        cudaFreeHost(room);
+                        break;
+                    }
+                    cudaGetLastError();
+                    cudaFreeHost(p);
+                }
                 cudaGetLastError();
                 p = nullptr;
                 const int64_t less = tries < 4 ? n * 31 / 32 : n * 7 / 8;
@@ -1313,6 +1343,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             R.tick.assign((size_t) n, 0);
             F->ram_bytes += (size_t) n * R.stride;
         }
+        if (split_load_ != nullptr) split_load_->pass_pin(part_);
         if (split_load_ == nullptr && !staging_only && ram_budget_ < 0 && remaining >= 0) {
             remaining = std::max<int64_t>(0, remaining - (int64_t) F->ram_bytes);
             remaining_layers -= n_moe;
@@ -1767,11 +1798,13 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     if (!cached) {
     // ---- calibration, each lane alone: the CPU after 100 ms of the same work (an idle CPU's clocks take tens of ms to
     //      ramp up - a decode keeps them up), then five rounds of 16 runs ~100 ms apart (the same work between them
-    //      keeps the clocks up), and an expert's time is the fastest round's median.  One round takes ~40 ms, so a
+    //      keeps the clocks up), and an expert's time is the middle round's median.  One round takes ~40 ms, so a
     //      burst of other work on the CPU (the OS reclaiming memory after the RAM tier was pinned, a desktop's
     //      background jobs) covered all of its runs at once: one start timed 0.63 ms an expert against the usual 0.32,
-    //      its CPU lane took half its share and decode lost 16% for the engine's life (#56).  Interference only adds
-    //      time, so the fastest round is the CPU's own speed
+    //      its CPU lane took half its share and decode lost 16% for the engine's life (#56) - the middle of five
+    //      leaves out a burst over one or two.  Not the fastest round: that is the CPU alone, as a decode never has it
+    //      (a split's other lanes, the disk reads), and it gave a 2x RTX 3080 split's lanes two thirds of the RAM-tier
+    //      experts where v1.0.32's timing gave them half - the lane 25% slower a token (#105)
     const auto median16 = [](std::array<double, 16>& v) {
         std::sort(v.begin(), v.end());
         return 0.5 * (v[7] + v[8]);
@@ -1787,7 +1820,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     };
     busy(100);
     std::array<double, 16> runs{};
-    double best = 0.0;
+    std::array<double, 5> rounds{};
     for (int round = 0; round < 5; ++round) {
         if (round > 0) busy(100);
         for (int rep = 0; rep < 16; ++rep) {
@@ -1796,10 +1829,10 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             fast_cpu_experts(il_cal, n_cal, cals, w4, x.data(), out.data());
             runs[(size_t) rep] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         }
-        const double med = median16(runs);
-        best = round == 0 ? med : std::min(best, med);
+        rounds[(size_t) round] = median16(runs);
     }
-    c_ms = best / n_cal;   // an expert's share of a call
+    std::sort(rounds.begin(), rounds.end());
+    c_ms = rounds[2] / n_cal;   // an expert's share of a call
     cudaEvent_t e0 = nullptr, e1 = nullptr;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
@@ -1888,7 +1921,8 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             err = "glm fast: the CPU lane's route counts did not allocate";
             return false;
         }
-        cudaMemcpy(F->dcnt_d, F->cnt.data(), (size_t) F->n_keys * sizeof(unsigned int), cudaMemcpyHostToDevice);
+        upload_staged(F->stage.empty() ? nullptr : F->stage[0], F->stage_bytes, F->dcnt_d, F->cnt.data(),
+                      (size_t) F->n_keys * sizeof(unsigned int));
         F->md.dcnt = F->dcnt_d;
     }
     std::fprintf(stderr, "glm fast: CUDA%d CPU lane: %d threads%s, an expert %.3f ms on the CPU vs %.3f ms over PCIe -> "
@@ -2216,8 +2250,10 @@ bool Glm5Model::fast_warm(std::string& err) {
                          (double) done_bytes / 1e9, (double) total_bytes / 1e9, s);
         }
     }
-    if (cudaMemcpy(F->tab, th.data(), th.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice) != cudaSuccess) {
-        err = "glm fast: the warmed expert tables did not upload";
+    if (const cudaError_t ue = upload_staged(F->stage.empty() ? nullptr : F->stage[0], F->stage_bytes, F->tab, th.data(),
+                                             th.size() * sizeof(unsigned long long));
+        ue != cudaSuccess) {
+        err = std::string("glm fast: the warmed expert tables did not upload (") + cudaGetErrorString(ue) + ")";
         return false;
     }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
