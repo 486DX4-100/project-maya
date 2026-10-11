@@ -1305,7 +1305,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             cls_n[c] = std::min<int64_t>(n, cls_cap[c]);
         }
         // parallel load: take the planned size from the budget and let the next part plan; every part pins once all
-        // have planned (a later part's measurement then sees no tier half pinned), all of them at once
+        // have planned (a later part's measurement then sees no tier half pinned)
         if (split_load_ != nullptr) {
             int64_t planned = 0;
             for (size_t c = 0; c < cls_n.size(); ++c) planned += cls_n[c] * (int64_t) cls_stride[c];
