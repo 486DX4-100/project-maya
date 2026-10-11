@@ -1580,7 +1580,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         kept = keep_args(read_json(cfg_path).get("args") or [], cfg["args"], ("--prefill", "--parallel"))
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
-    if a.parallel:
+    if getattr(a, "parallel", None):
         set_arg(cfg["args"], "--parallel", a.parallel)
     for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
         ok(line)
