@@ -3776,6 +3776,17 @@ bool Glm5Model::fast_boundary(std::string& err) {
     // Also catches an asynchronous failure before waiting for routes that may never have been published.
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm boundary compute", err) || !F->route_ok(err))
         return false;
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    // Windows' HIP runtime submits queued work only when the host waits on the GPU (see fast_service): the moves the
+    // last boundary queued on the side streams - demotions into the RAM tier, background promotions - may not have
+    // run yet, and their events must not be taken for landed before they did (#133: a VRAM slot freed early took
+    // another expert before the demotion's copy read it out, the RAM tier then served those bytes, and a conversation
+    // taken back from a slot - the tiers full of another one's experts - answered the other's question, then looped).
+    // The moves were submitted when they were queued (the end of this function), so the wait is mostly over already.
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm boundary moves", err) ||
+        !glmfast::cuda_ok(cudaStreamSynchronize(F->ps), "glm boundary prefetch", err))
+        return false;
+#endif
     const Glm5Geometry& g = g_;
     while (F->processed.load(std::memory_order_acquire) < F->expected) cpu_relax();
     std::lock_guard<std::mutex> lk(F->mu);
@@ -4206,6 +4217,11 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }
     }
     flush();
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    // this boundary's moves start now, while the next token computes - not at the next boundary's wait (above)
+    (void) cudaStreamQuery(F->copy);
+    (void) cudaGetLastError();
+#endif
     static const bool diag = getenv("STRATA_GLM_TIER_DIAG") != nullptr;
     if (diag && ++F->diag_b % 64 == 0)
         std::fprintf(stderr, "glm tier diag CUDA%d (%llu boundaries): VRAM drops %llu, RAM evictions %llu, lend drops %llu (to RAM %llu), background promotions %llu / demotions %llu, resident skips %llu | "
