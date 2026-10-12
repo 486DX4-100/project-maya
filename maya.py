@@ -1795,12 +1795,14 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     if cfg_path.exists():
         old = read_json(cfg_path).get("args") or []
         kept = keep_args(old, cfg["args"],
-                         ("--prefill", "--parallel", "--expert-profile-save", "--expert-profile-save-every"))
+                         ("--prefill", "--parallel", "--kv", "--expert-profile-save", "--expert-profile-save-every"))
         kept += keep_profile(old, cfg["args"])
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
     if getattr(a, "parallel", None):
         set_arg(cfg["args"], "--parallel", a.parallel)
+    if getattr(a, "kv", None):                         # the attention's cache: int8 (the engine's default) or fp16
+        set_arg(cfg["args"], "--kv", a.kv)
     for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
         ok(line)
     gguf_dir = local.parent if local else Path(a.gguf_dir).expanduser().resolve() if a.gguf_dir else None
@@ -2119,6 +2121,9 @@ def server_command(cfg_path: Path, a) -> tuple:
     cfg = read_json(cfg_path)
     if getattr(a, "parallel", None):                   # --parallel given at a start: kept in the config
         set_arg(cfg.setdefault("args", []), "--parallel", a.parallel)
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    if getattr(a, "kv", None):                         # --kv given at a start: kept in the config too
+        set_arg(cfg.setdefault("args", []), "--kv", a.kv)
         cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     select_build_backend(cfg.get("backend", "cuda"))
     args = cfg.get("args") or []
@@ -2662,6 +2667,10 @@ def main() -> int:
                     help="answer up to N requests at once (1-8, default 1), kept in the config: on one GPU they are "
                          "decoded together, more tokens per second in all; each extra conversation keeps its own "
                          "context in VRAM, which the expert cache gives up")
+    ap.add_argument("--kv", choices=("int8", "fp16"),
+                    help="the attention's cache, kept in the config: int8 (the default - half the memory of fp16 a "
+                         "token, the same answers within fp16's own spread, more of the model in VRAM) or fp16 (full "
+                         "precision)")
     ap.add_argument("--port", type=int, help="the dashboard's and the API's port (default 8080)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this machine only (default), 0.0.0.0 = also "
                                    "other devices on your network (set --api-key too)")

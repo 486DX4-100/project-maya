@@ -109,6 +109,21 @@ class PrefillConfigTests(unittest.TestCase):
         self.assertEqual(args[args.index("--parallel") + 1], "2")
         self.assertEqual(args.count("--parallel"), 1)
 
+    def test_kv_is_the_engines_unless_given_then_kept(self):
+        # --kv: absent by default (the engine's INT8), written when given, kept by a later setup, a new value wins
+        _, args = self.write([0])
+        self.assertNotIn("--kv", args)
+        self.a.kv = "fp16"
+        _, args = self.write([0])
+        self.assertEqual(args[args.index("--kv") + 1], "fp16")
+        self.a.kv = None
+        _, args = self.write([0])
+        self.assertEqual(args[args.index("--kv") + 1], "fp16")
+        self.a.kv = "int8"
+        _, args = self.write([0])
+        self.assertEqual(args[args.index("--kv") + 1], "int8")
+        self.assertEqual(args.count("--kv"), 1)
+
     def test_dflash2_drafter_in_the_config(self):
         # a DFlash2 setup: --dflash with the drafter's file, the answer kept for the next setup, its own tuning key
         pc = {"gpus": [{"index": i, "name": "GPU", "vram_gb": 24} for i in (0, 1)]}

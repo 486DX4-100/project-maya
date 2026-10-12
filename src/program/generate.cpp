@@ -149,6 +149,7 @@ struct Options {
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
+    bool kv_given = false;             ///< --kv was on the command line (a GLM pack's latent cache is INT8 without it)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
@@ -2920,7 +2921,7 @@ int main(int argc, char** argv) {
         else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
-        else if (a == "--kv") o.kv = next("--kv");
+        else if (a == "--kv") { o.kv = next("--kv"); o.kv_given = true; }
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
@@ -3068,8 +3069,11 @@ int main(int argc, char** argv) {
     // see glm_pack_generate).  --glm-pack with an explicit non-default --pack is almost certainly a
     // mistake worth saying out loud.
     if (!o.glm_pack.empty()) {
-        // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
-        if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
+        // the GLM latent cache (Glm5Model::lat_q8_, read at load): INT8 unless asked otherwise - 544 bytes a token and
+        // layer instead of FP16's 1024, the answers the same within FP16's own run-to-run spread, so a context costs
+        // half the state and more experts fit in VRAM.  --kv fp16 (or STRATA_GLM_KV_INT8=0) keeps FP16.
+        if (std::getenv("STRATA_GLM_KV_INT8") == nullptr)
+            set_env("STRATA_GLM_KV_INT8", o.kv_given && o.kv == "fp16" ? "0" : "1");
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }

@@ -54,6 +54,7 @@ is not downloaded again, and your settings stay. By hand: `git pull`, then `./se
 | `--no-vision` | text only: no image encoder |
 | `--draft mtp` / `--draft dflash2` | how the model drafts tokens ahead: its MTP block (the default), or a DFlash2 drafter - downloaded (0.7 GB) into `DIR/GLM-5.3-Flash-DFlash2/` and passed as `--dflash` (Maya-L: +44% on nine GPUs, +12% on two, +19% on one GPU; NVIDIA RTX 30 / A100 and newer - older cards keep the MTP block unless you pass this; the drafter's license is CC BY-NC-ND 4.0, non-commercial use only). The [speed calibration](SETTINGS.md#the-speed-calibration) then keeps it only if it is faster on your PC |
 | `--gpu N` / `--gpus 0,1,2,3` | one GPU, or several (up to 16) that split the model's layers |
+| `--kv int8` / `--kv fp16` | the attention's cache, kept in the config: int8 (the default - half the memory a token, so more of the model stays in VRAM; the same answers within fp16's own spread) or fp16 (full precision) |
 | `--context N` | context length in tokens: 8192, 32768 (default), 65536, 131072 |
 | `--port N`, `--host 0.0.0.0 --api-key KEY` | another port; reachable from your network (always set a key; several: `KEY1,KEY2`) |
 | `--env KEY=VALUE` | an engine setting kept in the config (see [Tuning](SETTINGS.md)) |
