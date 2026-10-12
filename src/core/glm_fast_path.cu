@@ -5304,6 +5304,9 @@ std::vector<int> Glm5Model::dsa_layers() const {
 
 // the open pool's ik / ig rows at snap_pos_ (pool start .. + kpool - 2: contiguous in the ring, which is a multiple
 // of kpool) <-> snap_pool_; on fast_->cs
+static bool g_snapdump_busy = false;   // DEBUG #133: STRATA_GLM_SNAPDUMP's guard and file counter
+static int g_snapdump_n = 0;
+
 void Glm5Model::snap_pool_copy(bool restore) {
     const Glm5Geometry& g = g_;
     const std::vector<int> ls = dsa_layers();
@@ -5355,6 +5358,13 @@ bool Glm5Model::snapshot_save() {
         }
     }
     cudaSetDevice(dev_);
+    // DEBUG #133 (not for a release): STRATA_GLM_SNAPDUMP=<dir> writes the state each snapshot covers as a slot file
+    if (const char* dd = getenv("STRATA_GLM_SNAPDUMP"); dd != nullptr && !g_snapdump_busy) {
+        g_snapdump_busy = true;
+        std::string e;
+        slot_save(std::string(dd) + "/snap-" + std::to_string(++g_snapdump_n) + "-" + std::to_string(snap_pos_) + ".bin", e);
+        g_snapdump_busy = false;
+    }
     return true;
 }
 
@@ -5575,6 +5585,14 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
     if (!snapshot_restore()) {
         err = "the snapshot did not restore";
         return false;
+    }
+    // DEBUG #133: the live state right after the restore (snapshot_save copies it into snap_ again), as a slot file
+    if (const char* dd = getenv("STRATA_GLM_SNAPDUMP"); dd != nullptr) {
+        g_snapdump_busy = true;
+        snapshot_save();
+        std::string e;
+        slot_save(std::string(dd) + "/load-" + std::to_string(++g_snapdump_n) + "-" + std::to_string(n) + ".bin", e);
+        g_snapdump_busy = false;
     }
     return true;
 }
