@@ -3776,6 +3776,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
     // Also catches an asynchronous failure before waiting for routes that may never have been published.
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm boundary compute", err) || !F->route_ok(err))
         return false;
+    // DEBUG #133: STRATA_GLM_DBG_BOUNDSYNC=1 - every queued copy (demotions, background moves) finished before the
+    // boundary looks at their events
+    static const bool dbg_bsync = getenv("STRATA_GLM_DBG_BOUNDSYNC") != nullptr;
+    if (dbg_bsync) cudaDeviceSynchronize();
     const Glm5Geometry& g = g_;
     while (F->processed.load(std::memory_order_acquire) < F->expected) cpu_relax();
     std::lock_guard<std::mutex> lk(F->mu);
