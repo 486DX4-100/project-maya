@@ -135,7 +135,7 @@ class Gguf(unittest.TestCase):
         for q, gb in (("gguf-q8", 508.4), ("gguf-q4", 500.7)):
             m = maya.ds4_gguf_model(q)
             self.assertEqual((m["format"], m["folder"]), ("ds4-gguf", maya.DS4_QUANTS[q]))
-            self.assertEqual(len(m["files"]), 10)
+            self.assertEqual(len(m["files"]), 9)
             for n, size in m["files"].items():
                 self.assertNotIn("/", n)
                 self.assertTrue(n.endswith(".gguf"))
@@ -293,7 +293,7 @@ class Vision(unittest.TestCase):
 
 class MayaQuants(unittest.TestCase):
     """Maya's quants of DeepSeek: offered once download_gguf.json lists their files, downloaded into
-    <...-GGUF>/Maya-S, their Engram tables from unsloth's two Engram-only shards into <...-GGUF>/Engram (hard-linked
+    <...-GGUF>/Maya-S, their Engram tables from unsloth's Engram-only shard into <...-GGUF>/Engram (hard-linked
     from an unsloth folder that already holds them)."""
 
     def setUp(self):
@@ -377,12 +377,11 @@ class MayaQuants(unittest.TestCase):
 
     def test_engram_model(self):
         m = maya.ds4_engram_model()
-        self.assertEqual(sorted(m["files"]), ["DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00010.gguf",
-                                              "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00010.gguf"])
+        self.assertEqual(sorted(m["files"]), ["DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00009.gguf"])
         self.assertAlmostEqual(m["download_gb"], 202.8, delta=0.1)
         u = maya.file_url(m, sorted(m["files"])[0])
         self.assertRegex(u, r"^https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/[0-9a-f]{40}/"
-                            r"UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00010\.gguf$")
+                            r"UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00009\.gguf$")
 
     def test_engram_linked_from_an_unsloth_folder(self):
         import hashlib

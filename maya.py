@@ -420,7 +420,7 @@ DS4_MIN_CC = 80
 # the OS page cache, from the SSD, so it runs whatever the memory; Volta or newer.  The DSpark drafter and the vision
 # tower, which the GGUFs leave out, come from DeepSeek's own checkpoint (download_gguf.json's "drafter" and "vision").
 # Maya's own quants of it (download_gguf.json's "maya": Maya-S, the experts in 2-3 bits; Maya-M once published) carry
-# everything but the two Engram tables, which come from unsloth's two Engram-only shards into <...-GGUF>/Engram.
+# everything but the two Engram tables, which come from unsloth's Engram-only shard into <...-GGUF>/Engram.
 DS4_GGUF_MANIFEST = ROOT / "tools" / "ds4" / "download_gguf.json"
 DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/chat_template.jinja")
 DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M",
@@ -3228,16 +3228,16 @@ def ds4_drafter_step(a, d: Path) -> bool:
 
 
 def ds4_engram_model() -> dict:
-    """The two Engram tables Maya's quant leaves out, as offer_download's form: unsloth's two Engram-only shards
-    (download_gguf.json's "maya" names them; their sizes and sha256 are the UD-Q8_K_XL entries')."""
+    """The two Engram tables Maya's quant leaves out, as offer_download's form: unsloth's Engram-only shard
+    (download_gguf.json's "maya" names it; its size and sha256 are the UD-Q8_K_XL entry's)."""
     man = read_json(DS4_GGUF_MANIFEST)
     names = (man.get("maya") or {}).get("engram") or []
     q8 = ((man.get("quants") or {}).get("UD-Q8_K_XL") or {}).get("files") or {}
-    if len(names) != 2 or any(n not in q8 for n in names):
+    if not names or any(n not in q8 for n in names):
         fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
     files = {Path(n).name: q8[n] for n in names}
     return {"about": "DeepSeek's two Engram tables (the n-gram memory, read a few rows a token from the SSD), from "
-                     "unsloth's GGUF: the two files that hold only them", "format": "ds4-engram",
+                     "unsloth's GGUF: the file that holds only them", "format": "ds4-engram",
             "repo": man["repo"], "revision": man["revision"], "folder": "UD-Q8_K_XL",
             "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
             "download_gb": sum(v[0] for v in files.values()) / 1e9}

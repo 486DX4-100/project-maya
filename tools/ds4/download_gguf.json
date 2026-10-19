@@ -2,98 +2,90 @@
  "_": "DeepSeek-V4.1-Flash-1017 as unsloth's GGUFs for maya-ds4 (maya.py's DeepSeek setup, tools/ds4/pack_gguf.py): dense weights BF16 (UD-Q8_K_XL) or Q8_0 (UD-Q4_K_XL), routed experts MXFP4, the Engram tables MXFP8 - every file pinned to a revision, with its size and sha256. Neither has the DSpark drafter or the vision tower (\"drafter\" and \"vision\" below: from DeepSeek's own checkpoint).",
  "name": "DeepSeek-V4.1-Flash-1017",
  "repo": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
- "revision": "dc788bdb683b0af7a6e5315a7d98e9d082faf5e5",
+ "revision": "c991b28e7c109eed10a55075ddb46f830b5b3059",
  "license": "MIT",
  "quants": {
   "UD-Q8_K_XL": {
    "files": {
-    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00010.gguf": [
-     5781234,
-     "e88691700c4778890cfa845bc21242cf101faa014c8a44d1315402e3f64e701a"
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf": [
+     5780589,
+     "cc15d470afcb030558bbc4d8e2ccd840182e2e95de1a95198138efe63a5fd99f"
     ],
-    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00002-of-00010.gguf": [
-     48129640000,
-     "8b9e24ae7322af960c6cceb3cc79623ac79c173fba860da2b10fe5de04e763e2"
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00002-of-00009.gguf": [
+     50536121984,
+     "9cb2047676bd20e448be2377b480080c97fb38fae117f4846e07de2c65bb8522"
     ],
-    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00003-of-00010.gguf": [
-     48129640000,
-     "9b5047e0f84d64f673d638a6d85282bae16b53f39cf12559c4b8605b127baeca"
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00003-of-00009.gguf": [
+     50536121984,
+     "17d398dd327e7ff1991b382677814db75d970b074661757564b6f2ac3d0c8d95"
     ],
-    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00004-of-00010.gguf": [
-     48129640000,
-     "83a630d0dd9f2dc6e1d1223b265e78523a51ba6483ab70e3ae3f188978df2491"
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00004-of-00009.gguf": [
+     50536122016,
+     "7ea8da1143b9a6bf1424a361eb1b0d6f66c7ce79eac9711162f212cc4f39c319"
     ],
-    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00005-of-00010.gguf": [
-     48129640000,
-     "90ecd6d773dd0eab5ce1a7bdff626617f8b59360ae53a2cd5d763bde0088b2e8"
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00005-of-00009.gguf": [
+     50536122016,
+     "1952da19a841176b46f9681c99ea57c674f8a8861e16d76fb35cec4befe039b2"
     ],
-    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00006-of-00010.gguf": [
-     48129640000,
-     "e688bfa9a31f00ac33ac7cd739fbc0a903ae0d1601e85c485c23147c57a282fd"
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00006-of-00009.gguf": [
+     50536122016,
+     "d6711781d8effab79b410af9c40920bffcc0c28976e509bc1227ff0c6669c33a"
     ],
-    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00007-of-00010.gguf": [
-     48129640000,
-     "daf02b75c0ad3562c8ccc505fcd94ce08584f967f485b9e9e3ebdbfcafcaf286"
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00007-of-00009.gguf": [
+     36097230048,
+     "2ebc8d198d03a14865e8a85df637285ceb5dd79b1ffc78424bd3c3e06df57823"
     ],
-    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00010.gguf": [
-     101377628544,
-     "b9a5d8344f60c87bf8e8b2f56f89074e22c3a148342455129fd2a6f65bc6a612"
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00009.gguf": [
+     202758032592,
+     "12df293355efbd104b088a77e13ee22410fb1ec3f7ab3863947f09896e64bec7"
     ],
-    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00010.gguf": [
-     101380404256,
-     "0dc8cda974060d492b147a0e3fa074a892bddb0c8b8d6322dc2367c6c6a72fbf"
-    ],
-    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00010-of-00010.gguf": [
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00009.gguf": [
      16835109952,
-     "93749d36aa1d2a73dba2bbaf903cc366e694769bc16c216ec2e0dff846e74cac"
+     "df33722d1dcf5ffe0347ed8406f7acb3b18061f4ded2c13c2b0a184b8d41c9ea"
     ]
    },
-   "bytes": 508376763986
+   "bytes": 508376763197
   },
   "UD-Q4_K_XL": {
    "files": {
-    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00010.gguf": [
-     5781234,
-     "e88691700c4778890cfa845bc21242cf101faa014c8a44d1315402e3f64e701a"
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf": [
+     5780589,
+     "cc15d470afcb030558bbc4d8e2ccd840182e2e95de1a95198138efe63a5fd99f"
     ],
-    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00002-of-00010.gguf": [
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00002-of-00009.gguf": [
      48129640000,
-     "8b9e24ae7322af960c6cceb3cc79623ac79c173fba860da2b10fe5de04e763e2"
+     "17df217d8fc26a39f21ea40805dc6ab788c7ce8623a59a95c431051df7eafc94"
     ],
-    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00003-of-00010.gguf": [
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00003-of-00009.gguf": [
      48129640000,
-     "9b5047e0f84d64f673d638a6d85282bae16b53f39cf12559c4b8605b127baeca"
+     "0c8065f620a049cb437024c54ff12c314c94603a1cc683f5191be4689d6d6d3b"
     ],
-    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00004-of-00010.gguf": [
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00004-of-00009.gguf": [
      48129640000,
-     "83a630d0dd9f2dc6e1d1223b265e78523a51ba6483ab70e3ae3f188978df2491"
+     "3bd8b2ebf8f51d8708a73ae0895f8d4acc7e4c983ba4e89d038492b203cc89ac"
     ],
-    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00005-of-00010.gguf": [
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00005-of-00009.gguf": [
      48129640000,
-     "90ecd6d773dd0eab5ce1a7bdff626617f8b59360ae53a2cd5d763bde0088b2e8"
+     "929054a6bbf3701765779b58c37988b6c6284a3b8413901858b59c0e95f37cc3"
     ],
-    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00006-of-00010.gguf": [
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00006-of-00009.gguf": [
      48129640000,
-     "e688bfa9a31f00ac33ac7cd739fbc0a903ae0d1601e85c485c23147c57a282fd"
+     "49d3de04bd6a09de786c9ef7db900eae02ee9fd391573f91a923013d7d5b24d3"
     ],
-    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00007-of-00010.gguf": [
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00007-of-00009.gguf": [
      48129640000,
-     "daf02b75c0ad3562c8ccc505fcd94ce08584f967f485b9e9e3ebdbfcafcaf286"
+     "f18feae5878dd680f1ea87ecd1d84f4fb098480298b25a3162dcbdab8dc2ca5b"
     ],
-    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00008-of-00010.gguf": [
-     101377628544,
-     "b9a5d8344f60c87bf8e8b2f56f89074e22c3a148342455129fd2a6f65bc6a612"
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00008-of-00009.gguf": [
+     202758032592,
+     "12df293355efbd104b088a77e13ee22410fb1ec3f7ab3863947f09896e64bec7"
     ],
-    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00009-of-00010.gguf": [
-     101380404256,
-     "0dc8cda974060d492b147a0e3fa074a892bddb0c8b8d6322dc2367c6c6a72fbf"
-    ],
-    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00010-of-00010.gguf": [
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00009-of-00009.gguf": [
      9165923392,
-     "82a3958d47e2c220f49d7235256a54c3a93a08f9c1bbf90c7a0c552a64c90d9a"
+     "c21ad6105a780bc2f44eb7dd41f9b1a1efb4e8ec87618f60b733bc2652bd2ffe"
     ]
    },
-   "bytes": 500707577426
+   "bytes": 500707576573
   }
  },
  "maya": {
@@ -101,8 +93,7 @@
   "repo": "peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF",
   "revision": "26c6aeaf5ecce88fe47103f780279bcc6f1f0d9b",
   "engram": [
-   "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00010.gguf",
-   "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00010.gguf"
+   "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00009.gguf"
   ],
   "quants": {
    "Maya-S": {

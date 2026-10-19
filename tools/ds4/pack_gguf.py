@@ -29,6 +29,7 @@ import sys
 
 TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 30: ("BF16", 1, 2), 39: ("MXFP4", 32, 17),
          67: ("MXFP8", 32, 33),          # ggml type -> (name, values a block, bytes a block); 67: unsloth's fork
+         43: ("MXFP8", 32, 33),          # llama.cpp's own id (unsloth's GGUFs from 2026-10-19 on)
          # the low-bit expert types (the Maya quants' experts; the engine's ds4_iq kernels)
          10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
          14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98),
@@ -180,6 +181,51 @@ def geometry(kv: dict, vocab: int) -> dict:
     return out
 
 
+def ple_to_engram(kv: dict):
+    """llama.cpp's own names for the Engram metadata (unsloth's GGUFs from 2026-10-19 on: ple.*, the hash heads' offsets
+    counted across the layers' tables) -> the engram.* keys this pack reads (each layer's offsets from its own table)."""
+    a = kv.get("general.architecture")
+    g = lambda k, d=None: kv.get("%s.%s" % (a, k), d)  # noqa: E731
+    if g("engram.layers") or not g("ple.layers"):
+        return
+    layers, ngram, heads = list(g("ple.layers")), g("ple.ngram_size"), g("ple.heads_per_ngram")
+    offs, sizes = list(g("ple.head_offsets")), list(g("ple.head_vocab_sizes"))
+    cols = (ngram - 1) * heads
+    if len(offs) != len(layers) * cols or len(sizes) != len(offs):
+        raise SystemExit("ple: %d head offsets, %d sizes for %d layers x %d columns" %
+                         (len(offs), len(sizes), len(layers), cols))
+    per, rows = [], []
+    for i in range(len(layers)):
+        o, s = offs[i * cols:(i + 1) * cols], sizes[i * cols:(i + 1) * cols]
+        per += [x - o[0] for x in o]
+        rows.append(o[-1] + s[-1] - o[0])
+    for k, v in (("layers", layers), ("max_ngram_size", ngram), ("head_count", heads),
+                 ("head_dim", g("embedding_length_per_layer_input")), ("multipliers", list(g("ple.layer_multipliers"))),
+                 ("primes", sizes), ("offsets", per), ("num_embeddings", rows)):
+        kv["%s.engram.%s" % (a, k)] = v
+
+
+def split_ple(g: Gguf, kv: dict):
+    """llama.cpp's one Engram tensor (per_layer_token_embd: every layer's table, one after the other) -> each layer's
+    own blk.N.engram_embd as the earlier GGUFs had it: the same bytes, read in place."""
+    a = kv["general.architecture"]
+    ple = [t for t in g.tensors if t[0] == "per_layer_token_embd.weight"]
+    if not ple:
+        return
+    name, typ, dims, off = ple[0]
+    layers, rows = kv.get("%s.engram.layers" % a, []), kv.get("%s.engram.num_embeddings" % a, [])
+    if len(dims) != 2 or typ not in TYPES or len(rows) != len(layers) or sum(rows) != dims[1]:
+        raise SystemExit("%s: %s %s does not split in the Engram layers %s of %s rows" % (g.path.name, name, dims, layers,
+                                                                                         rows))
+    _, per, bpb = TYPES[typ]
+    row = dims[0] // per * bpb
+    parts, start = [], 0
+    for il, n in zip(layers, rows):
+        parts.append(("blk.%d.engram_embd.weight" % il, typ, [dims[0], n], off + start * row))
+        start += n
+    g.tensors = [t for t in g.tensors if t[0] != name] + parts
+
+
 def write_engram(out: pathlib.Path, kv: dict, vocab: int):
     a = kv["general.architecture"]
     g = lambda k, d=None: kv.get("%s.%s" % (a, k), d)  # noqa: E731
@@ -242,10 +288,14 @@ def main() -> int:
     split = int(kv.get("split.count", 1))
     if split != len(shards):
         raise SystemExit("%s: %d of the %d shards are here" % (model, len(shards), split))
+    ple_to_engram(kv)
+    for g in gs:
+        split_ple(g, kv)
     # the Engram tables may come from a shared set of GGUF files beside the quant (the same tensor names): <model>/Engram/
     # or <model>/../Engram/ - its engram tensors fill in the ones the quant's shards leave out, its engram metadata too.
-    # The Maya quants: unsloth's UD-Q8_K_XL shards 00008 and 00009 as they are (each one table; two shards of a split of
-    # ten, so no shard count is checked - every Engram layer's tables must be found, below)
+    # The Maya quants: unsloth's UD-Q8_K_XL shard that holds only the tables, as it is (00008 of 9; before 2026-10-19
+    # shards 00008 and 00009 of 10, a table each), so no shard count is checked - every Engram layer's tables must be
+    # found, below)
     have = {t[0] for g in gs for t in g.tensors}
     eg_dir = next((d for d in (model / "Engram", model.parent / "Engram") if d.is_dir() and any(d.glob("*.gguf"))), None)
     eg_from = {}
@@ -254,8 +304,11 @@ def main() -> int:
         egs = [Gguf(p) for p in eshards]
         for g in egs:
             for k, v in g.kv.items():
-                if ".engram." in k:
+                if ".engram." in k or ".ple." in k or k.endswith(".embedding_length_per_layer_input"):
                     kv.setdefault(k, v)
+        ple_to_engram(kv)
+        for g in egs:
+            split_ple(g, kv)
         for p, g in zip(eshards, egs):
             picked = [t for t in g.tensors if re.match(r"blk\.\d+\.engram_", t[0]) and t[0] not in have]
             if picked:
@@ -267,7 +320,7 @@ def main() -> int:
             nm = "blk.%d.%s.weight" % (il, part)
             if nm not in have and not any(t[0] == nm for g in eg_from.values() for t in g.tensors):
                 raise SystemExit("%s: missing - not in the quant's shards nor in an Engram set (<model>/Engram/ or "
-                                 "<model>/../Engram/: unsloth's UD-Q8_K_XL shards 00008 and 00009)" % nm)
+                                 "<model>/../Engram/: unsloth's UD-Q8_K_XL shard of the Engram tables)" % nm)
     rel = lambda p: os.path.relpath(p, model).replace(os.sep, "/")  # noqa: E731
     gs_all = gs + list(eg_from.values())
     names = [g.path.name for g in gs] + [rel(p) for p in eg_from]
