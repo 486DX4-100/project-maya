@@ -979,6 +979,15 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_rows_exact_test src/kernels/cpu/native_rows_exact_test.cpp)
     target_link_libraries(native_rows_exact_test PRIVATE strata_kernels_cpu)
     add_test(NAME native_rows_exact_test COMMAND native_rows_exact_test)
+    # DeepSeek's CPU-lane IQ1_S rows (src/ds4/ds4_iq_cpu.cpp) bit for bit against ggml-cpu's dot: the form without pdep
+    # (AMD Zen / Zen+ / Zen 2's default) forced on any CPU, and the measured choice
+    add_executable(ds4_iq1_rows_test tests/ds4_iq1_rows_test.cpp src/ds4/ds4_iq_cpu.cpp)
+    target_include_directories(ds4_iq1_rows_test PRIVATE third_party/ggml)
+    target_link_libraries(ds4_iq1_rows_test PRIVATE strata_kernels_cpu)
+    add_test(NAME ds4_iq1_rows_nopdep COMMAND ds4_iq1_rows_test)
+    set_tests_properties(ds4_iq1_rows_nopdep PROPERTIES ENVIRONMENT DS4_IQ1_PDEP=0)
+    add_test(NAME ds4_iq1_rows_measured COMMAND ds4_iq1_rows_test)
+    set_tests_properties(ds4_iq1_rows_measured PROPERTIES ENVIRONMENT DS4_IQ1_PDEP=1)
   endif()
   if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     # the dense GEMV for several conversations at once (mv_nt) against the one-conversation GEMV, bit for bit; the
