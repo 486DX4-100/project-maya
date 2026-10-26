@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include <string>
+
 namespace mm3::k {
 
 /// y = x * rsqrt(mean(x^2) + eps) * w1 per row of D (w1 = 1 + the stored weight: Gemma's); y16 (if given) the same
@@ -20,25 +22,64 @@ void rms(const float* x, const float* w1, int rows, int D, float eps, float* y, 
 /// The rotary's inverse frequencies theta^(-2i / n_rot), i < n_rot / 2 (host, F32 as transformers computes them).
 void rope_inv_freq(float theta, int n_rot, float* inv /*[n_rot / 2]*/);
 
-/// An INT8 K / V cache (--kv-cache int8): rows of 128 int8 (round(v / s)) and a scale s each (the row's max |v| / 127),
-/// [rows][Hkv][128] and [rows][Hkv]; all null: the BF16 caches.  rot (--kv-rotate on): the rows are H k and H v (H the
-/// 128-point Hadamard / sqrt(128), after the norm and RoPE), the queries rotated alike and the attention's output
-/// rotated back - an outlier spread over its row before the row's scale (not exact either: opt-in).
-struct KvI8 {
-    int8_t *kc = nullptr, *vc = nullptr;
-    float *ks = nullptr, *vs = nullptr;
-    bool rot = false;
+/// The K / V caches' row formats - a row is one position's one KV head, 128 values: its codes, then (another array)
+/// its scales.
+///   kKvBf16  256 bytes of BF16 values (the model's dtype: exact)
+///   kKvI8    128 int8 round(v / s), an F32 scale s = max |v| / 127
+///   kKvFp8   128 E4M3 codes, a UE8M0 power-of-two scale a group of 32 (the scale byte: its F32 exponent)
+///   kKvFp4   64 bytes of E2M1 codes (value 2i in the low nibble), an E4M3 scale a group of 16 (NVFP4's)
+constexpr int kKvBf16 = 0, kKvI8 = 1, kKvFp8 = 2, kKvFp4 = 3;
+__host__ __device__ constexpr size_t kv_code_bytes(int f) { return f == kKvBf16 ? 256 : f == kKvFp4 ? 64 : 128; }
+__host__ __device__ constexpr size_t kv_scale_bytes(int f) { return f == kKvBf16 ? 0 : f == kKvFp4 ? 8 : 4; }
+/// A row's bytes in all (codes and scales)
+__host__ __device__ constexpr size_t kv_row_bytes(int f) { return kv_code_bytes(f) + kv_scale_bytes(f); }
+/// A layer's quantized K / V caches (--kv-cache): K's rows in format kf, V's in vf - for a format other than BF16 its
+/// codes [rows][Hkv][kv_code_bytes] and scales [rows][Hkv][kv_scale_bytes] here (the BF16 caches kc / vc unused for
+/// it); rot (bit 0 K, bit 1 V): the rows rotated by the 128-point Hadamard transform before they are rounded (outliers
+/// spread over the row - the queries are rotated alike and the attention's output back, so q . k and the values'
+/// sum keep their meaning).  All 0: the BF16 caches.
+struct KvQ {
+    int kf = kKvBf16, vf = kKvBf16;
+    int rot = 0;
+    uint8_t *kc = nullptr, *vc = nullptr;
+    uint8_t *ks = nullptr, *vs = nullptr;
 };
+
+/// The bytes of a layer's K and V caches of `rows` rows (positions x KV heads) in formats kf / vf.
+inline size_t kv_bytes(int kf, int vf, size_t rows) { return rows * (kv_row_bytes(kf) + kv_row_bytes(vf)); }
+/// One block of kv_bytes(kf, vf, rows) carved into the caches: K's codes and scales (a BF16 K: kc16), then V's.
+inline void kv_carve(uint8_t* b, size_t rows, int kf, int vf, int rot, uint16_t*& kc16, uint16_t*& vc16, KvQ& q) {
+    q.kf = kf;
+    q.vf = vf;
+    q.rot = rot;
+    const int f[2] = {kf, vf};
+    for (int r = 0; r < 2; ++r) {
+        if (f[r] == kKvBf16) {
+            (r == 0 ? kc16 : vc16) = (uint16_t*) b;
+        } else {
+            (r == 0 ? q.kc : q.vc) = b;
+            (r == 0 ? q.ks : q.vs) = b + rows * kv_code_bytes(f[r]);
+        }
+        b += rows * kv_row_bytes(f[r]);
+    }
+}
+/// A format's name (bf16, int8, fp8, fp4) and back (-1: none of them).
+inline const char* kv_name(int f) { return f == kKvI8 ? "int8" : f == kKvFp8 ? "fp8" : f == kKvFp4 ? "fp4" : "bf16"; }
+inline int kv_parse(const char* s) {
+    const std::string v = s;
+    return v == "bf16" || v == "16" ? kKvBf16 : v == "int8" || v == "i8" ? kKvI8 : v == "fp8" || v == "8" ? kKvFp8
+           : v == "fp4" || v == "4" ? kKvFp4 : -1;
+}
 
 /// KV streaming (--kv-streaming): the VRAM K / V caches a ring of `ring` rows - position p at row p % ring, tag[row] the
 /// position the row holds (-1: none) - and every position in host memory as well (pinned and mapped: rows [max_ctx]
-/// [Hkv][128] in the VRAM caches' format, kc / vc BF16 or i8 INT8).  Attention reads a key from VRAM when the ring holds
-/// it, else from the host over PCIe.  ring 0: off (the VRAM caches a row a position).
+/// [Hkv] in the VRAM caches' formats, kc / vc BF16 or q's codes and scales).  Attention reads a key from VRAM when the
+/// ring holds it, else from the host over PCIe.  ring 0: off (the VRAM caches a row a position).
 struct KvHost {
     int ring = 0;
     int* tag = nullptr;
     uint16_t *kc = nullptr, *vc = nullptr;
-    KvI8 i8;
+    KvQ q;
 };
 
 /// q [T][Hq][hd] in place: the per-head RMSNorm (one [hd] weight w1 = 1 + w for every head) then NeoX RoPE on the
@@ -46,7 +87,7 @@ struct KvHost {
 /// BF16.  inv [n_rot / 2] on the device.
 void qk_norm_rope(float* q, const float* k, const float* v, const float* qn1, const float* kn1, const int* pos, int T,
                   int Hq, int Hkv, int hd, int n_rot, const float* inv, float eps, uint16_t* kc, uint16_t* vc,
-                  cudaStream_t s, int ring = 0, const KvI8& i8 = KvI8{}, const KvHost& hs = KvHost{});
+                  cudaStream_t s, int ring = 0, const KvQ& kq = KvQ{}, const KvHost& hs = KvHost{});
 /// (ring > 0: the caches are rings of that many rows, position p at row p % ring - the DSpark draft's window.  Hq 0:
 ///  K and V alone)
 
@@ -66,11 +107,12 @@ void select_blocks(const float* bs, const int* pos, int T, int Hi, int nblk, int
                    cudaStream_t s);
 
 /// out [T][Hq][hd] (F32): each query head over its KV group's kept blocks (kept [Hkv][T][topk], -1 unused), the keys
-/// j <= pos[t] of them, softmax(q . k * scale) . v - exact (online softmax in F32).  hd = 128, Hq / Hkv = 16.
-/// splits > 1 (with part: T x Hkv x splits x 16 x 130 floats): each query's kept blocks in that many runs on blocks of
-/// their own (a decode window's few queries), combined in run order - a query's sums depend on splits alone, not on T.
+/// j <= pos[t] of them, softmax(q . k * scale) . v - exact over the cached rows (online softmax in F32).  hd = 128,
+/// Hq / Hkv = 16.  kq: the caches' formats (KvQ).  splits > 1 (with part: T x Hkv x splits x 16 x 130 floats): each
+/// query's kept blocks in that many runs on blocks of their own (a decode window's few queries), combined in run order -
+/// a query's sums depend on splits alone, not on T.
 void sparse_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int* kept, const int* pos, int T,
-                 int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s, const KvI8& i8 = KvI8{},
+                 int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s, const KvQ& kq = KvQ{},
                  const KvHost& hs = KvHost{}, int splits = 1, float* part = nullptr);
 /// part's floats for sparse_attn's splits over T queries and Hkv groups.
 inline size_t attn_part_floats(int T, int Hkv, int splits) { return (size_t) T * Hkv * splits * 16 * 130; }
@@ -103,8 +145,11 @@ void draft_block(const uint16_t* anchor, const float* mask, int D, int B, int P,
                  cudaStream_t s);
 /// x += a (n floats).
 void add(float* x, const float* a, size_t n, cudaStream_t s);
-/// (the tensor-parallel path) one thread spins until *flag (mapped host memory, a counter) reaches v, wrap-safe.
+/// (the tensor-parallel path) one thread spins until *flag (mapped host memory, a counter) reaches v, wrap-safe - for at
+/// most 120 s (then it goes on and wait_timeouts() counts it: a host that never answers leaves no GPU spinning).
 void wait_flag(const unsigned* flag, unsigned v, cudaStream_t s);
+/// The current device's waits on the host that gave up (wait_flag), since the process started.
+unsigned wait_timeouts();
 /// (the tensor-parallel path) n floats (a multiple of 4) from src (mapped host memory) into dst (device) by a kernel - no
 /// copy engine: a copy waiting behind a wait_flag on one stream holds up the device's host -> device copies of the others
 void pull(float* dst, const float* src, size_t n, cudaStream_t s);

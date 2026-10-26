@@ -4,7 +4,8 @@
 // maya-mm3's own copy of include/strata/kernels/exl3.hpp (the GLM and DeepSeek engines keep theirs): the same format
 // and interface in namespace strata::mm3::exl3, with the routed experts' activation MiniMax's swigluoai -
 // g = min(g, limit), u = clamp(u, -limit, limit), h = g * sigmoid(kSwigluAlpha g) * (u + 1) - instead of the clamped
-// swiglu, and no pre-sm_80 kernels.
+// swiglu.  Before sm_80: Volta / Turing's tensor cores (nvcuda::wmma) for every tile, and the prompt path's busy
+// matrices through cuBLAS' FP16 GEMMs over their decoded weights (blas_enable).
 //
 // The format (exllamav3, MIT, turboderp).  A weight with k inputs and n outputs (y = x W) is stored as
 //   trellis  int16 [k/16][n/16][16 K]: each 16x16 tile is a tail-biting trellis of 256 K-bit steps read MSB-first
@@ -188,13 +189,25 @@ struct SetArgs {
     int n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
     int skip_ge = 0;    // (ds4's low-bit GGUF experts) > 0: experts of at least this many rows are the caller's (FP16 GEMMs)
+    // (given: a host copy of bounds) before sm_80 the busy experts - blas_enable's rows or more - go through the FP16
+    // GEMM (each decoded once, the product on the tensor cores), the rest through the tiles
+    const int* hbounds = nullptr;
 };
 /// h[local row] = FP16 swigluoai of gate and up over x[row_idx[local row]] (F32 rows, ldx floats apart).
 void set_gate_up(const SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh, cudaStream_t s);
 /// y[local row] = down(h[local row]) (F32 rows, ldy floats apart).
 void set_down(const SetArgs& a, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s);
 /// Y[r] = beta Y[r] + (X[r] W) for r < rows: one matrix over FP16 rows (ldx), F32 output rows (ldy).
+/// (before sm_80, with blas_enable on the stream: rows >= MM3_EXL3_BLAS_ROWS (64) through the FP16 GEMM; Volta /
+/// Turing's tiles on the tensor cores below that, the portable kernels elsewhere)
 void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta, cudaStream_t s);
+
+/// GPUs before sm_80 (V100, T4, RTX 20): the prompt path's FP16 GEMMs through cuBLAS for stream s on the current
+/// device - a handle of its own (the tensor cores' math) and scratch_mb of VRAM (8 at least; a MiniMax-M3.1 expert needs 96); blas_bytes: what it
+/// took (0: not enabled), blas_wanted: whether the current device uses it (before sm_80, MM3_EXL3_BLAS_ROWS != 0).
+bool blas_enable(cudaStream_t s, size_t scratch_mb);
+size_t blas_bytes(cudaStream_t s);
+bool blas_wanted();
 
 /// The full weight in the engine's row layout: dst[r][c] = W[c][r] (n rows of k values), BF16 or F16 bits.
 void reconstruct_rows(const Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
@@ -217,5 +230,7 @@ void rows_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, uin
 
 /// Launch failures of this family since the process started (each is also printed).
 int launch_errors();
+/// The current device's win_experts waits on the host's word that gave up after 120 s (the host never answered).
+unsigned wait_timeouts();
 
 }  // namespace strata::mm3::exl3

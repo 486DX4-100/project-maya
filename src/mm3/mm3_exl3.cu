@@ -1,5 +1,7 @@
 // src/mm3/mm3_exl3.cu - maya-mm3's EXL3 device kernels (the format: mm3_exl3.hpp): a copy of the shared
-// src/kernels/cuda/exl3.cu with MiniMax-M3.1's swigluoai in the routed experts and without the pre-sm_80 kernels.
+// src/kernels/cuda/exl3.cu with MiniMax-M3.1's swigluoai in the routed experts.  Before sm_80 (V100, T4, RTX 20) the
+// tiles run on the tensor cores through nvcuda::wmma (EXL3_WM70 below) on every path, and the prompt path's busy
+// matrices through cuBLAS' FP16 GEMMs over their decoded weights (blas_enable).
 //
 // The codebooks and the trellis window arithmetic follow exllamav3 (MIT, turboderp - exllamav3_ext/quant/
 // codebook.cuh, exl3_dq.cuh, hadamard_inner.cuh), and so does decoding a tile straight into tensor-core fragments
@@ -16,9 +18,14 @@
 //     split order (deterministic) and runs the output rotation.
 
 #include "mm3_exl3.hpp"
+#include "mm3_env.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if !defined(STRATA_USE_HIP)
+#include <cublas_v2.h>
+#include <mma.h>   // (sm_70 / sm_75: nvcuda::wmma - V100, T4 and RTX 20's tensor cores)
+#endif
 #include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #include <algorithm>
@@ -295,6 +302,22 @@ constexpr int kTok = 8;   // activations a block takes at once (the MMA's n)
 #if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define EXL3_TC 1
 #endif
+// Volta and Turing (sm_70, sm_75: V100, T4, RTX 20): the tiles on the tensor cores through nvcuda::wmma's
+// m16n16k16 - a warp's decoded tile goes through shared memory into A's row-major layout (output m: its 16 inputs),
+// the chunk's activations are B's columns straight from the chunk buffer (columns past nc hold whatever the buffer
+// holds: their outputs are never written), F32 accumulation.  The token path and a window's take it alike (each
+// activation's column is its own: a window's token keeps the token path's bits).  MM3_EXL3_V100_FMA (a build define):
+// the CUDA cores' F32 product instead, as before.
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 800 && \
+    !defined(MM3_EXL3_V100_FMA)
+#define EXL3_WM70 1
+#endif
+#if defined(EXL3_WM70)
+constexpr int kTokB = 16;   // the chunk buffers' and out's activation rows: B and D are 16 columns wide
+#else
+constexpr int kTokB = kTok;
+#endif
+constexpr int kWtPitch = 12;   // (EXL3_WM70) a decoded tile's row in shared memory: 8 words of its 16 inputs + 4
 
 // RDNA 3 / 4: v_dot2_f32_f16 - two FP16 products and their FP32 sum onto c in one instruction (no conversions)
 #if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
@@ -386,10 +409,13 @@ constexpr int kMinBlocksMv = 2;
 
 // the shared memory of a block_gemv block
 template <int K2>
-struct BlockSmem {
-    __half xb[2 * kTok * kCols];       // two chunk buffers, kTok activations each
+struct __align__(32) BlockSmem {
+    __half xb[2 * kTokB * kCols];      // two chunk buffers, kTok activations each (EXL3_WM70: 16 rows, B's columns)
+    float out[kTokB * kCols];
+#if defined(EXL3_WM70)
+    uint32_t wt[kWarps * 16 * kWtPitch];   // a warp's decoded tile by output (A, row-major)
+#endif
     uint32_t stage[kWarps * 4 * K2];   // a tile per warp (K != 4)
-    float out[kTok * kCols];
 };
 
 // (kTag 1: the mixed kernels' own copy - sharing one with them changes how AMD compiles the others' arithmetic)
@@ -409,13 +435,17 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     if (rot) chunk_load(x, suh, k0, lane, xv, xs4);
 #if defined(EXL3_TC)
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#elif defined(EXL3_WM70)
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cw;
+    nvcuda::wmma::fill_fragment(cw, 0.0f);
+    uint32_t* wt = sm.wt + warp * 16 * kWtPitch;
 #else
     float acc[kTok][2];
 #pragma unroll
     for (int cc = 0; cc < kTok; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
 #endif
     for (int q = 0; q < nq; ++q) {
-        __half* xq = sm.xb + (q & 1) * (kTok * kCols);
+        __half* xq = sm.xb + (q & 1) * (kTokB * kCols);
         if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
         __syncthreads();
         if (q + 1 < nq) {
@@ -435,6 +465,21 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
             }
             // A: rows (outputs) g / g + 8, columns (inputs) 2t.. / 2t + 8..: steps 0,1 / 4,5 / 2,3 / 6,7
             mma_f32(c, f[0], f[2], f[1], f[3], b0, b1);
+#elif defined(EXL3_WM70)
+            // f: outputs g (f[0], f[1]) and g + 8 (f[2], f[3]), inputs 2t, 2t + 1 (f[0], f[2]) / 2t + 8, 2t + 9
+            wt[g * kWtPitch + t] = f[0];
+            wt[g * kWtPitch + 4 + t] = f[1];
+            wt[(g + 8) * kWtPitch + t] = f[2];
+            wt[(g + 8) * kWtPitch + 4 + t] = f[3];
+            __syncwarp();
+            {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> fa;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> fb;
+                nvcuda::wmma::load_matrix_sync(fa, reinterpret_cast<const __half*>(wt), 2 * kWtPitch);
+                nvcuda::wmma::load_matrix_sync(fb, xq + s * 16, kCols);
+                nvcuda::wmma::mma_sync(cw, fa, fb, cw);
+            }
+            __syncwarp();   // (wt: the next slice's)
 #elif defined(EXL3_DOT2)
             // the pairs straight from FP16 (f[i]: steps 2i, 2i + 1; the activation's 2t, 2t + 1 / 2t + 8, 2t + 9)
 #pragma unroll
@@ -481,6 +526,9 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
         sm.out[(2 * t + 1) * kCols + o] = c[1];
         sm.out[(2 * t + 1) * kCols + o + 8] = c[3];
     }
+#elif defined(EXL3_WM70)
+    // D: output o of the warp's tile for activation n at out[n * kCols + warp * 16 + o] (16 columns: out is 16 rows)
+    nvcuda::wmma::store_matrix_sync(sm.out + warp * 16, cw, kCols, nvcuda::wmma::mem_col_major);
 #else
     // the 4 lanes of one g hold parts of the same two outputs
 #pragma unroll
@@ -969,12 +1017,21 @@ __global__ void EXL3_BOUNDS(2) win_down_mix_kernel(const KWin a, const KMix mx) 
     }
 }
 
+// (a host that never answers: the wait gives up after 120 s and wait_timeouts() counts it - no GPU left spinning)
+__device__ unsigned g_win_timeouts = 0;
 __global__ void win_wait_kernel(const unsigned* p, unsigned v) {
     if (threadIdx.x != 0) return;
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
     while (*(volatile const unsigned*) p != v) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (t - t0 > 120ull * 1000000000ull) {
+            atomicAdd(&g_win_timeouts, 1u);
+            break;
+        }
     }
     __threadfence_system();
 }
@@ -1112,6 +1169,49 @@ __global__ void __launch_bounds__(kThreads) rows_rot_out_kernel(float* y, int ld
     had128(v, lane);
 #pragma unroll
     for (int i = 0; i < 4; ++i) p[lane * 4 + i] = __fmul_rn(v[i], h2f(svh[b * kCols + lane * 4 + i]));
+}
+// rows_rot_f16 of FP16 rows (the prompt path's x16 / h16): out[r][c] = FP16(H(x_r * suh)[c]) - the portable kernels'
+// rotation of their FP16 input (XinHalf), bit for bit
+__global__ void __launch_bounds__(kThreads) rows_rot_f16h_kernel(const uint16_t* __restrict__ x, int ldx, int nrows,
+                                                                 int ncols, const uint16_t* __restrict__ suh,
+                                                                 uint16_t* out) {
+    const int lane = threadIdx.x & 31, nb = ncols / kCols;
+    const int w = blockIdx.x * kWarps + (threadIdx.x >> 5);
+    if (w >= nrows * nb) return;
+    const int r = w / nb, b = w % nb;
+    XinHalf xin;
+    xin.h = x + (size_t) r * ldx;
+    float v[4], sc[4];
+    chunk_load(xin, suh, b * kCols, lane, v, sc);
+    chunk_store(v, sc, lane, reinterpret_cast<__half*>(out) + (size_t) r * ncols + b * kCols);
+}
+// y[r][c] = beta y[r][c] + H(t_r)[c] * svh[c] (the output rotation of a product in t, added to y as hip_rows_kernel adds)
+__global__ void __launch_bounds__(kThreads) rows_rot_acc_kernel(const float* __restrict__ t, int ldt, float* y,
+                                                                int ldy, int nrows, int ncols,
+                                                                const uint16_t* __restrict__ svh, float beta) {
+    const int lane = threadIdx.x & 31, nb = ncols / kCols;
+    const int w = blockIdx.x * kWarps + (threadIdx.x >> 5);
+    if (w >= nrows * nb) return;
+    const int r = w / nb, b = w % nb;
+    const float* p = t + (size_t) r * ldt + b * kCols;
+    float* d = y + (size_t) r * ldy + b * kCols;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = p[lane * 4 + i];
+    had128(v, lane);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float value = v[i] * h2f(svh[b * kCols + lane * 4 + i]);
+        d[lane * 4 + i] = beta == 0.0f ? value : value + beta * d[lane * 4 + i];
+    }
+}
+// h[r][c] = FP16 swigluoai(g[r][c], u[r][c]) (the routed experts' activation, the tile kernels' swiglu)
+__global__ void swiglu_rows_kernel(const float* __restrict__ g, const float* __restrict__ u, int ld, int nrows, int ff,
+                                   float limit, uint16_t* h, int ldh) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) nrows * ff) return;
+    const int r = (int) (i / ff), c = (int) (i % ff);
+    h[(size_t) r * ldh + c] = __half_as_ushort(__float2half_rn(swiglu(g[(size_t) r * ld + c], u[(size_t) r * ld + c], limit)));
 }
 
 __global__ void rows_f16_kernel(const float* __restrict__ x, int ldx, const int* __restrict__ idx, int ncols,
@@ -1366,6 +1466,7 @@ __global__ void __launch_bounds__(kThreads) hip_set_kernel(SetArgs a, const floa
     const int row = start - a.row0 + (int) blockIdx.x * kTok;
     const int nc = min(kTok, end - start - (int) blockIdx.x * kTok);
     if (nc <= 0) return;
+    if (a.skip_ge > 0 && end - start >= a.skip_ge) return;   // (a busy expert: the caller's FP16 GEMMs take it)
     const uint8_t* blob = a.wbase + (size_t) e * a.stride;
     if constexpr (gate_up) {
         Xin in;
@@ -1461,11 +1562,16 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(SetArgs a, KMix mx, c
 // takes it on gfx11 only (wmma_now; EXL3_WMMA_ROWS 16 or 32, by default 16); the decode and verify kernels keep
 // block_gemv (their bits are the token path's).
 constexpr int kXS = kCols + 8;   // an activation's pitch in xb (halves: 2-way LDS reads)
+#if defined(STRATA_USE_HIP)
+constexpr int kWtW = 9;          // a warp's decoded tile by output, 8 words a row + 1 (banks)
+#else
+constexpr int kWtW = kWtPitch;   // (nvcuda::wmma: a row 16-byte aligned - 8 words + 4)
+#endif
 template <int K2, int NR>
-struct WmmaSmem {   // (out, xb and wt at the same offsets for every K2: the mixed kernel keeps one for all classes)
+struct __align__(32) WmmaSmem {   // (out, xb and wt at the same offsets for every K2: the mixed kernel keeps one for all)
     float out[NR * kCols];
     __half xb[2 * NR * kXS];
-    uint32_t wt[kWarps * 16 * 9];   // a warp's decoded tile by output, 8 words a row + 1 (banks)
+    uint32_t wt[kWarps * 16 * kWtW];
     uint32_t stage[kWarps * 4 * K2];
 };
 #if defined(STRATA_USE_HIP) && defined(__GFX11__)
@@ -1545,6 +1651,66 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
 #pragma unroll
             for (int i = 0; i < 8; ++i) sm.out[(b * 16 + m) * kCols + warp * 16 + 2 * i + (lane >> 4)] = c[b][i];
     __syncthreads();
+#elif defined(EXL3_WM70)
+    // Volta / Turing: the same through nvcuda::wmma - A the warp's decoded tile from wt (row-major, output m's 16
+    // inputs), B each 16 activations of the chunk (col-major: activation n's inputs at xq + n kXS), D into out
+    static_assert(K2 <= KS, "the shared memory's stage holds K2 words a lane");
+    namespace wm = nvcuda::wmma;
+    constexpr int W = Words<K2>::W, R = Words<K2>::R, NJ = NR / 8, NB = NR / 16;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    const size_t sstride = (size_t) ld * W;
+    const uint32_t* tile = tr + ((size_t) (k0 / 16) * ld + tc0 + warp) * W;
+    uint32_t* st = sm.stage + warp * W;
+    uint32_t* wt = sm.wt + warp * 16 * kWtW;
+    const int nq = (k1 - k0) / kCols;
+    uint32_t wc[8][R], wn[8][R];
+    float xv[NJ][4], xs[NJ][4];
+    load_tiles<K2>(tile, sstride, lane, wc);
+#pragma unroll
+    for (int j = 0; j < NJ; ++j)
+        if (warp + 8 * j < nc) chunk_load(in[j], suh, k0, lane, xv[j], xs[j]);
+    wm::fragment<wm::accumulator, 16, 16, 16, float> c[NB];
+#pragma unroll
+    for (int b = 0; b < NB; ++b) wm::fill_fragment(c[b], 0.0f);
+    for (int q = 0; q < nq; ++q) {
+        __half* xq = sm.xb + (q & 1) * (NR * kXS);
+#pragma unroll
+        for (int j = 0; j < NJ; ++j)
+            if (warp + 8 * j < nc) chunk_store(xv[j], xs[j], lane, xq + (warp + 8 * j) * kXS);
+        __syncthreads();
+        if (q + 1 < nq) {
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
+#pragma unroll
+            for (int j = 0; j < NJ; ++j)
+                if (warp + 8 * j < nc) chunk_load(in[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs[j]);
+        }
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            uint32_t f[4];
+            slice_frags<K2, cb>(wc[s], st, lane, f);
+            wt[g * kWtW + t] = f[0];
+            wt[g * kWtW + 4 + t] = f[1];
+            wt[(g + 8) * kWtW + t] = f[2];
+            wt[(g + 8) * kWtW + 4 + t] = f[3];
+            __syncwarp();
+            wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> fa;
+            wm::load_matrix_sync(fa, reinterpret_cast<const __half*>(wt), 2 * kWtW);
+#pragma unroll
+            for (int b = 0; b < NB; ++b) {   // (activations past nc: whatever xb holds - their outputs are not read)
+                wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::col_major> fb;
+                wm::load_matrix_sync(fb, xq + (b * 16) * kXS + s * 16, kXS);
+                wm::mma_sync(c[b], fa, fb, c[b]);
+            }
+            __syncwarp();   // (wt: the next slice's)
+        }
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+#pragma unroll
+            for (int r = 0; r < R; ++r) wc[s][r] = wn[s][r];
+    }
+#pragma unroll
+    for (int b = 0; b < NB; ++b) wm::store_matrix_sync(sm.out + (b * 16) * kCols + warp * 16, c[b], kCols, wm::mem_col_major);
+    __syncthreads();
 #endif
 }
 
@@ -1596,6 +1762,7 @@ __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const flo
     const int row = start - a.row0 + (int) blockIdx.x * NR;
     const int nc = min(NR, end - start - (int) blockIdx.x * NR);
     if (nc <= 0) return;
+    if (a.skip_ge > 0 && end - start >= a.skip_ge) return;   // (a busy expert: the caller's FP16 GEMMs take it)
     const uint8_t* blob = a.wbase + (size_t) e * a.stride;
     auto gemm = [&](int r, const auto& in) -> const float* {
         const int ld = r < 2 ? a.n_ff / 16 : a.n_embd / 16, k1 = r < 2 ? a.n_embd : a.n_ff;
@@ -1659,6 +1826,51 @@ __global__ void __launch_bounds__(kThreads) hip_rows_kernel(Mat m, const uint16_
         }
     }
 }
+// gemm_rows on Volta / Turing's tensor cores (block_gemm_w, EXL3_WM70): NR rows a block, each weight tile decoded once
+// for all of them
+template <int K2, int cb, int NR>
+__global__ void __launch_bounds__(kThreads) wm_rows_kernel(Mat m, const uint16_t* x, int ldx, int rows, float* y,
+                                                        int ldy, float beta) {
+    __shared__ __align__(16) WmmaSmem<K2, NR> sm;
+    const int row = blockIdx.x * NR, g = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nc = min(NR, rows - row);
+    XinHalf in[NR / 8];
+#pragma unroll
+    for (int j = 0; j < NR / 8; ++j)
+        if (warp + 8 * j < nc) in[j].h = x + (size_t) (row + warp + 8 * j) * ldx;
+    block_gemm_w<K2, cb, K2, NR>(m.trellis, m.ld > 0 ? m.ld : m.n / 16, g * 8, 0, m.k, in, m.suh, nc, sm);
+    for (int rr = warp; rr < nc; rr += kWarps) {
+        float v[4];
+        for (int i = 0; i < 4; ++i) v[i] = sm.out[rr * kCols + lane * 4 + i];
+        had128(v, lane);
+        for (int i = 0; i < 4; ++i) {
+            const int c = g * kCols + lane * 4 + i;
+            float* dst = y + (size_t) (row + rr) * ldy + c;
+            const float value = v[i] * h2f(m.svh[c]);
+            *dst = beta == 0.0f ? value : value + beta * *dst;
+        }
+    }
+}
+constexpr int kWmRows = 16;   // (Volta / Turing: 32 rows a block would take more than 48 KB of static shared memory)
+template <int K2, int cb> struct RunWm70GateUp {
+    static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
+        wmma_set_kernel<K2, cb, true, kWmRows><<<dim3((a.max_rows + kWmRows - 1) / kWmRows, a.n_ff / kCols, a.n_exp),
+                                                 kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, nullptr, 0);
+    }
+};
+template <int K2, int cb> struct RunWm70Down {
+    static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
+        wmma_set_kernel<K2, cb, false, kWmRows><<<dim3((a.max_rows + kWmRows - 1) / kWmRows, a.n_embd / kCols, a.n_exp),
+                                                  kThreads, 0, s>>>(a, nullptr, 0, nullptr, const_cast<uint16_t*>(h),
+                                                                    ldh, y, ldy);
+    }
+};
+template <int K2, int cb> struct RunWm70Rows {
+    static void run(const Mat& m, const uint16_t* x, int ldx, int rows, float* y, int ldy, float beta, cudaStream_t s) {
+        wm_rows_kernel<K2, cb, kWmRows><<<dim3((rows + kWmRows - 1) / kWmRows, m.n / kCols), kThreads, 0, s>>>(
+            m, x, ldx, rows, y, ldy, beta);
+    }
+};
 template <int K2, int cb> struct RunHipGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
         hip_set_kernel<K2, cb, true><<<dim3((a.max_rows + kTok - 1) / kTok, a.n_ff / kCols, a.n_exp), kThreads, 0, s>>>
@@ -1895,6 +2107,15 @@ int mv_cols(const Mat& m) {
     if (S <= 0) return 0;
     if (S == 1) return kTok;
     return (int) std::max<size_t>(1, std::min<size_t>(kTok, kPartFloats / ((size_t) S * m.n)));
+}
+
+unsigned wait_timeouts() {
+    unsigned n = 0;
+    if (cudaMemcpyFromSymbol(&n, g_win_timeouts, sizeof n) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return n;
 }
 
 int launch_errors() {
@@ -2237,6 +2458,161 @@ template <int K2, int cb> struct RunWmmaDown {
 };
 #endif
 
+#if !defined(STRATA_USE_HIP)
+// Volta / Turing (cc 7.x): the prompt path's tile kernels on the tensor cores (EXL3_WM70: wmma_set_kernel,
+// wm_rows_kernel) - cached a device; MM3_EXL3_WM70=0: the CUDA cores' portable kernels instead (A/B)
+static bool wm70_now() {
+    static const bool off = ::mm3::env("MM3_EXL3_WM70") != nullptr && std::atoi(::mm3::env("MM3_EXL3_WM70")) == 0;
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (off || dev < 0 || dev >= 64) return false;
+    int k = known[dev].load(std::memory_order_acquire);
+    if (k == 0) {
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        k = major == 7 ? 2 : 1;
+        known[dev].store(k, std::memory_order_release);
+    }
+    return k == 2;
+}
+
+// ---- the FP16 GEMMs (blas_enable): a stream's cuBLAS handle (its default math: the tensor cores) and scratch
+struct BlasCtx {
+    cublasHandle_t h = nullptr;
+    uint16_t* w16 = nullptr;   // a matrix's decoded W' (reconstruct_inner_rows), or a column piece of it
+    size_t w16_n = 0;
+    uint16_t* x16 = nullptr;   // the rotated input rows
+    size_t x16_n = 0;
+    float* f32 = nullptr;      // products before their output rotation (gate, up; a beta != 0 product)
+    size_t f32_n = 0;
+    size_t bytes = 0;
+};
+std::mutex g_blas_mu;
+std::map<std::pair<int, cudaStream_t>, BlasCtx> g_blas;
+BlasCtx* blas_ctx(cudaStream_t s) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    std::lock_guard<std::mutex> lk(g_blas_mu);
+    auto it = g_blas.find({dev, s});
+    return it == g_blas.end() ? nullptr : &it->second;
+}
+int blas_rows_env() {
+    static const int r = [] {
+        const char* v = ::mm3::env("MM3_EXL3_BLAS_ROWS");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 64;
+    }();
+    return r;
+}
+bool gemm16(BlasCtx& c, int m, int n, int k, const uint16_t* A, int lda, const uint16_t* B, int ldb, float* C, int ldc) {
+    const float one = 1.0f, zero = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(c.h, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, &one, A, CUDA_R_16F, lda, B,
+                                           CUDA_R_16F, ldb, &zero, C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F,
+                                           CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        std::fprintf(stderr, "exl3: cublasGemmEx status %d\n", (int) st);
+        g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
+}
+void launch_rot_f16h(const uint16_t* x, int ldx, int nrows, int ncols, const uint16_t* suh, uint16_t* out,
+                     cudaStream_t s) {
+    const long long warps = (long long) nrows * (ncols / kCols);
+    rows_rot_f16h_kernel<<<(unsigned) ((warps + kWarps - 1) / kWarps), kThreads, 0, s>>>(x, ldx, nrows, ncols, suh, out);
+}
+void launch_rot_acc(const float* t, int ldt, float* y, int ldy, int nrows, int ncols, const uint16_t* svh, float beta,
+                    cudaStream_t s) {
+    const long long warps = (long long) nrows * (ncols / kCols);
+    rows_rot_acc_kernel<<<(unsigned) ((warps + kWarps - 1) / kWarps), kThreads, 0, s>>>(t, ldt, y, ldy, nrows, ncols,
+                                                                                        svh, beta);
+}
+// one EXL3 matrix over FP16 rows through the FP16 GEMM: W' decoded once a column piece, the rows rotated by suh, the
+// product's output rotation by svh (x W = H(H(x * suh) W') * svh), y = beta y + it
+bool blas_rows_mat(BlasCtx& c, const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta,
+                   cudaStream_t s) {
+    const int cols = (int) std::min<size_t>((size_t) m.n, c.w16_n / (size_t) m.k / kCols * kCols);
+    if (cols < kCols) return false;
+    const int rp = (int) std::min<size_t>({(size_t) rows, c.x16_n / (size_t) m.k, c.f32_n / (size_t) cols});
+    if (rp <= 0) return false;
+    for (int c0 = 0; c0 < m.n; c0 += cols) {
+        const int nc = std::min(cols, m.n - c0);
+        const Mat v = nc == m.n ? m : view(m, c0, nc);
+        reconstruct_inner_rows(v, c.w16, s);
+        for (int r0 = 0; r0 < rows; r0 += rp) {
+            const int nr = std::min(rp, rows - r0);
+            launch_rot_f16h(x16 + (size_t) r0 * ldx, ldx, nr, m.k, m.suh, c.x16, s);
+            if (beta == 0.0f) {
+                if (!gemm16(c, nc, nr, m.k, c.w16, m.k, c.x16, m.k, y + (size_t) r0 * ldy + c0, ldy)) return false;
+                rows_rot_out(y + (size_t) r0 * ldy + c0, ldy, nr, nc, v.svh, s);
+            } else {
+                if (!gemm16(c, nc, nr, m.k, c.w16, m.k, c.x16, m.k, c.f32, nc)) return false;
+                launch_rot_acc(c.f32, nc, y + (size_t) r0 * ldy + c0, ldy, nr, nc, v.svh, beta, s);
+            }
+        }
+    }
+    launch_check("gemm_rows (FP16 GEMM)");
+    return true;
+}
+Mat expert_mat(const SetArgs& sa, int e, int r) {
+    const uint8_t* blob = sa.wbase + (size_t) e * sa.stride;
+    Mat m;
+    m.trellis = (const uint32_t*) (blob + sa.lay.trellis[r]);
+    m.suh = (const uint16_t*) (blob + sa.lay.suh[r]);
+    m.svh = (const uint16_t*) (blob + sa.lay.svh[r]);
+    m.k = r < 2 ? sa.n_embd : sa.n_ff;
+    m.n = r < 2 ? sa.n_ff : sa.n_embd;
+    m.k2 = sa.lay.k2[r];
+    m.cb = sa.lay.cb;
+    return m;
+}
+// a busy expert's gate / up (its sorted rows [lr0, lr0 + n) of the set, local): h16 rows = FP16 swigluoai
+bool blas_gate_up(BlasCtx& c, const SetArgs& sa, int e, int lr0, int n, const float* x, int ldx, const int* idx,
+                  uint16_t* h16, int ldh, cudaStream_t s) {
+    const int E = sa.n_embd, F = sa.n_ff;
+    if ((size_t) F * E > c.w16_n) return false;
+    const int rp = (int) std::min<size_t>({(size_t) n, c.x16_n / (size_t) E, c.f32_n / (2 * (size_t) F)});
+    if (rp <= 0) return false;
+    const Mat mg = expert_mat(sa, e, 0), mu = expert_mat(sa, e, 1);
+    float* G = c.f32;
+    float* U = c.f32 + (size_t) rp * F;
+    for (int r0 = 0; r0 < n; r0 += rp) {
+        const int nr = std::min(rp, n - r0);
+        for (int r = 0; r < 2; ++r) {   // (gate, then up: W' of one at a time in w16)
+            const Mat& m = r == 0 ? mg : mu;
+            reconstruct_inner_rows(m, c.w16, s);
+            rows_rot_f16(x, ldx, idx + lr0 + r0, nr, E, m.suh, c.x16, s);
+            if (!gemm16(c, F, nr, E, c.w16, E, c.x16, E, r == 0 ? G : U, F)) return false;
+            rows_rot_out(r == 0 ? G : U, F, nr, F, m.svh, s);
+        }
+        const size_t tot = (size_t) nr * F;
+        swiglu_rows_kernel<<<(unsigned) ((tot + 255) / 256), 256, 0, s>>>(G, U, F, nr, F, sa.limit,
+                                                                           h16 + (size_t) (lr0 + r0) * ldh, ldh);
+    }
+    launch_check("set_gate_up (FP16 GEMM)");
+    return true;
+}
+// ... and its down: y rows (local [lr0, lr0 + n)) = down(h16 rows)
+bool blas_down(BlasCtx& c, const SetArgs& sa, int e, int lr0, int n, const uint16_t* h16, int ldh, float* y, int ldy,
+               cudaStream_t s) {
+    const int E = sa.n_embd, F = sa.n_ff;
+    if ((size_t) F * E > c.w16_n) return false;
+    const int rp = (int) std::min<size_t>((size_t) n, c.x16_n / (size_t) F);
+    if (rp <= 0) return false;
+    const Mat md = expert_mat(sa, e, 2);
+    reconstruct_inner_rows(md, c.w16, s);
+    for (int r0 = 0; r0 < n; r0 += rp) {
+        const int nr = std::min(rp, n - r0);
+        launch_rot_f16h(h16 + (size_t) (lr0 + r0) * ldh, ldh, nr, F, md.suh, c.x16, s);
+        float* yr = y + (size_t) (lr0 + r0) * ldy;
+        if (!gemm16(c, E, nr, F, c.w16, F, c.x16, F, yr, ldy)) return false;
+        rows_rot_out(yr, ldy, nr, E, md.svh, s);
+    }
+    launch_check("set_down (FP16 GEMM)");
+    return true;
+}
+#endif
+
 bool mma_supported() {
 #if defined(STRATA_USE_HIP)
     return false;
@@ -2277,9 +2653,31 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
         return;
     }
 #if !defined(STRATA_USE_HIP)
-    if (!mma_now()) {   // (before sm_80: the portable kernels)
+    if (!mma_now()) {   // (before sm_80: Volta / Turing's tensor cores, else the portable kernels)
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
-        if (sa.lay.k2[0] != sa.lay.k2[1] || !dispatch<RunHipGateUp>(sa.lay.k2[0], sa.lay.cb, sa, x, ldx, row_idx, h16, ldh, s)) {
+        SetArgs sb = sa;
+        if (BlasCtx* bc = sa.hbounds != nullptr && blas_rows_env() > 0 ? blas_ctx(s) : nullptr) {
+            // the busy experts (blas_rows_env rows or more) through the FP16 GEMM, the rest through the tiles
+            const int R = blas_rows_env();
+            bool busy = false;
+            for (int e = 0; e < sa.n_exp; ++e) {
+                const int n = sa.hbounds[e + 1] - sa.hbounds[e];
+                if (n < R) continue;
+                if (!blas_gate_up(*bc, sa, e, sa.hbounds[e] - sa.row0, n, x, ldx, row_idx, h16, ldh, s)) {
+                    std::fprintf(stderr, "exl3 set_gate_up: the FP16 GEMM's scratch is too small\n");
+                    g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                busy = true;
+            }
+            if (busy) sb.skip_ge = R;
+        }
+        if (sa.lay.k2[0] == sa.lay.k2[1] && wm70_now() &&
+            dispatch<RunWm70GateUp>(sa.lay.k2[0], sa.lay.cb, sb, x, ldx, row_idx, h16, ldh, s)) {
+            launch_check("set_gate_up (tensor cores, sm_7x)");
+            return;
+        }
+        if (sa.lay.k2[0] != sa.lay.k2[1] || !dispatch<RunHipGateUp>(sa.lay.k2[0], sa.lay.cb, sb, x, ldx, row_idx, h16, ldh, s)) {
             std::fprintf(stderr, "exl3 set_gate_up: unsupported layout\n");
             g_launch_errors.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -2361,8 +2759,28 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
     }
 #if !defined(STRATA_USE_HIP)
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
-    if (!mma_now()) {   // (before sm_80: the portable kernels)
-        if (!dispatch<RunHipDown>(sa.lay.k2[2], sa.lay.cb, sa, h16, ldh, y, ldy, s))
+    if (!mma_now()) {   // (before sm_80: Volta / Turing's tensor cores, else the portable kernels)
+        SetArgs sb = sa;
+        if (BlasCtx* bc = sa.hbounds != nullptr && blas_rows_env() > 0 ? blas_ctx(s) : nullptr) {
+            const int R = blas_rows_env();
+            bool busy = false;
+            for (int e = 0; e < sa.n_exp; ++e) {
+                const int n = sa.hbounds[e + 1] - sa.hbounds[e];
+                if (n < R) continue;
+                if (!blas_down(*bc, sa, e, sa.hbounds[e] - sa.row0, n, h16, ldh, y, ldy, s)) {
+                    std::fprintf(stderr, "exl3 set_down: the FP16 GEMM's scratch is too small\n");
+                    g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                busy = true;
+            }
+            if (busy) sb.skip_ge = R;
+        }
+        if (wm70_now() && dispatch<RunWm70Down>(sa.lay.k2[2], sa.lay.cb, sb, h16, ldh, y, ldy, s)) {
+            launch_check("set_down (tensor cores, sm_7x)");
+            return;
+        }
+        if (!dispatch<RunHipDown>(sa.lay.k2[2], sa.lay.cb, sb, h16, ldh, y, ldy, s))
             g_launch_errors.fetch_add(1, std::memory_order_relaxed);
         else
             launch_check("set_down (portable)");
@@ -2404,8 +2822,18 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
 void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta, cudaStream_t s) {
 #if !defined(STRATA_USE_HIP)
     if (rows <= 0) return;
-    if (!mma_now()) {   // (before sm_80: the portable kernels)
-        if (!supported(m) || !dispatch<RunHipRows>(m.k2, m.cb, m, x16, ldx, rows, y, ldy, beta, s))
+    if (!mma_now()) {   // (before sm_80: the FP16 GEMM for many rows, Volta / Turing's tiles, the portable kernels)
+        if (!supported(m)) {
+            g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (BlasCtx* bc = blas_rows_env() > 0 && rows >= blas_rows_env() ? blas_ctx(s) : nullptr)
+            if (blas_rows_mat(*bc, m, x16, ldx, rows, y, ldy, beta, s)) return;
+        if (wm70_now() && dispatch<RunWm70Rows>(m.k2, m.cb, m, x16, ldx, rows, y, ldy, beta, s)) {
+            launch_check("gemm_rows (tensor cores, sm_7x)");
+            return;
+        }
+        if (!dispatch<RunHipRows>(m.k2, m.cb, m, x16, ldx, rows, y, ldy, beta, s))
             g_launch_errors.fetch_add(1, std::memory_order_relaxed);
         else
             launch_check("gemm_rows (portable)");
@@ -2439,6 +2867,59 @@ void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, i
         return;
     }
     launch_check("HIP gemm_rows");
+#endif
+}
+
+bool blas_enable(cudaStream_t s, size_t scratch_mb) {
+#if defined(STRATA_USE_HIP)
+    (void) s, (void) scratch_mb;
+    return false;
+#else
+    int dev = 0;
+    cudaGetDevice(&dev);
+    {
+        std::lock_guard<std::mutex> lk(g_blas_mu);
+        if (g_blas.count({dev, s})) return true;
+    }
+    BlasCtx c;
+    const size_t total = std::max<size_t>(scratch_mb, 8) << 20;
+    // a busy expert's W' (n_ff x n_embd: 6144 x 3072 for MiniMax-M3.1) and a dense matrix's column pieces in 40%, the
+    // rotated rows 25%, the F32 products the rest
+    c.w16_n = total * 2 / 5 / 2;
+    c.x16_n = total / 4 / 2;
+    c.f32_n = (total - c.w16_n * 2 - c.x16_n * 2) / 4;
+    if (cublasCreate(&c.h) != CUBLAS_STATUS_SUCCESS) return false;
+    if (cublasSetStream(c.h, s) != CUBLAS_STATUS_SUCCESS || cudaMalloc(&c.w16, c.w16_n * 2) != cudaSuccess ||
+        cudaMalloc(&c.x16, c.x16_n * 2) != cudaSuccess || cudaMalloc(&c.f32, c.f32_n * 4) != cudaSuccess) {
+        cudaGetLastError();
+        if (c.w16) cudaFree(c.w16);
+        if (c.x16) cudaFree(c.x16);
+        if (c.f32) cudaFree(c.f32);
+        cublasDestroy(c.h);
+        return false;
+    }
+    c.bytes = c.w16_n * 2 + c.x16_n * 2 + c.f32_n * 4;
+    std::lock_guard<std::mutex> lk(g_blas_mu);
+    g_blas[{dev, s}] = c;
+    return true;
+#endif
+}
+
+size_t blas_bytes(cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+    (void) s;
+    return 0;
+#else
+    BlasCtx* c = blas_ctx(s);
+    return c != nullptr ? c->bytes : 0;
+#endif
+}
+
+bool blas_wanted() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    return !mma_now() && blas_rows_env() > 0;
 #endif
 }
 

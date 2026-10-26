@@ -15,10 +15,7 @@
 #include <string>
 #include <vector>
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "mm3_os.hpp"
 
 namespace mm3 {
 
@@ -45,6 +42,7 @@ struct Pack {
             return false;
         }
         for (std::string line; std::getline(g, line);) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();   // (a pack written on Windows in text mode)
             const size_t sp = line.find(' ');
             if (sp != std::string::npos) kv[line.substr(0, sp)] = line.substr(sp + 1);
         }
@@ -55,6 +53,7 @@ struct Pack {
             return false;
         }
         for (std::string line; std::getline(f, line);) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
             std::istringstream is(line);
             std::string tag;
             is >> tag;
@@ -78,21 +77,14 @@ struct Pack {
         map_bytes.assign(files.size(), 0);
         for (size_t i = 0; i < files.size(); ++i) {
             const std::string p = model_dir + "/" + files[i];
-            const int fd = ::open(p.c_str(), O_RDONLY);
-            struct stat st{};
-            if (fd < 0 || ::fstat(fd, &st) != 0) {
-                err = p + ": cannot open";
-                if (fd >= 0) ::close(fd);
+            size_t sz = 0;
+            const uint8_t* m = os::map_file(p, sz);
+            if (m == nullptr) {
+                err = p + ": cannot open or map";
                 return false;
             }
-            void* m = ::mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-            ::close(fd);
-            if (m == MAP_FAILED) {
-                err = p + ": mmap failed";
-                return false;
-            }
-            map[i] = (const uint8_t*) m;
-            map_bytes[i] = (size_t) st.st_size;
+            map[i] = m;
+            map_bytes[i] = sz;
         }
         for (const auto& [n, x] : t)
             if (x.file < 0 || x.file >= (int) files.size() || x.off + x.bytes > map_bytes[(size_t) x.file]) {

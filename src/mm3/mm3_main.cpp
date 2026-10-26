@@ -43,15 +43,20 @@
 #include <unordered_map>
 #include <vector>
 
-#include <unistd.h>
-
 #include <cuda_profiler_api.h>
 
 #include "mm3_cpu.hpp"
+#include "mm3_env.hpp"
+#include "mm3_kernels.cuh"
 #include "mm3_model.hpp"
+#include "mm3_os.hpp"
 #include "mm3_pack.hpp"
 #include "mm3_sample.hpp"
 #include "mm3_vision.hpp"
+#if defined(_WIN32)
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
+#endif
 
 namespace {
 
@@ -188,13 +193,13 @@ struct Lines {
     std::deque<std::string> q;
     bool eof = false;
     std::atomic<bool> stop{false};
+    std::atomic<bool> wrap{false};   // (WRAP: the server is stopping - a request still thinking closes it and answers)
     void start() {
         std::thread([this] {
             std::string buf;
             char chunk[4096];
             for (;;) {
-                const ssize_t n = ::read(0, chunk, sizeof chunk);
-                if (n < 0 && errno == EINTR) continue;
+                const long n = mm3::os::read_stdin(chunk, sizeof chunk);
                 if (n <= 0) break;
                 buf.append(chunk, (size_t) n);
                 for (size_t nl; (nl = buf.find('\n')) != std::string::npos;) {
@@ -203,6 +208,10 @@ struct Lines {
                     if (!l.empty() && l.back() == '\r') l.pop_back();
                     if (l == "STOP") {
                         stop.store(true);
+                        continue;
+                    }
+                    if (l == "WRAP") {
+                        wrap.store(true);
                         continue;
                     }
                     std::lock_guard<std::mutex> lk(mu);
@@ -259,15 +268,17 @@ bool parse_gen(const std::string& line, Req& r) {
 }
 
 int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, float conf_floor, float draft_cost,
-          bool kv_int8) {
+          const std::string& kv_fmt, const std::string& profile_out) {
     for (const std::string& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     for (const std::string& l : m.vram_lines()) std::printf("%s\n", l.c_str());   // (the Monitor's GPU map)
     const auto& st0 = m.stats();
     std::printf("INFO engine=mm3 engine_kind=mm3 model=MiniMax-M3.1-Flash experts_vram=%ld experts=%ld "
-                "expert_slots=%ld ram_slots=%ld dspark=%d kv=%s", st0.resident, st0.experts, st0.resident, st0.pooled,
-                m.draft_block() > 0 && spec_on ? 1 : 0, kv_int8 ? "int8" : "bf16");
+                "expert_slots=%ld ram_slots=%ld dspark=%d kv=%s cpu_threads=%d cpu_experts=%ld ctx=%d", st0.resident,
+                st0.experts, st0.resident, st0.pooled, m.draft_block() > 0 && spec_on ? 1 : 0, kv_fmt.c_str(),
+                st0.cpu_threads, st0.experts - st0.resident, m.max_ctx());
     if (st0.kv_ring > 0) std::printf(" kv_resident=%d", st0.kv_ring);   // (KV streaming: a layer's positions in VRAM)
     std::printf("\n");
+    if (!m.vision()) std::printf("INFO vision=off\n");   // (no tower: the server answers text only)
     if (const mm3::VisionGeo* vg = m.vision())   // (serve/mm3_vision.py's Geometry.from_info)
         std::printf("INFO vision=mm3 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
                     "vision_max_pixels=%d vision_min_pixels=%d\n", vg->image_token, vg->image_start, vg->image_end,
@@ -275,7 +286,9 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
     std::printf("READY %d stop\n", m.max_ctx());
     std::fflush(stdout);
     std::fprintf(stderr, "maya mm3 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, QUIT\n");
+#if defined(SIGPIPE)
     std::signal(SIGPIPE, SIG_IGN);
+#endif
     Lines in;
     in.start();
     std::vector<int> state;   // the tokens in the cache, positions 0 ..
@@ -299,6 +312,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         Req r;
         if (!parse_gen(line, r) || (line.rfind("GENI ", 0) == 0 && r.file.empty())) {
             std::printf("ERR expected: GEN <max_new> [keys] <id,id,...> (GENI: the pictures' file before the ids)\n");
+            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
             std::fflush(stdout);
             continue;
         }
@@ -312,6 +326,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         if ((long long) r.ids.size() + std::max(0LL, r.max_new) > m.max_ctx()) {
             std::printf("ERR the prompt (%zu tokens) and max_new %lld are more than the context %d\n", r.ids.size(),
                         r.max_new, m.max_ctx());
+            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
             std::fflush(stdout);
             continue;
         }
@@ -406,17 +421,24 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
                        rng);
         // (the Monitor's tier keys too: the experts in VRAM, in the pinned pool - the CPU lane computes those from it -
         //  and a token the CPU lane's experts and the promotions; without a pool the misses come from the mapped files)
+        long long d_off = 0, d_acc = 0;
         auto stat_line = [&]() {
             const auto& s = m.stats();
+            const double per0 = produced > 0 ? 1.0 / (double) produced : 0.0;
+            char extra[96] = "";
+            int ne = 0;
+            if (s.staged > s_dec.staged)
+                ne += std::snprintf(extra + ne, sizeof extra - ne, " pcie=%.3f", (double) (s.staged - s_dec.staged) * per0);
+            if (d_off > 0) std::snprintf(extra + ne, sizeof extra - ne, " drafts=%.3f", (double) d_acc / (double) d_off);
             const double ms = now() * 1e3 - t1;
             const double ex = (double) ((s.profiled - s_dec.profiled)), cx = (double) (s.cpu_experts - s_dec.cpu_experts);
             const double per = produced > 0 ? 1.0 / (double) produced : 0.0;
             std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f vram_used=%ld ram_used=%ld vram_gb=%.2f "
-                        "ram_gb=%.2f %s=%.3f %s=0 promo=%.3f\n",
+                        "ram_gb=%.2f %s=%.3f %s=0 promo=%.3f%s\n",
                         ms > 0 ? 1000.0 * (double) produced / ms : 0.0, produced > 0 ? ms / (double) produced : 0.0,
                         ex > 0 ? 1.0 - cx / ex : 1.0, cx * per, s.resident, s.pooled, s.vram_gb, s.pinned_gb,
                         s.pooled ? "ram_fetch" : "disk", cx * per, s.pooled ? "disk" : "ram_fetch",
-                        (double) (s.promoted - s_dec.promoted) * per);
+                        (double) (s.promoted - s_dec.promoted) * per, extra);
         };
         // DSpark: a round drafts after the token, verifies the token and its drafts in one forward and keeps the drafts
         // the target agrees with - greedy: its argmax; sampling: a draft d (the draft's argmax) kept with the target's
@@ -445,7 +467,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             return use_c ? dist_c(cd.top[(size_t) i], cd.extra, cd.ex[(size_t) i], r, hist)
                          : dist(lgw.data() + (size_t) i * m.vocab(), m.vocab(), r, hist);
         };
-        long long d_off = 0, d_acc = 0;
+        std::string fail;   // (a forward or a draft that failed while the answer is written)
         // one token out: false when the answer ends with it (an end token, max_new, the context)
         auto emit = [&](int t) -> bool {
             std::printf("T %d\n", t);
@@ -465,24 +487,24 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
                 finish = "cancel";
                 break;
             }
-            if (in_think && produced >= r.think_budget && tok != r.think_end) tok = r.think_end;   // (the budget)
+            if (in_think && (produced >= r.think_budget || in.wrap.load()) && tok != r.think_end)
+                tok = r.think_end;   // (the budget, or WRAP)
             if (!emit(tok)) break;
             const int pos = (int) state.size();
             int k = 0;
             if (spec) {   // (the drafts that can still be answer tokens: max_new, the context, the thinking budget)
                 long long room = std::min<long long>(r.max_new - produced, (long long) m.max_ctx() - pos - 1);
                 if (in_think) room = std::min<long long>(room, r.think_budget - produced);
+                if (in_think && in.wrap.load()) room = 0;
                 if (room > 0) {
                     if (sampled) {
                         for (float& u : draws) u = (float) std::uniform_real_distribution<double>(0.0, 1.0)(rng);
                         if (!m.draft_sampled(tok, pos, B, ds, draws, drafts, confs, qd, err)) {
-                            std::fprintf(stderr, "mm3: %s\n", err.c_str());
-                            finish = "cancel";
+                            fail = err;
                             break;
                         }
                     } else if (!m.draft(tok, pos, B, drafts, confs, err)) {
-                        std::fprintf(stderr, "mm3: %s\n", err.c_str());
-                        finish = "cancel";
+                        fail = err;
                         break;
                     }
                     double surv = 1.0;
@@ -502,8 +524,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             if (k == 0) {
                 if (!(use_c ? m.forward_cands(&tok, 1, pos, 1, cd, err)
                             : m.forward(&tok, 1, pos, 1, lgw.empty() ? lg.data() : lgw.data(), err))) {
-                    std::fprintf(stderr, "mm3: %s\n", err.c_str());
-                    finish = "cancel";
+                    fail = err;
                     break;
                 }
                 state.push_back(tok);
@@ -513,8 +534,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             }
             if (!(use_c ? m.forward_cands(win.data(), k + 1, pos, k + 1, cd, err)
                         : m.forward(win.data(), k + 1, pos, k + 1, lgw.data(), err))) {
-                std::fprintf(stderr, "mm3: %s\n", err.c_str());
-                finish = "cancel";
+                fail = err;
                 break;
             }
             state.push_back(tok);
@@ -556,6 +576,13 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         }
         if (spec && d_off > 0)
             std::fprintf(stderr, "maya mm3 serve: DSpark kept %lld of %lld drafts\n", d_acc, d_off);
+        if (!fail.empty()) {
+            std::fprintf(stderr, "mm3: %s\n", fail.c_str());
+            std::printf("ERR %s\n", fail.c_str());
+            finish = "cancel";
+            state.clear();
+            held.clear();
+        }
         stat_line();
         const double t2 = now() * 1e3;
         const auto& se = m.stats();
@@ -563,6 +590,12 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", produced, r.ids.size(), t1 - t0, t2 - t1,
                     finish, d_acc, d_off, from, look - cpu, look);
         std::fflush(stdout);
+        if (!profile_out.empty()) {   // (this PC's routing learned: the next start places its experts by it)
+            std::string perr;
+            const std::string tmp = profile_out + ".tmp";
+            if (!m.save_profile(tmp, perr) || !strata::ds4::os::replace_file(tmp, profile_out))
+                std::fprintf(stderr, "mm3: the expert profile %s not saved %s\n", profile_out.c_str(), perr.c_str());
+        }
         std::fprintf(stderr,
                      "maya mm3 serve: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), %lld generated "
                      "in %.0f ms (%.2f tok/s); CPU lane %.1f%% of the experts\n",
@@ -574,14 +607,151 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
     return 0;
 }
 
+// --score FILE [--write-ref OUT]: the quality check against a reference's top-K log-probs (tools/mm3/kv_gate.py writes
+// FILE from ref_topk.npz, or from another run's --write-ref).  FILE: "MM3R", int32 rows, int32 T, int32 K, then per row
+// int32 ids[T], int32 ref_ids[T][K], float ref_lp[T][K] (K 0: none), uint8 mask[T - 1] (position t predicts ids[t + 1];
+// 1: an assistant token).  Each row runs from position 0; per position t < T - 1: KL(ref || engine) over the
+// reference's top K plus the rest of the vocabulary as one bucket (calib_mm31.py's), whether the top tokens agree, and
+// the target's NLL - summed over the assistant tokens and over all.  OUT: this engine's own top 64 in FILE's format
+// (the reference for another KV format's run).  Prints "SCORE ..." lines (one a row, then all).
+int score_main(mm3::Model& m, const std::string& path, const std::string& out_path) {
+    std::ifstream f(path, std::ios::binary);
+    char magic[4];
+    int32_t hdr[3];
+    if (!f.read(magic, 4) || std::memcmp(magic, "MM3R", 4) != 0 || !f.read((char*) hdr, 12)) {
+        std::fprintf(stderr, "%s: not a reference file (MM3R)\n", path.c_str());
+        return 2;
+    }
+    const int rows = hdr[0], T = hdr[1], K = hdr[2], V = m.vocab(), KO = 64;
+    if (T < 2 || T > m.max_ctx()) {
+        std::fprintf(stderr, "%s: rows of %d tokens, the context is %d (--max-context)\n", path.c_str(), T, m.max_ctx());
+        return 2;
+    }
+    std::FILE* fo = out_path.empty() ? nullptr : std::fopen(out_path.c_str(), "wb");
+    if (!out_path.empty() && !fo) {
+        std::fprintf(stderr, "%s: cannot write\n", out_path.c_str());
+        return 2;
+    }
+    if (fo) {
+        const int32_t oh[3] = {rows, T, KO};
+        std::fwrite("MM3R", 1, 4, fo);
+        std::fwrite(oh, 4, 3, fo);
+    }
+    const int C = 256;   // (the logits of 256 positions at a time: 205 MB)
+    std::vector<float> lg((size_t) C * V);
+    double kl_a = 0, kl_all = 0, same_a = 0, same_all = 0, nll_a = 0, nll_all = 0;
+    long n_a = 0, n_all = 0;
+    std::string err;
+    for (int r = 0; r < rows; ++r) {
+        std::vector<int32_t> ids((size_t) T), rid((size_t) T * K);
+        std::vector<float> rlp((size_t) T * K);
+        std::vector<uint8_t> mask((size_t) T - 1);
+        if (!f.read((char*) ids.data(), 4 * (std::streamsize) T) ||
+            !f.read((char*) rid.data(), 4 * (std::streamsize) rid.size()) ||
+            !f.read((char*) rlp.data(), 4 * (std::streamsize) rlp.size()) ||
+            !f.read((char*) mask.data(), (std::streamsize) mask.size())) {
+            std::fprintf(stderr, "%s: row %d cut short\n", path.c_str(), r);
+            return 2;
+        }
+        std::vector<int32_t> oid((size_t) T * KO);
+        std::vector<float> olp((size_t) T * KO);
+        double rk = 0, rka = 0, rs = 0, rsa = 0, rn = 0, rna = 0;
+        long ra = 0;
+        const double t0 = now();
+        for (int a = 0; a < T; a += C) {
+            const int n = std::min(C, T - a);
+            if (!m.forward(ids.data() + a, n, a, n, lg.data(), err)) {
+                std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+                return 1;
+            }
+            for (int i = 0; i < n; ++i) {
+                const int t = a + i;
+                const float* row = lg.data() + (size_t) i * V;
+                double mx = row[0];
+                int am = 0;
+                for (int v = 1; v < V; ++v)
+                    if (row[v] > mx) {
+                        mx = row[v];
+                        am = v;
+                    }
+                double se = 0;
+                for (int v = 0; v < V; ++v) se += std::exp((double) row[v] - mx);
+                const double lse = mx + std::log(se);
+                if (fo) {   // (this engine's top 64)
+                    std::vector<std::pair<float, int>> top((size_t) V);
+                    for (int v = 0; v < V; ++v) top[(size_t) v] = {row[v], v};
+                    std::partial_sort(top.begin(), top.begin() + KO, top.end(),
+                                      [](const auto& x, const auto& y) { return x.first > y.first; });
+                    for (int j = 0; j < KO; ++j) {
+                        oid[(size_t) t * KO + j] = top[(size_t) j].second;
+                        olp[(size_t) t * KO + j] = (float) ((double) top[(size_t) j].first - lse);
+                    }
+                }
+                if (t + 1 >= T) continue;
+                const double nll = lse - (double) row[ids[(size_t) t + 1]];
+                double kl = 0, same = 0;
+                if (K > 0) {
+                    double pr_sum = 0, q_sum = 0;
+                    for (int j = 0; j < K; ++j) {
+                        const double rl = rlp[(size_t) t * K + j];
+                        const double ql = (double) row[rid[(size_t) t * K + j]] - lse;
+                        const double pr = std::exp(rl);
+                        kl += pr * (rl - ql);
+                        pr_sum += pr;
+                        q_sum += std::exp(ql);
+                    }
+                    const double rest_r = std::max(1e-12, 1.0 - pr_sum), rest_q = std::max(1e-12, 1.0 - q_sum);
+                    kl += rest_r * (std::log(rest_r) - std::log(rest_q));
+                    same = am == rid[(size_t) t * K] ? 1.0 : 0.0;
+                }
+                rk += kl;
+                rs += same;
+                rn += nll;
+                if (mask[(size_t) t]) {
+                    rka += kl;
+                    rsa += same;
+                    rna += nll;
+                    ++ra;
+                }
+            }
+        }
+        const long rnall = T - 1;
+        kl_all += rk;
+        same_all += rs;
+        nll_all += rn;
+        n_all += rnall;
+        kl_a += rka;
+        same_a += rsa;
+        nll_a += rna;
+        n_a += ra;
+        std::printf("SCORE row=%d tokens=%d asst=%ld asst_kl=%.5f asst_same=%.4f asst_nll=%.4f all_kl=%.5f all_same=%.4f "
+                    "all_nll=%.4f s=%.1f\n", r, T, ra, ra ? rka / ra : 0.0, ra ? rsa / ra : 0.0, ra ? rna / ra : 0.0,
+                    rk / rnall, rs / rnall, rn / rnall, now() - t0);
+        std::fflush(stdout);
+        if (fo) {
+            std::fwrite(ids.data(), 4, ids.size(), fo);
+            std::fwrite(oid.data(), 4, oid.size(), fo);
+            std::fwrite(olp.data(), 4, olp.size(), fo);
+            std::fwrite(mask.data(), 1, mask.size(), fo);
+        }
+    }
+    if (fo) std::fclose(fo);
+    std::printf("SCORE all rows=%d tokens=%ld asst=%ld asst_kl=%.5f asst_same=%.4f asst_nll=%.4f all_kl=%.5f "
+                "all_same=%.4f all_nll=%.4f\n", rows, n_all, n_a, n_a ? kl_a / n_a : 0.0, n_a ? same_a / n_a : 0.0,
+                n_a ? nll_a / n_a : 0.0, n_all ? kl_all / n_all : 0.0, n_all ? same_all / n_all : 0.0,
+                n_all ? nll_all / n_all : 0.0);
+    return 0;
+}
+
 int usage() {
     std::fprintf(stderr,
                  "usage: maya-mm3 --pack DIR --ids IDS|@FILE [--gen N] [--dump-logits FILE --last N] [--gpus LIST]\n"
                  "                [--max-context N] [--chunk N] [--staging N] [--resident-cap N] [--reserve-gb X]\n"
                  "                [--vision on|off] [--vision-gpu I] [--images FILE] [--layer-split auto|L,L,...]\n"
-                 "                [--tp 1|2|4] [--cache-gb X] [--kv-cache bf16|int8] [--kv-streaming on|off]\n"
-                 "                [--kv-resident N] [--kv-rotate on|off] [--tp-chunk N] [--tp-ffn-rows N]\n"
-                 "                [--dspark-cost X]\n"
+                 "                [--tp 1|2|4] [--cache-gb X] [--kv-cache F|K,V (bf16 int8 fp8 fp4; default int8)]\n"
+                 "                [--kv-rot on|off] [--kv-streaming on|off] [--expert-profile FILE]\n"
+                 "                [--score REF [--write-ref OUT]] [--cpu-threads N] [--dspark on|off]\n"
+                 "                [--kv-resident N] [--tp-chunk N] [--tp-ffn-rows N] [--dspark-cost X]\n"
                  "                [--verbose]\n"
                  "       maya-mm3 --pack DIR --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus N]\n");
     return 2;
@@ -590,8 +760,26 @@ int usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // cuBLAS gives the same bits run after run only with its workspace pinned (its notes on reproducibility): before
+    // any handle; a setting the caller made stays
+    if (std::getenv("CUBLAS_WORKSPACE_CONFIG") == nullptr) {
+#if defined(_WIN32)
+        _putenv_s("CUBLAS_WORKSPACE_CONFIG", ":4096:8");
+#else
+        setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 0);
+#endif
+    }
+#if defined(_WIN32)
+    // Windows sleeps in 15.6 ms ticks unless a process asks for finer ones (the CPU lane's idle workers, the waits'
+    // naps).  MAYA_MM3_TIMER_MS=0: leave the system's resolution alone
+    {
+        const char* v = std::getenv("MAYA_MM3_TIMER_MS");
+        const int ms = v != nullptr ? std::atoi(v) : 1;
+        if (ms > 0) timeBeginPeriod((UINT) ms);
+    }
+#endif
     mm3::Options o;
-    std::string ids_arg, dump, profile_out, batch, eos_arg, images, enc_rgb, enc_size, enc_out;
+    std::string ids_arg, dump, profile_out, batch, eos_arg, images, enc_rgb, enc_size, enc_out, score_path, ref_out, learned;
     bool serve_mode = false;
     int kv_stream = -1;   // (--kv-streaming: -1 not given)
     int gen = 0, last = 1, ppl = 0;
@@ -626,8 +814,15 @@ int main(int argc, char** argv) {
         else if (a == "--ppl") ppl = std::atoi(val().c_str());
         else if (a == "--batch") batch = val();
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val().c_str());
-        else if (a == "--dspark") o.dspark = val() != "off";
-        else if (a == "--vision") o.vision = val() != "off";
+        else if (a == "--dspark") {
+            const std::string v = val();
+            o.dspark = v != "off" && v != "none";
+        }
+        else if (a == "--expert-profile") learned = val();
+        else if (a == "--vision") {   // (on by default when the pack has the tower; --vision on: it must)
+            o.vision = val() != "off";
+            o.vision_auto = false;
+        }
         else if (a == "--tp") o.tp = std::atoi(val().c_str());
         else if (a == "--cache-gb") o.cache_gb = std::atof(val().c_str());
         else if (a == "--tp-chunk") o.tp_chunk = std::atoi(val().c_str());
@@ -637,15 +832,23 @@ int main(int argc, char** argv) {
             if (v != "on" && v != "off") return usage();
             kv_stream = v == "on" ? 1 : 0;
         } else if (a == "--kv-resident") o.kv_resident = std::max(0, std::atoi(val().c_str()));
-        else if (a == "--kv-rotate") {   // (on: the INT8 caches' rows rotated first - opt-in, measured by --ppl)
+        else if (a == "--kv-cache") {   // (one format for K and V, "K,V", or kXvY: k8v4, k16v4, ki8vi8)
+            std::string v = val(), kf = v, vf = v;
+            if (const size_t c = v.find(','); c != std::string::npos) {
+                kf = v.substr(0, c);
+                vf = v.substr(c + 1);
+            } else if (v.size() > 2 && v[0] == 'k' && v.find('v') != std::string::npos) {
+                kf = v.substr(1, v.find('v') - 1);
+                vf = v.substr(v.find('v') + 1);
+            }
+            const int K = mm3::k::kv_parse(kf.c_str()), V = mm3::k::kv_parse(vf.c_str());
+            if (K < 0 || V < 0) return usage();
+            o.kv_k = K;
+            o.kv_v = V;
+        } else if (a == "--kv-rot" || a == "--kv-rotate") {   // (#490's name too)
             const std::string v = val();
             if (v != "on" && v != "off") return usage();
-            o.kv_rotate = v == "on";
-        }
-        else if (a == "--kv-cache") {
-            const std::string v = val();
-            if (v != "int8" && v != "bf16") return usage();
-            o.kv_int8 = v == "int8";
+            o.kv_rot = v == "on";
         }
         else if (a == "--layer-split") {   // (serve/server.py's: "auto", or the first layer of each later GPU's share)
             const std::string v = val();
@@ -658,6 +861,8 @@ int main(int argc, char** argv) {
         else if (a == "--dump-image") enc_out = val();
         else if (a == "--dspark-conf") dspark_conf = (float) std::atof(val().c_str());
         else if (a == "--dspark-cost") dspark_cost = (float) std::atof(val().c_str());
+        else if (a == "--score") score_path = val();
+        else if (a == "--write-ref") ref_out = val();
         else if (a == "--serve") serve_mode = true;
         else if (a == "--eos") eos_arg = val();
         else if (a == "--verbose") o.verbose = true;
@@ -698,10 +903,20 @@ int main(int argc, char** argv) {
         std::fclose(fo);
         return 0;
     }
-    if (o.pack.empty() || (ids_arg.empty() && batch.empty() && !serve_mode)) return usage();
+    if (o.pack.empty() || (ids_arg.empty() && batch.empty() && !serve_mode && score_path.empty())) return usage();
     if (kv_stream == 0) o.kv_resident = 0;
     else if (kv_stream == 1 && o.kv_resident == 0) o.kv_resident = 32768;
-    if (!images.empty()) o.vision = true;
+    if (!images.empty()) {
+        o.vision = true;
+        o.vision_auto = false;
+    }
+    if (!learned.empty()) {   // (this PC's own routing: read when it exists, else the shipped --profile; saved)
+        if (std::FILE* f = std::fopen(learned.c_str(), "rb")) {
+            std::fclose(f);
+            o.profile = learned;
+        }
+        if (profile_out.empty()) profile_out = learned;
+    }
     if (o.cpu_threads == -2) o.cpu_threads = mm3::CpuLane::auto_workers();   // (no --cpu-threads: this host's cores)
     std::vector<int> ids = ids_arg.empty() ? std::vector<int>{0} : parse_ids(ids_arg);
     if (ids.empty()) {
@@ -714,9 +929,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
         return 1;
     }
+    if (!score_path.empty()) {
+        for (const auto& l : m.info_lines()) std::fprintf(stderr, "  %s\n", l.c_str());
+        return score_main(m, score_path, ref_out);
+    }
     if (serve_mode) {
         std::vector<int> eos = eos_arg.empty() ? std::vector<int>{m.eos()} : parse_list(eos_arg);
-        return serve(m, eos, o.chunk, o.dspark, dspark_conf, dspark_cost, o.kv_int8);
+        const std::string kvf = o.kv_k == o.kv_v ? std::string(mm3::k::kv_name(o.kv_k))
+                                                 : std::string(mm3::k::kv_name(o.kv_k)) + "," + mm3::k::kv_name(o.kv_v);
+        return serve(m, eos, o.chunk, o.dspark, dspark_conf, dspark_cost, kvf, profile_out);
     }
     const auto& st = m.stats();
     std::fprintf(stderr, "maya-mm3: loaded in %.1f s, %ld of %ld experts in VRAM, %.1f GB pinned pool\n", st.load_s,
@@ -854,9 +1075,9 @@ int main(int argc, char** argv) {
     int next = argmax(logits.data() + (size_t) (last - 1) * m.vocab());
     std::printf("next %d\n", next);
     // (debugging, MM3_STRESS=N [MM3_STRESS_T=T]: one verify window's forward N more times - its logits may not change)
-    if (const char* sv = std::getenv("MM3_STRESS"); sv && m.draft_block() > 0) {
+    if (const char* sv = ::mm3::env("MM3_STRESS"); sv && m.draft_block() > 0) {
         const int iters = std::atoi(sv);
-        const int tw = std::getenv("MM3_STRESS_T") ? std::atoi(std::getenv("MM3_STRESS_T")) : 4;
+        const int tw = ::mm3::env("MM3_STRESS_T") ? std::atoi(::mm3::env("MM3_STRESS_T")) : 4;
         std::vector<int> drafts;
         std::vector<float> conf;
         if (!m.draft(next, n, m.draft_block(), drafts, conf, err)) return 1;
@@ -902,7 +1123,7 @@ int main(int argc, char** argv) {
         while ((int) out.size() < gen) {
             out.push_back(next);
             if (next == m.eos()) break;
-            if (const char* ns = std::getenv("MM3_NSYS")) {   // (profiling: rounds 20 .. 20 + N under nsys's capture)
+            if (const char* ns = ::mm3::env("MM3_NSYS")) {   // (profiling: rounds 20 .. 20 + N under nsys's capture)
                 if (rounds == 20) cudaProfilerStart();
                 if (rounds == 20 + std::atoi(ns)) cudaProfilerStop();
             }
@@ -915,7 +1136,7 @@ int main(int argc, char** argv) {
             while (k < (int) drafts.size() && conf[(size_t) k] >= dspark_conf) ++k;
             ++drafted;
             t_draft += now() - td;
-            if (std::getenv("MM3_CONF") && k > 0) {   // (debugging: each round's confidences)
+            if (::mm3::env("MM3_CONF") && k > 0) {   // (debugging: each round's confidences)
                 std::fprintf(stderr, "conf");
                 for (float c : conf) std::fprintf(stderr, " %.3f", c);
                 std::fprintf(stderr, " -> %d\n", k);
@@ -981,7 +1202,7 @@ int main(int argc, char** argv) {
         t1 = now();
         std::fprintf(stderr, "decode: %d tokens in %.2f s (%.2f tok/s), %ld experts staged in all, %ld on the CPU\n",
                      done, t1 - t0, done / (t1 - t0), m.stats().staged, m.stats().cpu_experts);
-        if (std::getenv("MM3_TIMING") && done > 0) {
+        if (::mm3::env("MM3_TIMING") && done > 0) {
             const auto& s2 = m.stats();
             std::fprintf(stderr, "  a token: %.1f ms - routing waits %.1f ms, CPU lane %.1f ms, promotions' copies %.1f ms "
                          "(%ld promoted)\n", 1e3 * s2.t_token / done, 1e3 * s2.t_sync / done, 1e3 * s2.t_lane / done,

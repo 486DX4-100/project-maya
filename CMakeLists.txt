@@ -499,14 +499,32 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
 
   # MiniMax-M3.1-Flash (EXL3, tools/mm3/pack.py): its own engine (src/mm3), with its own copy of the EXL3 device kernels
-  # (swigluoai) - none of the other engines' code.  CUDA on Linux.
-  if(STRATA_ENABLE_CUDA AND NOT WIN32)
+  # (swigluoai) - none of the other engines' code but maya-ds4's OS helpers (src/ds4/ds4_os.hpp).  CUDA, on Linux and
+  # Windows.
+  if(STRATA_ENABLE_CUDA)
     add_executable(maya-mm3 src/mm3/mm3_main.cpp src/mm3/mm3_model.cu src/mm3/mm3_kernels.cu src/mm3/mm3_exl3.cu
                             src/mm3/mm3_cpu.cpp src/mm3/mm3_host.cpp src/mm3/mm3_dspark.cu
                             src/mm3/mm3_vision.cu src/mm3/mm3_tp.cu)
     target_include_directories(maya-mm3 PRIVATE ${_strata_gpu_include_directories} include src/mm3)
     # (the CPU lane: the shared CPU EXL3 kernels, used as they are)
     target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    if(STRATA_BUILD_TESTS)
+      # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with
+      # swigluoai, the Volta / Turing tensor-core tiles and the FP16 GEMM path before sm_80
+      add_executable(mm3_exl3_test tests/mm3_exl3_test.cu src/mm3/mm3_exl3.cu)
+      target_include_directories(mm3_exl3_test PRIVATE ${_strata_gpu_include_directories} include src/mm3)
+      target_link_libraries(mm3_exl3_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target}
+                            ${_strata_gpu_blas_target})
+      add_test(NAME mm3_exl3_test COMMAND mm3_exl3_test)
+      set_tests_properties(mm3_exl3_test PROPERTIES TIMEOUT 300)
+      # the K / V caches in every format (BF16, INT8, FP8, FP4, mixed; rows rotated or not) and the sparse attention
+      # over them: exact over the decoded rows, KV streaming the same bits, each format's error (no model)
+      add_executable(mm3_kv_test tests/mm3_kv_test.cu src/mm3/mm3_kernels.cu)
+      target_include_directories(mm3_kv_test PRIVATE ${_strata_gpu_include_directories} include src/mm3)
+      target_link_libraries(mm3_kv_test PRIVATE ${_strata_gpu_runtime_target})
+      add_test(NAME mm3_kv_test COMMAND mm3_kv_test)
+      set_tests_properties(mm3_kv_test PROPERTIES TIMEOUT 600)
+    endif()
   endif()
 
   if(STRATA_ENABLE_HIP)

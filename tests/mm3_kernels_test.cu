@@ -144,14 +144,15 @@ int main() {
         uint16_t *kc = nullptr, *vc = nullptr;
         cudaMalloc(&kc, (size_t) ctx * 128 * 2);
         cudaMalloc(&vc, (size_t) ctx * 128 * 2);
-        k::KvI8 i8, i8r;
-        for (k::KvI8* c : {&i8, &i8r}) {
+        k::KvQ i8, i8r;   // (the INT8 caches; i8r's rows rotated - the queries are rotated inside sparse_attn)
+        for (k::KvQ* c : {&i8, &i8r}) {
+            c->kf = c->vf = k::kKvI8;
             cudaMalloc(&c->kc, (size_t) ctx * 128);
             cudaMalloc(&c->vc, (size_t) ctx * 128);
             cudaMalloc(&c->ks, (size_t) ctx * 4);
             cudaMalloc(&c->vs, (size_t) ctx * 4);
         }
-        i8r.rot = true;
+        i8r.rot = 3;
         k::qk_norm_rope(nullptr, d_k, d_v, nullptr, d_one, d_pos_all, ctx, 0, Hkv, 128, 0, d_inv, 1e-6f, kc, vc, 0);
         k::qk_norm_rope(nullptr, d_k, d_v, nullptr, d_one, d_pos_all, ctx, 0, Hkv, 128, 0, d_inv, 1e-6f, nullptr, nullptr, 0, 0, i8);
         k::qk_norm_rope(nullptr, d_k, d_v, nullptr, d_one, d_pos_all, ctx, 0, Hkv, 128, 0, d_inv, 1e-6f, nullptr, nullptr, 0, 0, i8r);
@@ -161,9 +162,8 @@ int main() {
         float* d_zk = dev(zk);
         float* d_qr = dev(q);
         k::qk_norm_rope(d_q, d_zk, d_zk, d_one, d_one, d_pos, T, Hq, 0, 128, 0, d_inv, 1e-6f, nullptr, nullptr, 0);
-        // (Hkv 0: q alone; the rotated q needs the int8 path's flag - a dummy INT8 cache of the window's rows)
-        k::KvI8 dummy = i8r;
-        k::qk_norm_rope(d_qr, d_zk, d_zk, d_one, d_one, d_pos, T, Hq, 0, 128, 0, d_inv, 1e-6f, nullptr, nullptr, 0, 0, dummy);
+        // (the rotated cache takes the same normed queries: sparse_attn rotates them as the keys)
+        cudaMemcpy(d_qr, d_q, q.size() * 4, cudaMemcpyDeviceToDevice);
         cudaDeviceSynchronize();
         int* d_kept = dev(kept);
         float *o1, *o16, *o8, *o8r, *part;
@@ -171,7 +171,7 @@ int main() {
         cudaMalloc(&part, k::attn_part_floats(T, Hkv, 16) * 4);
         const float scale = 1.0f / std::sqrt(128.0f);
         k::sparse_attn(d_q, kc, vc, d_kept, d_pos, T, Hq, Hkv, topk, blk, scale, o1, 0);
-        k::sparse_attn(d_q, kc, vc, d_kept, d_pos, T, Hq, Hkv, topk, blk, scale, o16, 0, k::KvI8{}, k::KvHost{}, 16, part);
+        k::sparse_attn(d_q, kc, vc, d_kept, d_pos, T, Hq, Hkv, topk, blk, scale, o16, 0, k::KvQ{}, k::KvHost{}, 16, part);
         k::sparse_attn(d_q, kc, vc, d_kept, d_pos, T, Hq, Hkv, topk, blk, scale, o8, 0, i8);
         k::sparse_attn(d_qr, kc, vc, d_kept, d_pos, T, Hq, Hkv, topk, blk, scale, o8r, 0, i8r, k::KvHost{}, 16, part);
         const cudaError_t ce = cudaDeviceSynchronize();

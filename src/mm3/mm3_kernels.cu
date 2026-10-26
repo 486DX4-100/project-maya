@@ -51,36 +51,14 @@ __device__ float block_absmax(float v, float* red) {
     return m;
 }
 
-// an INT8 cache row: v (this thread's of the block's 128) as round(v / s), s = the row's max |v| / 127 (0: a zero row);
-// host (KV streaming): the same row in host memory too
-__device__ void put_i8(float v, int8_t* row, float* scale, float* red, int8_t* hrow = nullptr, float* hscale = nullptr) {
-    const float am = block_absmax(v, red);
-    const float s = am / 127.0f;
-    const int8_t q = s > 0.0f ? (int8_t) fminf(fmaxf(rintf(v / s), -127.0f), 127.0f) : (int8_t) 0;
-    row[threadIdx.x] = q;
-    if (threadIdx.x == 0) *scale = s;
-    if (hrow) {
-        hrow[threadIdx.x] = q;
-        if (threadIdx.x == 0) *hscale = s;
-    }
-}
-
-constexpr float kInvSqrt128 = 0.08838834764831845f;
-
-// x [rows][128] in shared memory through the 128-point Sylvester Hadamard / sqrt(128), row by row (blockDim.x 128, a
-// column a thread; every thread of the block calls it)
-__device__ void fwht_rows(float (*x)[128], int rows) {
-    const int d = threadIdx.x;
-    for (int len = 1; len < 128; len <<= 1) {
-        __syncthreads();
-        if ((d & len) == 0)
-            for (int h = 0; h < rows; ++h) {
-                const float a = x[h][d], b = x[h][d + len];
-                x[h][d] = a + b;
-                x[h][d + len] = a - b;
-            }
-    }
-    __syncthreads();
+// the device's waits on the host give up after kWaitLimitNs (a host that never answers - a bug, a crash - must not leave
+// the GPU spinning and every later host wait hung): counted in g_wait_timeouts, which wait_timeouts() reads
+__device__ unsigned g_wait_timeouts = 0;
+constexpr unsigned long long kWaitLimitNs = 120ull * 1000000000ull;
+__device__ __forceinline__ unsigned long long gtimer() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
 }
 
 void check(const char* what) {
@@ -126,57 +104,178 @@ __device__ float norm_rope(float x, const float* w1, int pos, int n_rot, const f
     return o;
 }
 
-// (kc8: the INT8 caches instead - K / V rows of int8 and a scale each, kc / vc unused; rot (--kv-rotate, with kc8):
-//  q, k and v rows through the 128-point Hadamard / sqrt(128) first - q . k is the same, an outlier spread over the
-//  row before its scale.  hs.ring: KV streaming - the VRAM rows a ring, row p % hs.ring tagged p, and position p's row
-//  in host memory as well)
-__device__ __forceinline__ float rotate_row(float o, float* sh) {   // (blockDim.x = 128; every thread calls it)
-    sh[threadIdx.x] = o;
-    fwht_rows((float (*)[128]) sh, 1);
-    return sh[threadIdx.x] * kInvSqrt128;
+// ---------------------------------------------------------------- the K / V caches' rows (mm3_kernels.cuh: KvQ)
+// the 128-point Sylvester transform over sqrt(128) of the 128 values a warp holds 4 per lane (value lane * 4 + i) -
+// mm3_exl3.cu's had128
+__device__ __forceinline__ void had128w(float* v, int lane) {
+    const float s0 = v[0] + v[1], d0 = v[0] - v[1], s1 = v[2] + v[3], d1 = v[2] - v[3];
+    v[0] = s0 + s1;
+    v[1] = d0 + d1;
+    v[2] = s0 - s1;
+    v[3] = d0 - d1;
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float o = __shfl_xor_sync(0xffffffffu, v[i], m);
+            v[i] = (lane & m) ? o - v[i] : v[i] + o;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] *= 0.088388347648f;
+}
+// the same transform of the 128 values a block of 128 threads holds one each (value threadIdx.x); sh: 128 floats
+__device__ float had_block(float v, float* sh) {
+    const int d = threadIdx.x, lane = d & 31;
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+        const float o = __shfl_xor_sync(0xffffffffu, v, m);
+        v = (lane & m) ? o - v : v + o;
+    }
+    __syncthreads();
+    sh[d] = v;
+    __syncthreads();
+    {
+        const float o = sh[d ^ 32];
+        v = (d & 32) ? o - v : v + o;
+    }
+    __syncthreads();
+    sh[d] = v;
+    __syncthreads();
+    {
+        const float o = sh[d ^ 64];
+        v = (d & 64) ? o - v : v + o;
+    }
+    __syncthreads();
+    return v * 0.088388347648f;
+}
+// E2M1 (FP4): magnitudes 0 .5 1 1.5 2 3 4 6, the nearest (ties to even), its code (bit 3 the sign) and a code's value
+__device__ __forceinline__ float e2m1_rt(float v) {
+    const float a = fabsf(v);
+    float r;
+    if (a <= 0.25f) r = 0.0f;
+    else if (a < 0.75f) r = 0.5f;
+    else if (a <= 1.25f) r = 1.0f;
+    else if (a < 1.75f) r = 1.5f;
+    else if (a <= 2.5f) r = 2.0f;
+    else if (a < 3.5f) r = 3.0f;
+    else if (a <= 5.0f) r = 4.0f;
+    else r = 6.0f;
+    return copysignf(r, v);
+}
+__device__ __forceinline__ uint32_t e2m1_code(float q) {
+    const float a = fabsf(q);
+    const uint32_t m = a <= 1.5f ? (uint32_t) (a * 2.0f) : a <= 2.0f ? 4u : a <= 3.0f ? 5u : a <= 4.0f ? 6u : 7u;
+    return m | ((__float_as_uint(q) >> 31) << 3);
+}
+__device__ __forceinline__ float e2m1_val(uint32_t c) {
+    const uint32_t m = c & 7u;
+    const float a = m < 4u ? 0.5f * (float) m : m == 4u ? 2.0f : m == 5u ? 3.0f : m == 6u ? 4.0f : 6.0f;
+    return (c & 8u) ? -a : a;
+}
+// E4M3 (FP8): the nearest of v (saturated at 448), and a code's value (exact; no NaN codes are written)
+__device__ __forceinline__ uint32_t e4m3_enc(float v) {
+    return (uint32_t) __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+}
+__device__ __forceinline__ float e4m3_dec(uint32_t b) {
+    const uint32_t e = (b >> 3) & 15u, m = b & 7u;
+    const float a = e == 0u ? (float) m * 0.001953125f : __uint_as_float(((e + 120u) << 23) | (m << 20));
+    return (b & 0x80u) ? -a : a;
 }
 
+// one cache row (a position's KV head, 128 values, value threadIdx.x of the block's 128 threads) in format fmt into
+// code / sc (and hcode / hsc: KV streaming's host copy), rotated first when rot:
+//   kKvI8   128 int8 round(v / s), s = max |v| / 127 (an F32 scale)
+//   kKvFp8  128 E4M3 codes of v / 2^e, e the smallest with every |v| / 2^e of a group of 32 at most 448 (a UE8M0 byte a
+//           group: e + 127)
+//   kKvFp4  64 bytes of E2M1 codes (value 2i in the low nibble) of v / s, s the E4M3 of a group of 16's max |v| / 6
+//           (an E4M3 byte a group) - NVFP4's
+// red: 33 floats, sh: 128 floats of shared memory
+__device__ void put_row(float v, int fmt, bool rot, uint8_t* code, uint8_t* sc, uint8_t* hcode, uint8_t* hsc,
+                        float* red, float* sh) {
+    const int d = threadIdx.x, lane = d & 31;
+    if (rot) v = had_block(v, sh);
+    if (fmt == kKvI8) {
+        const float am = block_absmax(v, red);
+        const float s = am / 127.0f;
+        const int8_t q = s > 0.0f ? (int8_t) fminf(fmaxf(rintf(v / s), -127.0f), 127.0f) : (int8_t) 0;
+        code[d] = (uint8_t) q;
+        if (hcode) hcode[d] = (uint8_t) q;
+        if (d == 0) {
+            *(float*) sc = s;
+            if (hsc) *(float*) hsc = s;
+        }
+    } else if (fmt == kKvFp8) {
+        float am = fabsf(v);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+        int e = -127;
+        if (am > 0.0f) {
+            const uint32_t b = __float_as_uint(am / 448.0f);
+            e = (int) ((b >> 23) & 0xffu) - 127 + ((b & 0x7fffffu) != 0u ? 1 : 0);
+            e = max(-127, min(127, e));
+        }
+        const float s = ldexpf(1.0f, e);
+        const uint32_t q = e4m3_enc(v / s);
+        code[d] = (uint8_t) q;
+        if (hcode) hcode[d] = (uint8_t) q;
+        if (lane == 0) {
+            sc[d >> 5] = (uint8_t) (e + 127);
+            if (hsc) hsc[d >> 5] = (uint8_t) (e + 127);
+        }
+    } else {   // kKvFp4
+        float am = fabsf(v);
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+        const uint32_t sb = e4m3_enc(fmaxf(am / 6.0f, 0.001953125f));
+        const float s = e4m3_dec(sb);
+        const uint32_t c = e2m1_code(e2m1_rt(fminf(fmaxf(v / s, -6.0f), 6.0f)));
+        const uint32_t hi = __shfl_down_sync(0xffffffffu, c, 1);   // (value d + 1: the next lane's)
+        if ((d & 1) == 0) {
+            code[d >> 1] = (uint8_t) (c | (hi << 4));
+            if (hcode) hcode[d >> 1] = (uint8_t) (c | (hi << 4));
+        }
+        if ((d & 15) == 0) {
+            sc[d >> 4] = (uint8_t) sb;
+            if (hsc) hsc[d >> 4] = (uint8_t) sb;
+        }
+    }
+}
+
+// (q.kf / q.vf: K's / V's caches in that format instead - codes and scales, kc / vc unused for it.  hs.ring: KV
+//  streaming - the VRAM rows a ring, row p % hs.ring tagged p, and position p's row in host memory as well)
 __global__ void qk_kernel(float* q, const float* k, const float* v, const float* qn1, const float* kn1,
                           const int* pos, int Hq, int Hkv, int n_rot, const float* inv, float eps, uint16_t* kc,
-                          uint16_t* vc, int ring, int8_t* kc8, int8_t* vc8, float* ks, float* vs, bool rot,
-                          KvHost hs) {
+                          uint16_t* vc, int ring, KvQ kq, KvHost hs) {
     __shared__ float red[33], sh[128];
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x, hd = blockDim.x;
     const int p = pos[t];
     const int row = ring > 0 ? p % ring : hs.ring > 0 ? p % hs.ring : p;
     const bool host = hs.ring > 0;
-    rot = rot && kc8 != nullptr && hd == 128;
     if (h < Hq) {
         float* x = q + ((size_t) t * Hq + h) * hd;
-        float o = norm_rope(x[d], qn1, p, n_rot, inv, eps, sh, red);
-        if (rot) o = rotate_row(o, sh);
-        x[d] = o;
-    } else if (h < Hq + Hkv) {
-        const int kh = h - Hq;
-        float o = norm_rope(k[((size_t) t * Hkv + kh) * hd + d], kn1, p, n_rot, inv, eps, sh, red);
-        if (rot) o = rotate_row(o, sh);
-        const size_t at = (size_t) row * Hkv + kh, ah = (size_t) p * Hkv + kh;
-        if (kc8) {
-            put_i8(o, kc8 + at * hd, ks + at, red, host ? hs.i8.kc + ah * hd : nullptr, host ? hs.i8.ks + ah : nullptr);
-        } else {
-            const uint16_t b = f2bf(o);
-            kc[at * hd + d] = b;
-            if (host) hs.kc[ah * hd + d] = b;
-        }
-        if (host && kh == 0 && d == 0) hs.tag[row] = p;
-    } else {
-        const int vh = h - Hq - Hkv;
-        float o = v[((size_t) t * Hkv + vh) * hd + d];
-        if (rot) o = rotate_row(o, sh);
-        const size_t at = (size_t) row * Hkv + vh, ah = (size_t) p * Hkv + vh;
-        if (vc8) {
-            put_i8(o, vc8 + at * hd, vs + at, red, host ? hs.i8.vc + ah * hd : nullptr, host ? hs.i8.vs + ah : nullptr);
-        } else {
-            const uint16_t b = f2bf(o);
-            vc[at * hd + d] = b;
-            if (host) hs.vc[ah * hd + d] = b;
-        }
+        x[d] = norm_rope(x[d], qn1, p, n_rot, inv, eps, sh, red);
+        return;
     }
+    const bool is_k = h < Hq + Hkv;
+    const int kh = is_k ? h - Hq : h - Hq - Hkv;
+    const float o = is_k ? norm_rope(k[((size_t) t * Hkv + kh) * hd + d], kn1, p, n_rot, inv, eps, sh, red)
+                         : v[((size_t) t * Hkv + kh) * hd + d];
+    const size_t at = (size_t) row * Hkv + kh, ah = (size_t) p * Hkv + kh;
+    const int fmt = is_k ? kq.kf : kq.vf;
+    if (fmt != kKvBf16) {
+        const size_t cb = kv_code_bytes(fmt), sb = kv_scale_bytes(fmt);
+        uint8_t* code = (is_k ? kq.kc : kq.vc) + at * cb;
+        uint8_t* sc = (is_k ? kq.ks : kq.vs) + at * sb;
+        uint8_t* hcode = host ? (is_k ? hs.q.kc : hs.q.vc) + ah * cb : nullptr;
+        uint8_t* hsc = host ? (is_k ? hs.q.ks : hs.q.vs) + ah * sb : nullptr;
+        put_row(o, fmt, (kq.rot >> (is_k ? 0 : 1)) & 1, code, sc, hcode, hsc, red, sh);
+    } else {
+        const uint16_t b = f2bf(o);
+        (is_k ? kc : vc)[at * hd + d] = b;
+        if (host) (is_k ? hs.kc : hs.vc)[ah * hd + d] = b;
+    }
+    if (host && is_k && kh == 0 && d == 0) hs.tag[row] = p;
 }
 
 __global__ void index_kernel(float* iq, const float* ik, const float* qn1, const float* kn1, const int* pos, int Hi,
@@ -313,32 +412,129 @@ __device__ __forceinline__ size_t kv_row(const KvHost& hs, int kp, bool& host) {
     return host ? (size_t) kp : (size_t) r;
 }
 
-// I8: the INT8 caches (kc8 / vc8 rows, ks8 / vs8 their scales): a key's dot product over its int8 values times its
-// scale, a value's scale folded into its probability; rot (--kv-rotate): the caches hold H k and H v (qk_kernel's,
-// q rotated alike), so the output is H of the sum (H = H^-1).  S > 1: block z of S takes the kept blocks
-// [z topk / S, (z + 1) topk / S) and leaves its unnormalised sums, max and total in part [T][Hkv][S][kG][kPart] for
-// attn_combine - a query's split is S's alone, whatever T (a window's rows and the token path's agree).
+__device__ __forceinline__ uint32_t bf2pack(float a, float b) {
+    return (uint32_t) f2bf(a) | ((uint32_t) f2bf(b) << 16);
+}
+
+// one operand's tile (64 keys of KV group g from k0 on, keys past p zero) into shared memory: BF16 rows in t16 - FP8 /
+// FP4 rows decoded on the way (exact: their values are BF16 values) - or (F kKvI8) int8 rows in t8 and their scales in
+// tsc.  c16: the BF16 cache, cq / sq: the format's codes and scales (VRAM; host: hc16, hcq, hsq)
+template <int F>
+__device__ __forceinline__ void load_tile(int k0, int p, int g, int Hkv, const KvHost& hs, bool is_k,
+                                          const uint16_t* c16, const uint8_t* cq, const uint8_t* sq,
+                                          uint16_t (*t16)[kRow], int8_t (*t8)[2 * kRow], float* tsc) {
+    const int tid = threadIdx.x;
+    const uint16_t* h16 = is_k ? hs.kc : hs.vc;
+    const uint8_t* hcq = is_k ? hs.q.kc : hs.q.vc;
+    const uint8_t* hsq = is_k ? hs.q.ks : hs.q.vs;
+    if constexpr (F == kKvBf16) {
+        for (int i = tid; i < kTile * 64; i += 128) {   // 64 keys x 64 pairs of halves
+            const int j = i >> 6, c = i & 63;
+            const int kp = k0 + j;
+            uint32_t w = 0;
+            if (kp <= p) {
+                bool fh = false;
+                const size_t r = kv_row(hs, kp, fh);
+                w = *(const uint32_t*) ((fh ? h16 : c16) + (r * Hkv + g) * 128 + c * 2);
+            }
+            *(uint32_t*) &t16[j][c * 2] = w;
+        }
+    } else if constexpr (F == kKvI8) {
+        for (int i = tid; i < kTile * 32; i += 128) {   // 64 keys x 32 words of 4 int8
+            const int j = i >> 5, c = i & 31;
+            const int kp = k0 + j;
+            uint32_t w = 0;
+            if (kp <= p) {
+                bool fh = false;
+                const size_t r = kv_row(hs, kp, fh);
+                w = *(const uint32_t*) ((fh ? hcq : cq) + (r * Hkv + g) * 128 + c * 4);
+            }
+            *(uint32_t*) &t8[j][c * 4] = w;
+        }
+        if (tid < kTile) {
+            const int kp = k0 + tid;
+            float a = 0.0f;
+            if (kp <= p) {
+                bool fh = false;
+                const size_t r = kv_row(hs, kp, fh);
+                a = *(const float*) ((fh ? hsq : sq) + (r * Hkv + g) * 4);
+            }
+            tsc[tid] = a;
+        }
+    } else if constexpr (F == kKvFp8) {
+        for (int i = tid; i < kTile * 32; i += 128) {   // 64 keys x 32 words of 4 E4M3 codes (a scale byte a group of 32)
+            const int j = i >> 5, c = i & 31;
+            const int kp = k0 + j;
+            uint32_t w = 0, sb = 0;
+            if (kp <= p) {
+                bool fh = false;
+                const size_t r = kv_row(hs, kp, fh);
+                w = *(const uint32_t*) ((fh ? hcq : cq) + (r * Hkv + g) * 128 + c * 4);
+                sb = (fh ? hsq : sq)[(r * Hkv + g) * 4 + (c >> 3)];
+            }
+            const float s = __uint_as_float(sb << 23);   // (2^(sb - 127); 0 for an unwritten row)
+            uint32_t* dst = (uint32_t*) &t16[j][c * 4];
+            dst[0] = bf2pack(e4m3_dec(w & 0xffu) * s, e4m3_dec((w >> 8) & 0xffu) * s);
+            dst[1] = bf2pack(e4m3_dec((w >> 16) & 0xffu) * s, e4m3_dec(w >> 24) * s);
+        }
+    } else {   // kKvFp4
+        for (int i = tid; i < kTile * 16; i += 128) {   // 64 keys x 16 words of 8 E2M1 codes (an E4M3 scale a 16)
+            const int j = i >> 4, c = i & 15;
+            const int kp = k0 + j;
+            uint32_t w = 0, sb = 0;
+            if (kp <= p) {
+                bool fh = false;
+                const size_t r = kv_row(hs, kp, fh);
+                w = *(const uint32_t*) ((fh ? hcq : cq) + (r * Hkv + g) * 64 + c * 4);
+                sb = (fh ? hsq : sq)[(r * Hkv + g) * 8 + (c >> 1)];
+            }
+            const float s = e4m3_dec(sb);
+            uint32_t* dst = (uint32_t*) &t16[j][c * 8];
+#pragma unroll
+            for (int x = 0; x < 4; ++x)
+                dst[x] = bf2pack(e2m1_val((w >> (8 * x)) & 15u) * s, e2m1_val((w >> (8 * x + 4)) & 15u) * s);
+        }
+    }
+}
+
+// KF / VF: K's and V's cache formats (kKvI8: a key's dot product over its int8 values times its scale, a value's scale
+// folded into its probability; FP8 / FP4: decoded to BF16 rows in the tile).  rot (bit 0 K, bit 1 V): the rows are
+// stored rotated (H k, H v - the 128-point transform, its own inverse): the queries are rotated alike, the output
+// rotated back.  S > 1: block z of S takes the kept blocks [z topk / S, (z + 1) topk / S) and leaves its unnormalised
+// sums, max and total in part [T][Hkv][S][kG][kPart] for attn_combine - a query's split is S's alone, whatever T (a
+// window's rows and the token path's agree)
 constexpr int kPart = 130;   // (a head's partial: 128 sums, the max, the total)
 
-template <bool I8>
+template <int KF, int VF>
 __global__ void __launch_bounds__(128) sparse_attn_kernel(const float* q, const uint16_t* kc, const uint16_t* vc,
                                                           const int* kept, const int* pos, int T, int Hq, int Hkv,
-                                                          int topk, int blk, float scale, float* out,
-                                                          const int8_t* kc8, const int8_t* vc8, const float* ks8,
-                                                          const float* vs8, KvHost hs, int S, float* part, bool rot) {
+                                                          int topk, int blk, float scale, float* out, KvQ kq,
+                                                          KvHost hs, int S, float* part) {
     __shared__ float qs[kG][128];
     __shared__ __align__(4) uint16_t ks[kTile][kRow], vs[kTile][kRow];
     __shared__ float ksc[kTile], vsc[kTile];
-    int8_t (*k8)[2 * kRow] = (int8_t (*)[2 * kRow]) ks;   // (I8: the tiles as int8 rows, 260 bytes apart)
+    int8_t (*k8)[2 * kRow] = (int8_t (*)[2 * kRow]) ks;   // (int8: the tiles as int8 rows, 260 bytes apart)
     int8_t (*v8)[2 * kRow] = (int8_t (*)[2 * kRow]) vs;
     __shared__ float sc[kG][kTile + 1];
     __shared__ float mrow[kG], lrow[kG], arow[kG];
-    const int t = blockIdx.x, g = blockIdx.y, z = blockIdx.z, tid = threadIdx.x;
+    const int t = blockIdx.x, g = blockIdx.y, z = blockIdx.z, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
     const int p = pos[t];
     const int bi0 = z * topk / S, bi1 = (z + 1) * topk / S;
+    const bool krot = KF != kKvBf16 && (kq.rot & 1), vrot = VF != kKvBf16 && (kq.rot & 2);
     for (int i = tid; i < kG * 128; i += 128) {
         const int h = i / 128, d = i % 128;
         qs[h][d] = q[((size_t) t * Hq + g * kG + h) * 128 + d] * scale;
+    }
+    if (krot) {   // (the queries rotated as the keys: (H q) . (H k) = q . k)
+        __syncthreads();
+        for (int h = wp; h < kG; h += 4) {
+            float x[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) x[i] = qs[h][lane * 4 + i];
+            had128w(x, lane);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) qs[h][lane * 4 + i] = x[i];
+        }
     }
     if (tid < kG) {
         mrow[tid] = -INFINITY;
@@ -356,47 +552,8 @@ __global__ void __launch_bounds__(128) sparse_attn_kernel(const float* q, const 
             if (k0 > p) break;
             __syncthreads();
             // (KV streaming: a key from its VRAM ring row when that row holds it, else from host memory)
-            if constexpr (I8) {
-                for (int i = tid; i < kTile * 32; i += 128) {   // 64 keys x 32 words of 4 int8, K and V
-                    const int j = i >> 5, c = i & 31;
-                    const int kp = k0 + j;
-                    uint32_t kw = 0, vw = 0;
-                    if (kp <= p) {
-                        bool fh = false;
-                        const size_t r = kv_row(hs, kp, fh);
-                        kw = *(const uint32_t*) ((fh ? hs.i8.kc : kc8) + (r * Hkv + g) * 128 + c * 4);
-                        vw = *(const uint32_t*) ((fh ? hs.i8.vc : vc8) + (r * Hkv + g) * 128 + c * 4);
-                    }
-                    *(uint32_t*) &k8[j][c * 4] = kw;
-                    *(uint32_t*) &v8[j][c * 4] = vw;
-                }
-                if (tid < kTile) {
-                    const int kp = k0 + tid;
-                    float ka = 0.0f, va = 0.0f;
-                    if (kp <= p) {
-                        bool fh = false;
-                        const size_t r = kv_row(hs, kp, fh);
-                        ka = (fh ? hs.i8.ks : ks8)[r * Hkv + g];
-                        va = (fh ? hs.i8.vs : vs8)[r * Hkv + g];
-                    }
-                    ksc[tid] = ka;
-                    vsc[tid] = va;
-                }
-            } else {
-                for (int i = tid; i < kTile * 64; i += 128) {   // 64 keys x 64 pairs of halves, K and V
-                    const int j = i >> 6, c = i & 63;
-                    const int kp = k0 + j;
-                    uint32_t kw = 0, vw = 0;
-                    if (kp <= p) {
-                        bool fh = false;
-                        const size_t r = kv_row(hs, kp, fh);
-                        kw = *(const uint32_t*) ((fh ? hs.kc : kc) + (r * Hkv + g) * 128 + c * 2);
-                        vw = *(const uint32_t*) ((fh ? hs.vc : vc) + (r * Hkv + g) * 128 + c * 2);
-                    }
-                    *(uint32_t*) &ks[j][c * 2] = kw;
-                    *(uint32_t*) &vs[j][c * 2] = vw;
-                }
-            }
+            load_tile<KF>(k0, p, g, Hkv, hs, true, kc, kq.kc, kq.ks, ks, k8, ksc);
+            load_tile<VF>(k0, p, g, Hkv, hs, false, vc, kq.vc, kq.vs, vs, v8, vsc);
             __syncthreads();
             {   // scores: thread (j = tid % 64) for the heads (tid / 64) * 8 .. + 8
                 const int j = tid & 63, h0 = (tid >> 6) * 8;
@@ -407,11 +564,11 @@ __global__ void __launch_bounds__(128) sparse_attn_kernel(const float* q, const 
                 if (ok) {
 #pragma unroll 4
                     for (int d = 0; d < 128; ++d) {
-                        const float kv = I8 ? (float) k8[j][d] : bf2f(ks[j][d]);
+                        const float kv = KF == kKvI8 ? (float) k8[j][d] : bf2f(ks[j][d]);
 #pragma unroll
                         for (int h = 0; h < 8; ++h) s8[h] = fmaf(qs[h0 + h][d], kv, s8[h]);
                     }
-                    if constexpr (I8) {
+                    if constexpr (KF == kKvI8) {
 #pragma unroll
                         for (int h = 0; h < 8; ++h) s8[h] *= ksc[j];
                     }
@@ -441,7 +598,7 @@ __global__ void __launch_bounds__(128) sparse_attn_kernel(const float* q, const 
 #pragma unroll
                 for (int h = 0; h < kG; ++h) {
                     float s = acc[h] * arow[h];
-                    if constexpr (I8) {
+                    if constexpr (VF == kKvI8) {
                         for (int j = 0; j < kTile; ++j) s = fmaf(sc[h][j] * vsc[j], (float) v8[j][d], s);
                     } else {
                         for (int j = 0; j < kTile; ++j) s = fmaf(sc[h][j], bf2f(vs[j][d]), s);
@@ -462,17 +619,24 @@ __global__ void __launch_bounds__(128) sparse_attn_kernel(const float* q, const 
         }
         return;
     }
-    if (I8 && rot) {   // (qs is free now: the rows through H)
+    if (!vrot) {
 #pragma unroll
-        for (int h = 0; h < kG; ++h) qs[h][tid] = lrow[h] > 0.0f ? acc[h] / lrow[h] : 0.0f;
-        fwht_rows(qs, kG);
-#pragma unroll
-        for (int h = 0; h < kG; ++h) out[((size_t) t * Hq + g * kG + h) * 128 + tid] = qs[h][tid] * kInvSqrt128;
+        for (int h = 0; h < kG; ++h)
+            out[((size_t) t * Hq + g * kG + h) * 128 + tid] = lrow[h] > 0.0f ? acc[h] / lrow[h] : 0.0f;
         return;
     }
+    // (the values were rotated: the output rotated back, H (sum p H v) = sum p v)
 #pragma unroll
-    for (int h = 0; h < kG; ++h)
-        out[((size_t) t * Hq + g * kG + h) * 128 + tid] = lrow[h] > 0.0f ? acc[h] / lrow[h] : 0.0f;
+    for (int h = 0; h < kG; ++h) qs[h][tid] = lrow[h] > 0.0f ? acc[h] / lrow[h] : 0.0f;
+    __syncthreads();
+    for (int h = wp; h < kG; h += 4) {
+        float x[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) x[i] = qs[h][lane * 4 + i];
+        had128w(x, lane);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) out[((size_t) t * Hq + g * kG + h) * 128 + lane * 4 + i] = x[i];
+    }
 }
 
 // sparse_attn's S partials of query t, KV group g -> out: the heads' max over the splits, each split's sums and total
@@ -496,9 +660,21 @@ __global__ void __launch_bounds__(128) attn_combine_kernel(const float* part, in
             }
         o[h][d] = L > 0.0f ? a / L : 0.0f;
     }
-    if (rot) fwht_rows(o, kG);
+    if (!rot) {
 #pragma unroll
-    for (int h = 0; h < kG; ++h) out[((size_t) t * Hq + g * kG + h) * 128 + d] = rot ? o[h][d] * kInvSqrt128 : o[h][d];
+        for (int h = 0; h < kG; ++h) out[((size_t) t * Hq + g * kG + h) * 128 + d] = o[h][d];
+        return;
+    }
+    __syncthreads();
+    const int lane = d & 31, wp = d >> 5;
+    for (int h = wp; h < kG; h += 4) {   // (the values were rotated: the rows back through H)
+        float x[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) x[i] = o[h][lane * 4 + i];
+        had128w(x, lane);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) out[((size_t) t * Hq + g * kG + h) * 128 + lane * 4 + i] = x[i];
+    }
 }
 
 // ------------------------------------------------------------------ the router (one warp a token, E <= 256)
@@ -1095,13 +1271,12 @@ void rope_inv_freq(float theta, int n_rot, float* inv) {
 
 void qk_norm_rope(float* q, const float* k, const float* v, const float* qn1, const float* kn1, const int* pos, int T,
                   int Hq, int Hkv, int hd, int n_rot, const float* inv, float eps, uint16_t* kc, uint16_t* vc,
-                  cudaStream_t s, int ring, const KvI8& i8, const KvHost& hs) {
+                  cudaStream_t s, int ring, const KvQ& kq, const KvHost& hs) {
     if (T <= 0) return;
-    qk_kernel<<<dim3(T, Hq + 2 * Hkv), hd, 0, s>>>(q, k, v, qn1, kn1, pos, Hq, Hkv, n_rot, inv, eps, kc, vc, ring, i8.kc,
-                                                   i8.vc, i8.ks, i8.vs, i8.rot, hs);
+    qk_kernel<<<dim3(T, Hq + 2 * Hkv), hd, 0, s>>>(q, k, v, qn1, kn1, pos, Hq, Hkv, n_rot, inv, eps, kc, vc, ring, kq,
+                                                   hs);
     check("qk_norm_rope");
 }
-
 void index_norm_rope(float* iq, const float* ik, const float* qn1, const float* kn1, const int* pos, int T, int Hi,
                      int D, int n_rot, const float* inv, float eps, uint16_t* ic, cudaStream_t s) {
     if (T <= 0) return;
@@ -1136,19 +1311,26 @@ void select_blocks(const float* bs, const int* pos, int T, int Hi, int nblk, int
 }
 
 void sparse_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int* kept, const int* pos, int T,
-                 int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s, const KvI8& i8,
+                 int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s, const KvQ& kq,
                  const KvHost& hs, int splits, float* part) {
     if (T <= 0) return;
     const int S = part != nullptr && splits > 1 ? std::min(splits, topk) : 1;
     const dim3 grid((unsigned) T, (unsigned) Hkv, (unsigned) S);
-    if (i8.kc)
-        sparse_attn_kernel<true><<<grid, 128, 0, s>>>(q, kc, vc, kept, pos, T, Hq, Hkv, topk, blk, scale, out, i8.kc,
-                                                      i8.vc, i8.ks, i8.vs, hs, S, part, i8.rot);
-    else
-        sparse_attn_kernel<false><<<grid, 128, 0, s>>>(q, kc, vc, kept, pos, T, Hq, Hkv, topk, blk, scale, out, nullptr,
-                                                       nullptr, nullptr, nullptr, hs, S, part, false);
-    if (S > 1) attn_combine_kernel<<<dim3((unsigned) T, (unsigned) Hkv), 128, 0, s>>>(part, Hq, Hkv, S, i8.kc && i8.rot,
-                                                                                    out);
+#define MM3_ATTN(KK, VV)                                                                                             \
+    case KK * 4 + VV:                                                                                                \
+        sparse_attn_kernel<KK, VV><<<grid, 128, 0, s>>>(q, kc, vc, kept, pos, T, Hq, Hkv, topk, blk, scale, out, kq, \
+                                                        hs, S, part);                                                \
+        break;
+    switch ((kq.kf & 3) * 4 + (kq.vf & 3)) {
+        MM3_ATTN(0, 0) MM3_ATTN(0, 1) MM3_ATTN(0, 2) MM3_ATTN(0, 3)
+        MM3_ATTN(1, 0) MM3_ATTN(1, 1) MM3_ATTN(1, 2) MM3_ATTN(1, 3)
+        MM3_ATTN(2, 0) MM3_ATTN(2, 1) MM3_ATTN(2, 2) MM3_ATTN(2, 3)
+        MM3_ATTN(3, 0) MM3_ATTN(3, 1) MM3_ATTN(3, 2) MM3_ATTN(3, 3)
+    }
+#undef MM3_ATTN
+    if (S > 1)
+        attn_combine_kernel<<<dim3((unsigned) T, (unsigned) Hkv), 128, 0, s>>>(part, Hq, Hkv, S,
+                                                                             kq.vf != kKvBf16 && (kq.rot & 2), out);
     check("sparse_attn");
 }
 
@@ -1186,8 +1368,26 @@ void moe_combine(const float* res, const float* y, const int* inv, const float* 
 
 __global__ void wait_flag_kernel(const unsigned* flag, unsigned v) {
     if (threadIdx.x != 0) return;
-    while ((int) (*(volatile const unsigned*) flag - v) < 0) __nanosleep(100);
+    const unsigned long long t0 = gtimer();
+    while ((int) (*(volatile const unsigned*) flag - v) < 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(100);
+#endif
+        if (gtimer() - t0 > kWaitLimitNs) {   // (never a hung device: the host's answer did not come)
+            atomicAdd(&g_wait_timeouts, 1u);
+            break;
+        }
+    }
     __threadfence_system();
+}
+
+unsigned wait_timeouts() {
+    unsigned n = 0;
+    if (cudaMemcpyFromSymbol(&n, g_wait_timeouts, sizeof n) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return n;
 }
 
 void wait_flag(const unsigned* flag, unsigned v, cudaStream_t s) {

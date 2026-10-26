@@ -19,11 +19,13 @@
 
 #include "mm3_cands.hpp"
 #include "mm3_cpu.hpp"
+#include "mm3_env.hpp"
 #include "mm3_dspark.hpp"
 #include "mm3_exl3.hpp"
 #include "mm3_geo.hpp"
 #include "mm3_host.hpp"
 #include "mm3_kernels.cuh"
+#include "mm3_os.hpp"
 #include "mm3_vision.hpp"
 
 namespace mm3 {
@@ -196,6 +198,7 @@ struct Worker {
 };
 
 // (the host's AVX2 sums and norms: mm3_host.cpp - nvcc cannot read <immintrin.h> with every host compiler)
+using host::dot;
 using host::rms_rows;
 using host::sum_into;
 
@@ -266,7 +269,7 @@ struct TpEngine::Impl {
         x3::Mat q, k, v, o, mg, mu, md, sg, su, sd;
         float *qn1 = nullptr, *kn1 = nullptr, *iqn1 = nullptr, *ikn1 = nullptr, *wiq = nullptr, *wik = nullptr;
         uint16_t *kc = nullptr, *vc = nullptr, *ic = nullptr;
-        k::KvI8 i8;   // (--kv-cache int8: the K / V caches instead of kc / vc)
+        k::KvQ kvq;   // (--kv-cache: K's / V's quantized caches - a format other than BF16 instead of kc / vc)
         k::KvHost kvh;   // (--kv-streaming: the caches above a ring, every position in host memory too)
         uint8_t* res_base = nullptr;
         float* gate = nullptr;   // (member 0: the router, F32 [n_exp][dim])
@@ -328,7 +331,7 @@ struct TpEngine::Impl {
     std::atomic<bool> abort_{false};
     bool in_prompt = false;   // (the pipeline's host threads at work: the shared tallies are theirs to add after)
     // (MM3_TP_PROF: where a window's host time goes, printed at the end)
-    const bool prof_on = std::getenv("MM3_TP_PROF") != nullptr;
+    const bool prof_on = ::mm3::env("MM3_TP_PROF") != nullptr;
     double tp_norm = 0, tp_sum = 0, tp_route = 0, tp_plan = 0, tp_lane = 0, tp_wait = 0, tp_head = 0, tp_end = 0,
            tp_draft = 0, tp_start = 0;
     long tp_windows = 0;
@@ -459,12 +462,12 @@ struct TpEngine::Impl {
         o = o_;
         const double t0 = now();
         if (!pk.load(o.pack, err) || !g.read(pk, err)) return false;
-        if (const char* pr = std::getenv("MM3_PROMOTE"))
+        if (const char* pr = ::mm3::env("MM3_PROMOTE"))
             std::sscanf(pr, "%f,%d,%f", &kPromote, &kMaxPending, &kDecay);
         tp = o.tp;
         chunk = std::max(kWin + 1, std::min(o.tp_chunk, 8192));
         ffn_f = o.tp_ffn_rows > 0 ? std::max(o.tp_ffn_rows, (chunk + kMaxSlices - 1) / kMaxSlices) : chunk;
-        if (const char* sv = std::getenv("MM3_ATTN_SPLIT")) attn_splits = std::max(1, std::atoi(sv));
+        if (const char* sv = ::mm3::env("MM3_ATTN_SPLIT")) attn_splits = std::max(1, std::atoi(sv));
         attn_splits = std::min(attn_splits, g.topk);
         if (tp != 1 && tp != 2 && tp != 4) {
             err = "--tp " + std::to_string(tp) + ": 1, 2 or 4 (a member: 16 query heads a KV head)";
@@ -577,6 +580,7 @@ struct TpEngine::Impl {
                 info.push_back("DSpark draft: " + std::to_string(draftm->bytes() >> 20) + " MB on CUDA" +
                                std::to_string(hm.id));
             }
+            if (o.vision && o.vision_auto && !Vision::in_pack(pk)) o.vision = false;   // (by default: text only then)
             if (o.vision) {
                 if (!Vision::in_pack(pk)) {
                     err = "--vision: the pack has no vision tower (pack it again with tools/mm3/pack.py)";
@@ -792,12 +796,10 @@ struct TpEngine::Impl {
                 }
                 // (KV streaming: the VRAM caches a ring of kv_ring rows, tagged - the host's below)
                 acat = kAKV;
-                const size_t cache = (size_t) (kv_ring > 0 ? kv_ring : o.max_ctx) * mkv * g.hd;
-                if (o.kv_int8 ? !dalloc(dv, S.i8.kc, cache, err) || !dalloc(dv, S.i8.vc, cache, err) ||
-                                    !dalloc(dv, S.i8.ks, cache / g.hd, err) || !dalloc(dv, S.i8.vs, cache / g.hd, err)
-                              : !dalloc(dv, S.kc, cache, err) || !dalloc(dv, S.vc, cache, err))
-                    return false;
-                S.i8.rot = o.kv_int8 && o.kv_rotate;
+                const size_t kvrows = (size_t) (kv_ring > 0 ? kv_ring : o.max_ctx) * mkv;
+                uint8_t* kvb = nullptr;
+                if (!dalloc(dv, kvb, k::kv_bytes(o.kv_k, o.kv_v, kvrows), err)) return false;
+                k::kv_carve(kvb, kvrows, o.kv_k, o.kv_v, o.kv_rot ? 3 : 0, S.kc, S.vc, S.kvq);
                 if (!dalloc(dv, S.ic, (size_t) o.max_ctx * g.ix_dim, err)) return false;
                 acct_ic[dv] += (size_t) o.max_ctx * g.ix_dim * 2;
                 if (kv_ring > 0) {
@@ -812,15 +814,23 @@ struct TpEngine::Impl {
         // KV streaming: every slice's whole cache in host memory (one pinned, mapped allocation, carved), written as
         // the VRAM ring is and read where the ring no longer holds a key
         if (kv_ring > 0) {
-            const size_t eb = o.kv_int8 ? 1 : 2;
-            auto bytes_of = [&](int mkv) {
-                const size_t rows = (size_t) o.max_ctx * mkv;
-                return 2 * rows * g.hd * eb + (o.kv_int8 ? 2 * rows * 4 : 0);
-            };
+            auto bytes_of = [&](int mkv) { return k::kv_bytes(o.kv_k, o.kv_v, (size_t) o.max_ctx * mkv); };
             size_t total = 0;
             for (const Layer& l : L) {
                 const Group& gr = G[(size_t) l.group];
                 total += gr.mem.size() * bytes_of(g.n_kv / (int) gr.mem.size());
+            }
+            // (the RAM this process can still get must hold it beside a tenth of the RAM, 4..16 GB: a clear refusal
+            //  before the OS is asked to pin it)
+            const double tot_ram = (double) os::ram_total(), avail = (double) os::ram_avail();
+            const double head = tot_ram > 0 ? std::min(16.0, std::max(4.0, tot_ram / 10.0 / (1u << 30))) * (1u << 30)
+                                            : 8.0 * (1u << 30);
+            if (avail > 0 && (double) total + head > avail) {
+                err = "tp: KV streaming needs " + std::to_string((int) ((double) total / (1u << 30) + 0.5)) +
+                      " GB of pinned RAM for " + std::to_string(o.max_ctx) + " positions, " +
+                      std::to_string((int) std::max(0.0, (avail - head) / (1u << 30))) +
+                      " GB to spare: a smaller --max-context, or --tp 0 (the layer split sizes it itself)";
+                return false;
             }
             uint8_t* kvp = nullptr;
             if (!halloc(kvp, total, cudaHostAllocMapped | cudaHostAllocPortable, err)) return false;
@@ -831,16 +841,7 @@ struct TpEngine::Impl {
                 const size_t rows = (size_t) o.max_ctx * mkv, nb = bytes_of(mkv);
                 for (size_t j = 0; j < gr.mem.size(); ++j) {
                     k::KvHost& h = l.sl[j].kvh;
-                    uint8_t* b = kvp + off;
-                    if (o.kv_int8) {
-                        h.i8.kc = (int8_t*) b;
-                        h.i8.vc = (int8_t*) (b + rows * g.hd);
-                        h.i8.ks = (float*) (b + 2 * rows * g.hd);
-                        h.i8.vs = h.i8.ks + rows;
-                    } else {
-                        h.kc = (uint16_t*) b;
-                        h.vc = h.kc + rows * g.hd;
-                    }
+                    k::kv_carve(kvp + off, rows, o.kv_k, o.kv_v, o.kv_rot ? 3 : 0, h.kc, h.vc, h.q);
                     off += nb;
                     acct_kvh[M[(size_t) gr.mem[j]].id] += nb;
                 }
@@ -1092,10 +1093,10 @@ struct TpEngine::Impl {
             info.push_back("CUDA" + std::to_string(m.id) + ": " + std::to_string(fr >> 20) + " MB free");
         }
         info.push_back("CPU lane: " + std::to_string(lane->threads()) + " threads");
+        st.cpu_threads = lane->threads();
         {
-            std::string kv = std::string("KV cache: ") + (o.kv_int8 ? o.kv_rotate ? "INT8 (rotated, a scale a row of 128)"
-                                                                                  : "INT8 (a scale a row of 128)"
-                                                                     : "BF16");
+            std::string kv = std::string("KV cache: K ") + k::kv_name(o.kv_k) + ", V " + k::kv_name(o.kv_v) +
+                             (o.kv_rot && (o.kv_k || o.kv_v) ? " (rows rotated)" : "");
             if (kv_ring > 0)
                 kv += ", streamed: " + std::to_string(kv_ring) + " positions a layer in VRAM, all " +
                       std::to_string(o.max_ctx) + " in host memory (" + std::to_string((int) (st.kv_host_gb + 0.5)) +
@@ -1348,7 +1349,7 @@ struct TpEngine::Impl {
                 x3::gemm_rows(S.k, m.p_xn16, g.dim, T, m.p_k, mkv * g.hd, 0.0f, m.s);
                 x3::gemm_rows(S.v, m.p_xn16, g.dim, T, m.p_v, mkv * g.hd, 0.0f, m.s);
                 k::qk_norm_rope(m.p_q, m.p_k, m.p_v, S.qn1, S.kn1, m.p_pos, T, mh, mkv, g.hd, g.n_rot, m.inv, g.eps,
-                                S.kc, S.vc, m.s, 0, S.i8, S.kvh);
+                                S.kc, S.vc, m.s, 0, S.kvq, S.kvh);
                 if (cublasSgemm(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, mix * g.ix_dim, T, g.dim, &one, S.wiq, g.dim, m.p_xn,
                                 g.dim, &zero, m.p_iq, mix * g.ix_dim) != CUBLAS_STATUS_SUCCESS ||
                     cublasSgemm(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, g.ix_dim, T, g.dim, &one, S.wik, g.dim, m.p_xn,
@@ -1361,7 +1362,7 @@ struct TpEngine::Impl {
                 k::block_scores(m.p_iq, S.ic, m.p_pos, T, mix, nblk, g.blk, m.p_bs, m.s);
                 k::select_blocks(m.p_bs, m.p_pos, T, mix, nblk, g.blk, g.topk, m.p_kept, m.s);
                 k::sparse_attn(m.p_q, S.kc, S.vc, m.p_kept, m.p_pos, T, mh, mkv, g.topk, g.blk, scale, m.p_att, m.s,
-                               S.i8, S.kvh);
+                               S.kvq, S.kvh);
                 k::to_f16(m.p_att, T, mh * g.hd, mh * g.hd, m.p_att16, mh * g.hd, m.s);
                 x3::gemm_rows(S.o, m.p_att16, mh * g.hd, T, m.p_xn, g.dim, 0.0f, m.s);
                 k::publish(m.p_xn, part, (size_t) T * g.dim, m.counter, fo, ++vout, m.s);
@@ -1985,13 +1986,13 @@ struct TpEngine::Impl {
                 return false;
             }
             k::qk_norm_rope(m.q, m.k, m.v, S.qn1, S.kn1, m.pos, T, mh, mkv, g.hd, g.n_rot, m.inv, g.eps, S.kc, S.vc, m.s, 0,
-                            S.i8, S.kvh);
+                            S.kvq, S.kvh);
             k::rows_dot(S.wiq, mix * g.ix_dim, g.dim, m.xn, T, m.iq, m.s);
             k::rows_dot(S.wik, g.ix_dim, g.dim, m.xn, T, m.ik, m.s);
             k::index_norm_rope(m.iq, m.ik, S.iqn1, S.ikn1, m.pos, T, mix, g.ix_dim, g.n_rot, m.inv, g.eps, S.ic, m.s);
             k::block_scores(m.iq, S.ic, m.pos, T, mix, nblk, g.blk, m.bs, m.s);
             k::select_blocks(m.bs, m.pos, T, mix, nblk, g.blk, g.topk, m.kept, m.s);
-            k::sparse_attn(m.q, S.kc, S.vc, m.kept, m.pos, T, mh, mkv, g.topk, g.blk, scale, m.att, m.s, S.i8, S.kvh,
+            k::sparse_attn(m.q, S.kc, S.vc, m.kept, m.pos, T, mh, mkv, g.topk, g.blk, scale, m.att, m.s, S.kvq, S.kvh,
                            attn_splits, m.attp);
             const x3::MvJob oj = job(S.o, m.att, mh * g.hd, m.out, g.dim);
             if (!x3::mv(&oj, 1, m.s)) {
@@ -2287,7 +2288,7 @@ struct TpEngine::Impl {
         }
     }
 
-    const bool trace = std::getenv("MM3_TP_TRACE") != nullptr;
+    const bool trace = ::mm3::env("MM3_TP_TRACE") != nullptr;
     void tr(const char* what, int a = -1) {
         if (trace) std::fprintf(stderr, "[tp %.3f] %s %d\n", now(), what, a);
     }

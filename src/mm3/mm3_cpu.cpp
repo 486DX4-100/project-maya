@@ -20,8 +20,9 @@
 #include <thread>
 
 #include <immintrin.h>
-#include <pthread.h>
-#include <sched.h>
+
+#include "mm3_os.hpp"
+#include "mm3_env.hpp"
 
 #include "strata/kernels/cpu/pool.hpp"
 
@@ -50,8 +51,8 @@ struct CpuLane::Impl {
     static constexpr int kMaxE = 8;
     int max_entries = 64;
     // (MM3_LANE_PROF: run_multi's time by phase, printed at the end)
-    const bool prof = std::getenv("MM3_LANE_PROF") != nullptr;
-    const bool old_phases = std::getenv("MM3_LANE_OLD") != nullptr;   // (the four phases with a barrier each)
+    const bool prof = ::mm3::env("MM3_LANE_PROF") != nullptr;
+    const bool old_phases = ::mm3::env("MM3_LANE_OLD") != nullptr;   // (the four phases with a barrier each)
     double ph[6] = {0, 0, 0, 0, 0, 0};
     long calls = 0, subs = 0;
     int GQ, GB, DQ, DB, EB, FB;   // gate / up K jobs and bands, down K jobs and bands, x blocks, h blocks
@@ -61,12 +62,7 @@ struct CpuLane::Impl {
     std::vector<int> cores;   // (the physical cores but the first, one logical CPU each: the workers' places)
     void worker(int i) {
         // (pinned to the physical cores, after the caller's; more workers than cores share them in turn)
-        if (!cores.empty()) {
-            cpu_set_t set;
-            CPU_ZERO(&set);
-            CPU_SET(cores[(size_t) i % cores.size()], &set);
-            pthread_setaffinity_np(pthread_self(), sizeof set, &set);
-        }
+        if (!cores.empty()) os::pin_self(cores[(size_t) i % cores.size()]);
         uint64_t seen = 0;
         for (;;) {
             int spins = 0;

@@ -35,7 +35,8 @@ struct Options {
     int cpu_threads = -2;         // the CPU lane's workers besides the caller (-1: no CPU lane, misses are staged;
                                   // -2: this host's, CpuLane::auto_workers - one a physical core, the first the caller's)
     bool dspark = false;          // load the DSpark draft (the pack's dspark/) on the head's GPU
-    bool vision = false;          // load the vision tower (the pack's vision.*) on gpus[vision_gpu], before the experts
+    bool vision = true;           // load the vision tower (the pack's vision.*) on gpus[vision_gpu], before the experts
+    bool vision_auto = true;      // (vision not asked for by name: a pack without a tower runs text only, no error)
     int vision_gpu = 0;
     bool promote = true;          // the staging slots a cache: an expert the CPU lane keeps computing copied into one
                                   // (from the pinned pool, on a copy stream of its own) while the model runs
@@ -48,9 +49,11 @@ struct Options {
                                   // the same bits; 256 keeps ~37 more experts in VRAM, a prompt reads ~13% slower
     int kv_resident = 0;          // KV streaming (--kv-streaming on: 32768): the positions of each layer's K / V kept in
                                   // VRAM (a ring), all of them in pinned host memory (0, or the context or less: off)
-    bool kv_int8 = false;         // the K / V caches in INT8 (a scale a row of 128: half the memory, not exact - the
-                                  // default BF16 is; the index-key cache stays BF16)
-    bool kv_rotate = false;       // (with kv_int8) the rows through a 128-point Hadamard before their scale (k::KvI8)
+    // the K / V caches' formats (--kv-cache, mm3_kernels.cuh's kKv*: 0 BF16 - the model's dtype, exact - 1 INT8, 2 FP8
+    // E4M3 with a power-of-two scale a 32, 3 FP4 E2M1 with an E4M3 scale a 16) and whether their rows are rotated before
+    // they are rounded (--kv-rot); the index keys stay BF16 (the blocks each query keeps do not move)
+    int kv_k = 1, kv_v = 1;   // (INT8, rows rotated: tools/mm3/kv_gate.py decides whether FP4 joins it)
+    bool kv_rot = true;
     bool verbose = false;
 };
 
@@ -65,6 +68,7 @@ struct Stats {
     double kv_host_gb = 0;        // ... and the host memory holding every position
     long profiled = 0;            // routings counted (save_profile writes them)
     long cpu_experts = 0;         // routed experts the CPU lane computed
+    int cpu_threads = 0;          // the CPU lane's threads (0: no CPU lane)
     long promoted = 0;            // experts copied into a staging slot because they kept coming back
     double t_promo = 0;           // a forward's start waiting for those copies
     double t_sync = 0, t_lane = 0, t_token = 0;   // decode: waiting on the routing, the CPU lane, all (seconds)

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "mm3_exl3.hpp"
+#include "mm3_env.hpp"
 #include "mm3_pack.hpp"
 
 namespace mm3 {
@@ -22,7 +23,7 @@ struct Geo {
 
     bool read(const Pack& p, std::string& err) {
         dim = (int) p.num("hidden_size");
-        topk_override = std::getenv("MM3_TOPK") ? std::atoi(std::getenv("MM3_TOPK")) : 0;
+        topk_override = ::mm3::env("MM3_TOPK") ? std::atoi(::mm3::env("MM3_TOPK")) : 0;
         n_layers = (int) p.num("num_hidden_layers");
         n_head = (int) p.num("num_attention_heads");
         n_kv = (int) p.num("num_key_value_heads");
