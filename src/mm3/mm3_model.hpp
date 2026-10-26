@@ -37,13 +37,15 @@ struct Options {
     bool dspark = false;          // load the DSpark draft (the pack's dspark/) on the head's GPU
     bool vision = true;           // load the vision tower (the pack's vision.*) on gpus[vision_gpu], before the experts
     bool vision_auto = true;      // (vision not asked for by name: a pack without a tower runs text only, no error)
+    bool vision_must = false;     // (--images: a tower that does not load is an error; else vision off with a NOTE)
     int vision_gpu = 0;
     bool promote = true;          // the staging slots a cache: an expert the CPU lane keeps computing copied into one
                                   // (from the pinned pool, on a copy stream of its own) while the model runs
     int promote_lag = 2;          // a promoted expert's slot is its own this many forwards after its copy began, the
                                   // copy waited for then (1: the next forward - plain decode then waits ~5 ms a token)
     int tp = 0;                   // > 0: the tensor-parallel path (mm3_tp.hpp) in groups of tp GPUs (1, 2 or 4)
-    double cache_gb = 1.5;        // (tp) each GPU's expert cache (promote's slots), taken from its experts in VRAM
+    double cache_gb = 1.5;        // (tp) each GPU's expert cache (promote's slots), taken from its experts in VRAM -
+                                  // at least this, more where a layer's experts outside VRAM need more (tight memory)
     int tp_chunk = 1024;          // (tp) a prompt chunk's tokens: its experts not in VRAM are copied in once a chunk
     int tp_ffn_rows = 0;          // (tp) ... and its FFN half run in slices of this many tokens (0: the whole chunk) -
                                   // the same bits; 256 keeps ~37 more experts in VRAM, a prompt reads ~13% slower

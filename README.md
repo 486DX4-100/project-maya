@@ -88,7 +88,7 @@ commercial use has conditions) on an engine of its own (`maya-mm3`, contributed 
 
 | Files | Size | Runs on |
 | --- | ---: | --- |
-| Mia-AiLab's [EXL3 3.5 bpw](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw), with MiniMax's DSpark drafter and vision tower | 197 GB | NVIDIA RTX 30 / A100 and newer, Linux |
+| Mia-AiLab's [EXL3 3.5 bpw](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw), with MiniMax's DSpark drafter and vision tower | 197 GB | NVIDIA V100 / RTX 20 and newer, Linux and Windows |
 
 - **Set up for your PC:** the experts that do not fit in VRAM are computed on the CPU from RAM; the context (up to the
   model's 1M) is recommended by your memory; tensor parallel where the GPUs form groups; and the DSpark drafter only

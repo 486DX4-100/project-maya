@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -39,15 +40,23 @@ public:
 
     // whether the pack has a vision tower (mm3.txt's vision.* keys and its tensors)
     static bool in_pack(const Pack& pk);
-    // its weights and scratch (for the largest picture) on device `dev`, its own stream and cuBLAS handle
+    // its weights in host memory (the BF16 matrices where `pk` maps them: it must outlive the tower), pictures encoded
+    // on device `dev` - nothing of the tower stays in its memory between pictures: an encode takes the room it needs
+    // (room_bytes() at most), copies the weights in a stage at a time and gives the room back
     bool load(const Pack& pk, int dev, std::string& err);
+    // the engine's room for an encode when cudaMalloc has none: lend(bytes) its device memory of at least that many
+    // bytes (nullptr: none), give_back() after the encode (the engine's contents there are gone)
+    void set_lender(std::function<void*(size_t)> lend, std::function<void()> give_back);
     const VisionGeo& geo() const;
     // a picture's image tokens: (height / 28) * (width / 28); 0 for sides that are not multiples of 28 or too many
     // pixels
     int tokens(int width, int height) const;
     // rgb: height x width x 3 bytes -> rows F32 [tokens][out_dim]
     bool encode(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err);
-    size_t bytes() const;
+    size_t bytes() const;        // its device memory now (0 between pictures)
+    size_t host_bytes() const;   // its weights in host memory (or the pack's mapping)
+    size_t room_bytes() const;   // the device memory an encode of the largest picture takes
+    size_t last_bytes() const;   // ... and the last encode took
     int device() const;
 
 private:

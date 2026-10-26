@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project Maya - set up and start GLM-5.3-Flash or DeepSeek-V4.1-Flash-1017 on your own GPU(s).
+"""Project Maya - set up and start GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017 or MiniMax-M3.1-Flash on your own GPU(s).
 GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
 validated), Linux and Windows, text only.  DeepSeek-V4.1-Flash-1017: CUDA on Linux, RTX 30 / A100 or newer.
 
@@ -468,7 +468,7 @@ MM3_DIR = "MiniMax-M3.1-Flash-EXL3-3.5bpw"
 # Where its EXL3 quant is offered: everywhere DeepSeek's EXL3 runs (NVIDIA from V100, cc 7.0 = DS4_MIN_CC; Linux and
 # Windows) once maya-mm3 builds and runs there - MM3_ALL_PLATFORMS, the one switch.  Until then: Linux, RTX 30 / A100 or
 # newer (validated on sm_86 and sm_120); MAYA_MM3_MIN_CC=70 takes a V100 for testing.  AMD: never (EXL3 has no HIP port).
-MM3_ALL_PLATFORMS = False
+MM3_ALL_PLATFORMS = True
 MM3_MIN_CC = 70                                    # (with MM3_ALL_PLATFORMS: DeepSeek's EXL3 reach)
 MM3_MIN_CC_NOW = 80                                # (until then)
 MM3_TEST_CC_ENV = "MAYA_MM3_MIN_CC"                # (testing only: 70 lets the setup take a V100 - see mm3_min_cc)
@@ -987,7 +987,7 @@ def cuda_lib_dirs(nvcc: str) -> list:
 
 
 # ------------------------------------------------------------------------------------------------ 1. the PC
-def choose_gpus(a, found, min_cc: int = MIN_CC) -> list:
+def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "") -> list:
     """The GPUs the model runs on: --gpu / --gpus, else asked when several can share it (all of them recommended)."""
     byid = {g["index"]: g for g in found}
     usable = [g for g in found if int(g["arch"]) >= min_cc]
@@ -1022,7 +1022,10 @@ def choose_gpus(a, found, min_cc: int = MIN_CC) -> list:
             labels.append(f"{gpu_label(gs[0])} + {gpu_label(gs[1])} together")
         else:
             labels.append(f"{gpu_label(gs[0])} only")
-    intro = (["DeepSeek-V4.1-Flash runs best on all of them: pairs of equal GPUs split each of their layers (tensor",
+    intro = (["MiniMax-M3.1-Flash runs best on all of them: the GPUs share the layers (or split them in groups where",
+              "that measures faster), and the more VRAM, the fewer experts the CPU computes."]
+             if family == "minimax" else
+             ["DeepSeek-V4.1-Flash runs best on all of them: pairs of equal GPUs split each of their layers (tensor",
               "parallel), the pairs take the layers in turn, and the more VRAM, the fewer experts the CPU computes."]
              if min_cc >= DS4_MIN_CC else
              ["Maya can run on one GPU, or split the model's layers across several: each then caches the experts "
@@ -1069,7 +1072,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= max(min_cc, VALIDATED_CC) else
                                        "can be used (Pascal: experimental)" if int(g["arch"]) >= min_cc else
                                        f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
-    chosen = choose_gpus(a, found, min_cc)
+    chosen = choose_gpus(a, found, min_cc, family)
     archs = sorted({int(g["arch"]) for g in chosen})
     vram = sum(g["vram_gb"] for g in chosen)
     ok("using " + " + ".join(gpu_label(g) for g in chosen) +
@@ -1310,9 +1313,9 @@ def choose_family(a, prev: dict) -> str:
              "pictures from RTX 30 / A100 on); "
              f"fast with about {DS4_MEMORY_GB} GB of VRAM and RAM together{here}, with less the experts that do not "
              "fit are read from the SSD; tensor parallel across pairs of equal GPUs, a 256K context."),
-            (MM3, "experimental",
+            (MM3, "new",
              "MiniMax's MiniMax-M3.1-Flash (428B, 23B active per token) on its own engine: Mia-AiLab's EXL3 quant at "
-             f"3.5 bits (197 GB); NVIDIA {mm3_gpus()}{'' if MM3_ALL_PLATFORMS else ' on Linux'}; about "
+             f"3.5 bits (197 GB); NVIDIA {mm3_gpus()}{' on Linux and Windows (Windows: new)' if MM3_ALL_PLATFORMS else ' on Linux'}; about "
              f"{MM3_MEMORY_GB} GB of VRAM and RAM together{here}; the layers split across the GPUs, the experts that "
              "do not fit computed on the CPU; tool calls, MiniMax's thinking levels, pictures, DSpark drafting and "
              "up to a 1M context.")]
@@ -1392,12 +1395,10 @@ def cached_generator():
 
 
 def arch_setting(archs) -> str:
-    """CMAKE_CUDA_ARCHITECTURES for these GPUs.  CMakeLists.txt refuses an explicit arch below 75 (Strata's own
-    qwen4exp floor), but the GLM path is developed and measured on Volta V100s (sm_70) - so for those (and Pascal's
-    sm_6x, experimental) the build asks CMake for this machine's own GPUs ("native", which the guard leaves to
-    CMake), with CUDA_VISIBLE_DEVICES limited to the chosen cards.  RELEASE-CHECKLIST.md has the one-line CMake fix
-    that makes this unnecessary."""
-    return ";".join(str(x) for x in archs) if min(archs) >= 75 else "native"
+    """CMAKE_CUDA_ARCHITECTURES for these GPUs: the compute capabilities of the cards choose_gpus() took, by name -
+    never "native", which also builds for every other card in the PC (a Quadro P400 display card beside V100s: sm_61,
+    which maya-mm3's kernels cannot be compiled for).  CMakeLists.txt takes sm_60 and newer (Pascal experimental)."""
+    return ";".join(str(x) for x in archs)
 
 
 def toolkit_root_defs(nvcc) -> list:
@@ -1444,16 +1445,13 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
              f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}"]
     if host_compiler:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(host_compiler) or host_compiler}")
-    # "native" is what CMake sees: only the chosen cards, numbered as nvidia-smi numbers them
+    # (CMake's compiler checks see only the chosen cards, numbered as nvidia-smi numbers them)
     env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=",".join(str(i) for i in gpu_ids))
     # nvcc takes 2-4 GB per job on the big kernels: half the threads, and no more jobs than RAM / 4 GB
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     build = [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)]
     say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) +
         " (10-30 minutes the first time, a few minutes after an update) ...")
-    if cuda_archs == "native":
-        say("  (CMakeLists.txt refuses an explicit sm_70 - Maya's own floor is sm_75 - so CMake is asked for this")
-        say(f"  machine's GPUs instead: CMAKE_CUDA_ARCHITECTURES=native with CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']})")
     stopped = cmake_steps(conf, build, env, "build-maya.bat", nvcc=nvcc)
     if stopped:
         return stop(stopped)
@@ -2952,7 +2950,10 @@ def server_command(cfg_path: Path, a) -> tuple:
     if host not in ("127.0.0.1", "localhost", "::1"):
         say("  Other devices:    the server prints this machine's addresses when it is ready" +
             ("" if key else " - WARNING: no API key, anyone on your network can use it (--api-key KEY)"))
-    if ds4:
+    if config_family(cfg) == "minimax":
+        say("  Loading takes a few minutes: the engine places the experts in VRAM by how often they are used and keeps")
+        say("  the rest in pinned RAM for its CPU lane - the first answers are the slowest.")
+    elif ds4:
         say("  Loading takes a few minutes: the engine places the experts in VRAM by how often they are used, copies the")
         say("  rest into RAM for its CPU lane and pins them - the first answers are the slowest.")
     else:
@@ -4196,7 +4197,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     # calibration (tools/calibrate_ds4.py, as DeepSeek's) or the user's choice says it pays (set_up_mm3)
     if "--dspark" not in args[:-1] and "dspark.num_hidden_layers" in (pack / "mm3.txt").read_text(encoding="utf-8"):
         args += ["--dspark", "off"]
-    # pictures, ON by default: the pack's vision tower in the engine (~1.9 GB on the first GPU); --no-vision (or a
+    # pictures, ON by default: the pack's vision tower in the engine (in RAM, on a GPU only during a picture); --no-vision (or a
     # config's --vision off, kept) frees it for experts
     if getattr(a, "no_vision", False):
         set_arg(args, "--vision", "off")
@@ -4270,8 +4271,9 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     if a.no_vision:
         ok("pictures: off (--no-vision): the model reads text only")
     elif mm3_pack_has_vision(pack):
-        ok("pictures: ON - the model's own vision tower runs in the engine, on the first GPU (about 1.9 GB of its "
-           "memory); the server resizes the pictures, the Chat's picture button is shown")
+        ok("pictures: ON - the model's own vision tower runs in the engine; it stays in RAM and comes to the GPU only "
+           "while a picture is read (no VRAM kept for it); the server resizes the pictures, the Chat's picture button "
+           "is shown")
     else:
         ok("no vision tower in this pack: text only")
     cfg_path = write_config_mm3(a, pc, meta, pack, ctx, models, d)   # 8
@@ -4403,7 +4405,7 @@ def main() -> int:
         sys.stdout.flush()
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "maya.sh"), *sys.argv[1:]], dict(os.environ, MAYA_SH="1"))
     version = maya_version()
-    say(f"Project Maya v{version} - GLM-5.3-Flash or {DS4} on your own GPU(s).")
+    say(f"Project Maya v{version} - GLM-5.3-Flash, {DS4} or {MM3} on your own GPU(s).")
     if a.report:
         return report(version, a.backend, a.config)
     if a.bench:

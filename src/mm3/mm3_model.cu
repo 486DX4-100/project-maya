@@ -518,7 +518,7 @@ struct Model::Impl {
                 b += (h ? (double) h->bytes : 0.0) + 32.0 * g.vocab * 4;
                 if (o.dspark) b += 3.0 * GB;
             }
-            if (o.vision && (int) di == o.vision_gpu) b += 1.5 * GB;
+            // (the vision tower: no room - it stays in host memory, a picture's room lent by the staging slots)
             if (x3::blas_wanted()) b += 0.2 * GB;
             return b;
         };
@@ -844,17 +844,27 @@ struct Model::Impl {
             }
             vis = std::make_unique<Vision>();
             if (!vis->load(pk, D[(size_t) o.vision_gpu].id, err)) {
-                if (!o.vision_auto) return false;
-                info.push_back("vision off: the tower did not load on CUDA" + std::to_string(D[(size_t) o.vision_gpu].id) +
-                               " (" + err + ")");
+                if (o.vision_must) return false;
+                info.push_back("NOTE: vision off: the tower did not load on CUDA" +
+                               std::to_string(D[(size_t) o.vision_gpu].id) + " (" + err + ") - text only");
+                std::fprintf(stderr, "maya-mm3: %s\n", info.back().c_str());
                 err.clear();
                 cudaGetLastError();
                 vis.reset();
                 o.vision = false;
             }
-            if (vis) info.push_back("vision tower: " + std::to_string(vis->bytes() >> 20) + " MB on CUDA" +
-                           std::to_string(vis->device()) + ", up to " + std::to_string(vis->geo().max_pixels) +
-                           " pixels a picture");
+            if (vis) {
+                const size_t vi = (size_t) o.vision_gpu;
+                vis->set_lender([this, vi](size_t need) { return lend_slots(D[vi], need); },
+                                [this, vi]() { drop_slots(D[vi]); });
+                info.push_back("vision tower: on demand - its " + std::to_string(vis->host_bytes() >> 20) +
+                               " MB in host memory (the pack's mapping), a picture at a time on CUDA" +
+                               std::to_string(vis->device()) + " (up to " + std::to_string(vis->room_bytes() >> 20) +
+                               " MB, given back after it), up to " + std::to_string(vis->geo().max_pixels) +
+                               " pixels a picture");
+                info.push_back("NOTE: pictures: the vision tower is not kept in VRAM - each picture copies it in, the "
+                               "first one slower (its weights read from the SSD)");
+            }
         }
         // the profile: routings [layer][expert] (a wrong size is ignored)
         prof.assign((size_t) g.n_layers * g.n_exp, 0);
@@ -1404,6 +1414,26 @@ struct Model::Impl {
     // the pending slots become their expert's - at a forward's start only, their copies waited for: which experts a
     // forward finds in VRAM follows from the tokens before it, not from when a copy happened to end (the GPU's and the
     // CPU lane's sums of an expert differ in their last bits: the answer is the same from run to run this way)
+    // a picture's room (Vision::set_lender) when its GPU has none free: the staging slots, between forwards - their
+    // experts dropped, staged or promoted again as the forwards after it ask (drop_slots)
+    void* lend_slots(Dev& d, size_t need) {
+        if (d.stg == nullptr || (size_t) d.n_slots * d.slot_bytes < need) return nullptr;
+        cudaSetDevice(d.id);
+        if (cudaStreamSynchronize(d.s) != cudaSuccess || (d.cs && cudaStreamSynchronize(d.cs) != cudaSuccess))
+            return nullptr;
+        return d.stg;
+    }
+    void drop_slots(Dev& d) {
+        for (int s = 0; s < d.n_slots; ++s) {
+            d.slot_owner[(size_t) s] = -1;
+            d.slot_used[(size_t) s] = -1;
+            d.slot_pend[(size_t) s] = -1;
+            d.slot_iss[(size_t) s] = 0;
+        }
+        d.n_pending = 0;
+        d.promo_q.clear();
+    }
+
     void refresh_slots(Dev& d) {
         issue_promotions(d);   // (a forward that failed before its end)
         if (d.n_pending == 0) return;
@@ -1939,7 +1969,31 @@ Model::~Model() {
     delete tpe;
     delete p;
 }
-bool Model::load(const Options& o, std::string& err) {
+bool Model::load(const Options& o_in, std::string& err) {
+    Options o = o_in;
+    if (o.gpus.empty()) {   // (no --gpus: the GPUs this engine runs on - compute capability 7.0 or newer; a display card
+                            //  beside them, e.g. a Quadro P400, is left out with a NOTE)
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
+            err = "no CUDA device";
+            return false;
+        }
+        std::vector<std::string> skipped;
+        for (int i = 0; i < n; ++i) {
+            cudaDeviceProp pr{};
+            if (cudaGetDeviceProperties(&pr, i) != cudaSuccess) continue;
+            if (pr.major * 10 + pr.minor >= 70) o.gpus.push_back(i);
+            else skipped.push_back("CUDA" + std::to_string(i) + " (" + pr.name + ", sm_" + std::to_string(pr.major) +
+                                   std::to_string(pr.minor) + ")");
+        }
+        if (o.gpus.empty()) {
+            err = "no GPU of compute capability 7.0 or newer (MiniMax-M3.1's engine needs a V100 or newer)";
+            return false;
+        }
+        for (const auto& s : skipped)
+            std::fprintf(stderr, "maya-mm3: NOTE: %s left out - compute capability below 7.0 (--gpus to choose)\n",
+                         s.c_str());
+    }
 #if defined(_WIN32)
     // Windows: the tensor-parallel path's host waits on the GPUs' counters depend on its launches being submitted as
     // they are enqueued, which the WDDM driver batches - the layer split there (MAYA_MM3_TP_WINDOWS=1: try it anyway)
@@ -1953,7 +2007,23 @@ bool Model::load(const Options& o, std::string& err) {
 #endif
     if (o.tp > 0) {
         tpe = new TpEngine;
-        return tpe->load(o, err);
+        if (tpe->load(o, err)) return true;
+        // (the tensor-parallel path does not fit this PC - its memory, its GPUs: the layer split instead, which sizes
+        //  itself to the memory, with a NOTE; its own error when that does not load either)
+        const std::string why = err;
+        delete tpe;   // (frees its GPU memory and pinned pool first)
+        tpe = nullptr;
+        Options o2 = o;
+        o2.tp = 0;
+        err.clear();
+        std::fprintf(stderr, "maya-mm3: --tp %d did not load (%s): the layer split instead\n", o.tp, why.c_str());
+        if (!p->load(o2, err)) {
+            err = "--tp " + std::to_string(o.tp) + ": " + why + "; the layer split: " + err;
+            return false;
+        }
+        p->info.insert(p->info.begin(), "NOTE: --tp " + std::to_string(o.tp) + " did not fit (" + why +
+                                            "): the layer split instead");
+        return true;
     }
     return p->load(o, err);
 }

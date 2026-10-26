@@ -587,9 +587,27 @@ struct TpEngine::Impl {
                     return false;
                 }
                 vis = std::make_unique<Vision>();
-                if (!vis->load(pk, M[(size_t) std::clamp(o.vision_gpu, 0, (int) M.size() - 1)].id, err)) return false;
-                info.push_back("vision tower: " + std::to_string(vis->bytes() >> 20) + " MB on CUDA" +
-                               std::to_string(vis->device()));
+                const int vd = M[(size_t) std::clamp(o.vision_gpu, 0, (int) M.size() - 1)].id;
+                if (!vis->load(pk, vd, err)) {   // (before the layers: what fails here is this GPU's own memory)
+                    if (o.vision_must) return false;
+                    info.push_back("NOTE: vision off: the tower did not load on CUDA" + std::to_string(vd) + " (" + err +
+                                   ") - text only");
+                    std::fprintf(stderr, "maya-mm3: %s\n", info.back().c_str());
+                    err.clear();
+                    cudaGetLastError();
+                    vis.reset();
+                    o.vision = false;
+                }
+                if (vis) {
+                    vis->set_lender([this, vd](size_t need) { return lend_slots(vd, need); },
+                                    [this]() { drop_slots(); });
+                    info.push_back("vision tower: on demand - its " + std::to_string(vis->host_bytes() >> 20) +
+                                   " MB in host memory (the pack's mapping), a picture at a time on CUDA" +
+                                   std::to_string(vd) + " (up to " + std::to_string(vis->room_bytes() >> 20) +
+                                   " MB, given back after it)");
+                    info.push_back("NOTE: pictures: the vision tower is not kept in VRAM - each picture copies it in, "
+                                   "the first one slower (its weights read from the SSD)");
+                }
             }
         }
         for (Member& m : M) {
@@ -865,7 +883,12 @@ struct TpEngine::Impl {
         }
         acat = kAPool;
         // the routed experts in VRAM, group by group: the most routed of its layers first while its tightest member
-        // keeps reserve_gb free (each member holds its slice of every one)
+        // keeps reserve_gb free (each member holds its slice of every one).  A prompt stages a layer's experts outside
+        // VRAM all at once in the group's cache, so the cache and the residents share the measured free memory: at
+        // least --cache-gb of slots, more where the memory is tight - each layer then keeps n_exp - slots experts in
+        // VRAM at least; an error (the layer split instead: Model::load) only when not even a whole layer's experts
+        // fit as slots
+        const int cap = o.resident_cap < 0 ? g.n_exp : std::min(o.resident_cap, g.n_exp);
         for (size_t gi = 0; gi < G.size(); ++gi) {
             Group& gr = G[gi];
             size_t budget = SIZE_MAX;
@@ -873,13 +896,42 @@ struct TpEngine::Impl {
                 TK(cudaSetDevice(M[(size_t) mi].id));
                 size_t fr = 0, tot = 0;
                 TK(cudaMemGetInfo(&fr, &tot));
-                const size_t reserve =
-                    (size_t) (((o.reserve_gb < 0 ? 0.3 : o.reserve_gb) + o.cache_gb) * (1u << 30));
+                const size_t reserve = (size_t) ((o.reserve_gb < 0 ? 0.3 : o.reserve_gb) * (1u << 30));
                 budget = std::min(budget, fr > reserve ? fr - reserve : 0);
             }
             std::vector<int> ml;
+            size_t blob_max = 0;
             for (int li = gr.l0; li < gr.l1; ++li)
-                if (L[(size_t) li].moe) ml.push_back(li);
+                if (L[(size_t) li].moe) {
+                    ml.push_back(li);
+                    blob_max = std::max(blob_max, L[(size_t) li].blob);
+                }
+            gr.slot_bytes = blob_max;
+            int floor_res = 0;   // (each MoE layer's experts in VRAM at least)
+            if (blob_max > 0) {
+                const int asked = std::max(1, (int) ((size_t) (std::max(0.0, o.cache_gb) * (1u << 30)) / blob_max));
+                int S = std::min(g.n_exp, std::max(asked, g.n_exp - cap));
+                auto cost = [&](int s) {
+                    return (double) s * (double) blob_max + (double) ml.size() * (double) (g.n_exp - s) * (double) blob_max;
+                };
+                while (S < g.n_exp && cost(S) > (double) budget) ++S;
+                if (cost(S) > (double) budget) {
+                    err = "tp: layers " + std::to_string(gr.l0) + "-" + std::to_string(gr.l1 - 1) + " do not fit: a "
+                          "layer's " + std::to_string(g.n_exp) + " expert slices (" +
+                          std::to_string(((size_t) g.n_exp * blob_max) >> 20) + " MB) need more than the " +
+                          std::to_string(budget >> 20) + " MB free on its tightest GPU";
+                    return false;
+                }
+                if (S > asked)
+                    info.push_back("NOTE: tp: layers " + std::to_string(gr.l0) + "-" + std::to_string(gr.l1 - 1) +
+                                   ": an expert cache of " + std::to_string(S) + " slots (" +
+                                   std::to_string(((size_t) S * blob_max) >> 20) + " MB a GPU, --cache-gb asked " +
+                                   std::to_string(asked) + "): the GPU memory is tight, a prompt stages a layer's "
+                                   "experts outside VRAM at once");
+                gr.n_slots = S;
+                floor_res = g.n_exp - S;
+                budget -= (size_t) S * blob_max;
+            }
             if (o.verbose) {
                 std::fprintf(stderr, "tp: group %zu (layers %d-%d): expert budget %zu MB a member, free", gi, gr.l0,
                              gr.l1 - 1, budget >> 20);
@@ -891,7 +943,6 @@ struct TpEngine::Impl {
                 }
                 std::fprintf(stderr, "\n");
             }
-            const int cap = o.resident_cap < 0 ? g.n_exp : std::min(o.resident_cap, g.n_exp);
             struct C {
                 uint32_t n;
                 int li, e;
@@ -904,13 +955,18 @@ struct TpEngine::Impl {
             else   // (round robin: expert 0 of every layer, then 1, ...)
                 std::stable_sort(c.begin(), c.end(), [](const C& a, const C& b) { return a.e < b.e; });
             std::map<int, std::vector<int>> chosen;
-            for (const C& x : c) {
-                const Layer& l = L[(size_t) x.li];
-                if ((int) chosen[x.li].size() < cap && budget >= l.blob) {
-                    budget -= l.blob;
-                    chosen[x.li].push_back(x.e);
+            std::vector<char> took(c.size(), 0);
+            for (int pass = 0; pass < 2; ++pass)   // (each layer's floor first - its most routed - then by the profile)
+                for (size_t i = 0; i < c.size(); ++i) {
+                    const C& x = c[i];
+                    const Layer& l = L[(size_t) x.li];
+                    const int lim = pass == 0 ? floor_res : cap;
+                    if (!took[i] && (int) chosen[x.li].size() < lim && budget >= l.blob) {
+                        budget -= l.blob;
+                        chosen[x.li].push_back(x.e);
+                        took[i] = 1;
+                    }
                 }
-            }
             for (int li : ml) {
                 Layer& l = L[(size_t) li];
                 std::vector<int>& v = chosen[li];
@@ -970,16 +1026,10 @@ struct TpEngine::Impl {
                 return false;
             }
         }
-        // the expert cache's slots, group by group (cache_gb a member)
+        // the expert cache's slots, group by group (n_slots: sized with the residents above)
         for (Group& gr : G) {
             const int t = (int) gr.mem.size();
-            if (o.cache_gb <= 0) {
-                err = "--tp: --cache-gb must be more than 0 (its slots stage a prompt's experts)";
-                return false;
-            }
-            for (int li = gr.l0; li < gr.l1; ++li) gr.slot_bytes = std::max(gr.slot_bytes, L[(size_t) li].blob);
-            if (gr.slot_bytes == 0) continue;
-            gr.n_slots = (int) ((size_t) (o.cache_gb * (1u << 30)) / gr.slot_bytes);
+            if (gr.slot_bytes == 0 || gr.n_slots == 0) continue;
             gr.slot_base.assign((size_t) t, nullptr);
             gr.cs.assign((size_t) t, nullptr);
             gr.slot_ev.assign((size_t) t, {});
@@ -1159,6 +1209,48 @@ struct TpEngine::Impl {
     }
 
     // a window's start: the slots whose copies began promote_lag windows ago are their experts' (copies waited for)
+    // a picture's room (Vision::set_lender) when its GPU has none free: the expert cache of the group holding that GPU,
+    // between forwards - the group's cached experts dropped, staged or promoted again as the windows after it ask
+    int lent_g = -1;
+    void* lend_slots(int dev, size_t need) {
+        for (size_t gi = 0; gi < G.size(); ++gi) {
+            Group& gr = G[gi];
+            for (size_t j = 0; j < gr.mem.size(); ++j) {
+                if (M[(size_t) gr.mem[j]].id != dev || gr.n_slots == 0 || j >= gr.slot_base.size() ||
+                    (size_t) gr.n_slots * gr.slot_bytes < need)
+                    continue;
+                for (size_t q = 0; q < gr.mem.size(); ++q) {   // (every member's: a slot is the same expert on all)
+                    const Member& m = M[(size_t) gr.mem[q]];
+                    cudaSetDevice(m.id);
+                    if (cudaStreamSynchronize(m.s) != cudaSuccess ||
+                        (q < gr.cs.size() && gr.cs[q] && cudaStreamSynchronize(gr.cs[q]) != cudaSuccess))
+                        return nullptr;
+                }
+                cudaSetDevice(dev);
+                lent_g = (int) gi;
+                return gr.slot_base[j];
+            }
+        }
+        return nullptr;
+    }
+    void drop_slots() {
+        if (lent_g < 0) return;
+        Group& gr = G[(size_t) lent_g];
+        for (int s = 0; s < gr.n_slots; ++s) {
+            const long long key = gr.slot_owner[(size_t) s];
+            if (key >= 0) L[(size_t) (key / 1024)].slot_of[(size_t) (key % 1024)] = -1;
+            gr.slot_owner[(size_t) s] = -1;
+            gr.slot_pend[(size_t) s] = -1;
+            gr.slot_used[(size_t) s] = -1;
+            gr.slot_iss[(size_t) s] = 0;
+            gr.slot_prom[(size_t) s] = 0;
+        }
+        gr.n_pending = 0;
+        gr.n_prom = 0;
+        gr.promo_q.clear();
+        lent_g = -1;
+    }
+
     bool refresh(Group& gr, std::string& err) {
         if (gr.n_pending == 0) return true;
         for (int s = 0; s < gr.n_slots; ++s) {

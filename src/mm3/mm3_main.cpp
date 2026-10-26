@@ -44,6 +44,7 @@
 #include <vector>
 
 #include <cuda_profiler_api.h>
+#include <cuda_runtime.h>
 
 #include "mm3_cpu.hpp"
 #include "mm3_env.hpp"
@@ -884,7 +885,19 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "maya-mm3: %s\n", err.empty() ? "the pack has no vision tower" : err.c_str());
             return 1;
         }
+        void* lent = nullptr;   // (MAYA_MM3_VISION_LEND=1: the lender's path tested - a room lent, given back)
+        if (const char* fl = mm3::env("MM3_VISION_LEND"); fl && std::atoi(fl) == 1)
+            v.set_lender([&lent](size_t b) { return cudaMalloc(&lent, b) == cudaSuccess ? lent : nullptr; },
+                         [&lent]() {
+                             cudaFree(lent);
+                             lent = nullptr;
+                             std::fprintf(stderr, "vision: the lent room given back\n");
+                         });
         std::vector<float> rows;
+        size_t fr0 = 0, fr1 = 0, tot = 0;
+        double first_ms = 0;
+        cudaSetDevice(v.device());
+        cudaMemGetInfo(&fr0, &tot);
         for (int rep = 0; rep < 2; ++rep) {   // (the second one timed)
             const double t0 = now();
             if (!v.encode(px.data(), w, h, rows, err)) {
@@ -892,9 +905,15 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (rep == 1)
-                std::fprintf(stderr, "vision: %d x %d pixels -> %zu rows in %.0f ms (%zu MB on CUDA%d)\n", w, h,
-                             rows.size() / (size_t) v.geo().out_dim, 1e3 * (now() - t0), v.bytes() >> 20, v.device());
+                std::fprintf(stderr, "vision: %d x %d pixels -> %zu rows in %.0f ms (%zu MB of CUDA%d during it, the "
+                             "first %.0f ms)\n", w, h, rows.size() / (size_t) v.geo().out_dim, 1e3 * (now() - t0),
+                             v.last_bytes() >> 20, v.device(), 1e3 * first_ms);
+            else
+                first_ms = now() - t0;
         }
+        cudaMemGetInfo(&fr1, &tot);
+        std::fprintf(stderr, "vision: CUDA%d free %zu MB before, %zu MB after (the tower in VRAM between pictures: %zu "
+                     "MB)\n", v.device(), fr0 >> 20, fr1 >> 20, v.bytes() >> 20);
         std::FILE* fo = std::fopen(enc_out.c_str(), "wb");
         if (!fo || std::fwrite(rows.data(), 4, rows.size(), fo) != rows.size()) {
             std::fprintf(stderr, "%s: cannot write\n", enc_out.c_str());
@@ -909,6 +928,7 @@ int main(int argc, char** argv) {
     if (!images.empty()) {
         o.vision = true;
         o.vision_auto = false;
+        o.vision_must = true;
     }
     if (!learned.empty()) {   // (this PC's own routing: read when it exists, else the shipped --profile; saved)
         if (std::FILE* f = std::fopen(learned.c_str(), "rb")) {
@@ -1029,12 +1049,14 @@ int main(int argc, char** argv) {
     if (!images.empty()) {   // --images: an MMI1 file's pictures, for the prompt's spans
         std::vector<Pic> pics;
         std::vector<mm3::Model::Image> rows;
+        for (const std::string& l : m.vram_lines()) std::fprintf(stderr, "before the pictures: %s\n", l.c_str());
         const double t0 = now();
         if (!read_pics(images, pics, err) || !picture_rows(m, pics, ids, 0, rows, err)) {
             std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
             return 1;
         }
         std::fprintf(stderr, "pictures: %zu encoded in %.0f ms\n", pics.size(), 1e3 * (now() - t0));
+        for (const std::string& l : m.vram_lines()) std::fprintf(stderr, "after the pictures: %s\n", l.c_str());
         m.set_images(std::move(rows));
     }
     last = std::max(1, std::min(last, n));

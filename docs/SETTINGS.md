@@ -690,7 +690,7 @@ Engine options, in the config's `"args"`:
 | `--dspark` | `off` until measured | `on`: the DSpark drafter proposes tokens, the model checks them (the same tokens); `./maya.sh --speed-calibration` measures which is faster here |
 | `--dspark-conf` | 0.7 | a draft is verified only while its confidence is at least this |
 | `--tp` | from the GPU count | tensor parallel: the GPUs in groups of 4 or 2 (the first alone when the others make whole groups); `0`: layers split across the GPUs |
-| `--cache-gb` | 1.5 | with `--tp`: each GPU's expert cache, out of its experts in VRAM |
+| `--cache-gb` | 1.5 | with `--tp`: each GPU's expert cache, out of its experts in VRAM - at least this; where the GPU memory is tight the engine makes it larger by itself (a NOTE), and when `--tp` does not fit at all it runs the layer split instead (a NOTE) |
 | `--tp-chunk` | 1024 | with `--tp`: the prompt's tokens a pipeline chunk takes |
 | `--tp-ffn-rows` | 0 | with `--tp`: a chunk's FFN in slices of this many tokens (0: the whole chunk; 256 keeps more experts in VRAM) |
 | `--dspark-cost` | 0 | (> 0) drafts are verified only while their confidences' product stays above this |
