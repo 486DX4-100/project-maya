@@ -23,6 +23,8 @@
 #include <pthread.h>
 #include <sched.h>
 
+#include "strata/kernels/cpu/pool.hpp"
+
 namespace kc = strata::kernels::cpu;
 
 namespace mm3 {
@@ -56,12 +58,15 @@ struct CpuLane::Impl {
     std::vector<float> xh, xsb, acc, xhd, xsd, accd, yd;
     std::vector<float> mxh, mxsb, macc, mxhd, mxsd, maccd, myd;   // (run_multi's, by entry: allocated on first use)
 
+    std::vector<int> cores;   // (the physical cores but the first, one logical CPU each: the workers' places)
     void worker(int i) {
-        // (pinned to the physical cores, after the caller's: CPUs 1.. here are cores of both sockets)
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET((i + 1) % (int) std::thread::hardware_concurrency(), &set);
-        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+        // (pinned to the physical cores, after the caller's; more workers than cores share them in turn)
+        if (!cores.empty()) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(cores[(size_t) i % cores.size()], &set);
+            pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+        }
         uint64_t seen = 0;
         for (;;) {
             int spins = 0;
@@ -134,8 +139,11 @@ CpuLane::CpuLane(int threads, int dim, int ff, float alpha, float limit, int max
     p->xsd.resize((size_t) E * p->FB);
     p->accd.resize((size_t) E * p->DQ * dim);
     p->yd.resize((size_t) E * dim);
+    p->cores = kc::physical_cores(true);
     for (int i = 0; i < threads; ++i) p->th.emplace_back([this, i] { p->worker(i); });
 }
+
+int CpuLane::auto_workers() { return (int) kc::physical_cores(true).size(); }
 
 CpuLane::~CpuLane() {
     if (p->prof && p->calls)

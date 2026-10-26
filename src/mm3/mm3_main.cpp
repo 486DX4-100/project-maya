@@ -47,6 +47,7 @@
 
 #include <cuda_profiler_api.h>
 
+#include "mm3_cpu.hpp"
 #include "mm3_model.hpp"
 #include "mm3_pack.hpp"
 #include "mm3_sample.hpp"
@@ -701,6 +702,7 @@ int main(int argc, char** argv) {
     if (kv_stream == 0) o.kv_resident = 0;
     else if (kv_stream == 1 && o.kv_resident == 0) o.kv_resident = 32768;
     if (!images.empty()) o.vision = true;
+    if (o.cpu_threads == -2) o.cpu_threads = mm3::CpuLane::auto_workers();   // (no --cpu-threads: this host's cores)
     std::vector<int> ids = ids_arg.empty() ? std::vector<int>{0} : parse_ids(ids_arg);
     if (ids.empty()) {
         std::fprintf(stderr, "no token ids\n");

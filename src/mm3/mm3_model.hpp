@@ -32,7 +32,8 @@ struct Options {
     std::string profile;          // an expert profile (uint32 [layers][experts] routings): the most used stay in VRAM
     bool pin_pool = true;         // the experts not in VRAM assembled once in pinned host memory (a miss: one DMA)
     bool fast_decode = true;      // one token: the decode GEMVs and the token's fused experts (else the prompt path)
-    int cpu_threads = 43;         // the CPU lane's workers besides the caller (-1: no CPU lane, misses are staged)
+    int cpu_threads = -2;         // the CPU lane's workers besides the caller (-1: no CPU lane, misses are staged;
+                                  // -2: this host's, CpuLane::auto_workers - one a physical core, the first the caller's)
     bool dspark = false;          // load the DSpark draft (the pack's dspark/) on the head's GPU
     bool vision = false;          // load the vision tower (the pack's vision.*) on gpus[vision_gpu], before the experts
     int vision_gpu = 0;

@@ -466,6 +466,7 @@ MM3_MANIFEST = ROOT / "tools" / "mm3" / "download.json"
 MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/strata_tokenizer.py")
 MM3_DIR = "MiniMax-M3.1-Flash-EXL3-3.5bpw"
 MM3_MIN_CC = 80                                    # (validated on RTX 30 and RTX 50: sm_86, sm_120)
+MM3_TEST_CC_ENV = "MAYA_MM3_MIN_CC"                # (testing only: 70 lets the setup take a V100 - see mm3_min_cc)
 MM3_CONTEXTS = [32768, 65536, 131072, 262144]
 MM3_DEFAULT_CONTEXT = 65536
 MM3_MODEL_NAME = "minimax-m3.1-flash"
@@ -1031,7 +1032,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         return check_hip_pc(a)
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows", "the engine needs an NVIDIA GPU and CUDA")
-    min_cc = (DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else MM3_MIN_CC if mm3 else MIN_CC
+    min_cc = (DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else mm3_min_cc() if mm3 else MIN_CC
     if WIN:
         warn("Windows support is new (experimental): Maya is developed and measured on Linux - tell us how it runs")
     if S.is_wsl():
@@ -1292,7 +1293,7 @@ def choose_family(a, prev: dict) -> str:
              "MiniMax's MiniMax-M3.1-Flash (428B, 23B active per token) on its own engine: Mia-AiLab's EXL3 quant at "
              f"3.5 bits (197 GB); NVIDIA RTX 30 / A100 or newer on Linux; about {MM3_MEMORY_GB} GB of VRAM and RAM "
              f"together{here}; the layers split across the GPUs, the experts that do not fit computed on the CPU; "
-             "tool calls and thinking levels, text only for now.")]
+             "tool calls, thinking levels and pictures.")]
     pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
     return FAMILIES[pick]
 
@@ -4000,6 +4001,17 @@ def set_up_ds4(a, prev: dict) -> Path | None:
 
 
 # ------------------------------------------------------------------------------------------------ MiniMax-M3.1-Flash
+def mm3_min_cc() -> int:
+    """The GPUs maya-mm3's setup takes: RTX 30 / A100 or newer (MM3_MIN_CC), or - for testing, opt-in - from the
+    compute capability MAYA_MM3_MIN_CC names (70: V100 on - the engine's portable kernels before sm_80)."""
+    v = os.environ.get(MM3_TEST_CC_ENV, "").strip()
+    if v.isdigit() and 70 <= int(v) < MM3_MIN_CC:
+        warn(f"{MM3_TEST_CC_ENV}={v}: GPUs before RTX 30 / A100 are taken for testing - {MM3}'s engine has not been "
+             "validated on them")
+        return int(v)
+    return MM3_MIN_CC
+
+
 def mm3_models() -> tuple:
     """The MiniMax download as MODELS entries (offer_download's form): the model's files, and its DSpark draft's (in
     the repo's dspark/ folder, so a folder of its own beside them)."""
@@ -4167,7 +4179,10 @@ def set_up_mm3(a, prev: dict) -> Path | None:
         return None
     pack = mm3_pack_step(a, d, files)                  # 6
     step(7, "images (the vision tower)")
-    ok("not yet: maya-mm3 reads text (the vision tower is in the download for later)")
+    if "vision.hidden_size" in (pack / "mm3.txt").read_text(encoding="utf-8"):
+        ok("pictures: the model's vision tower runs in the engine (~1.9 GB on the first GPU)")
+    else:
+        ok("no vision tower in this pack: text only")
     return write_config_mm3(a, pc, meta, pack, ctx, models, d)   # 8
 
 

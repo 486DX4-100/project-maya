@@ -37,6 +37,9 @@ public:
     /// The most (expert, token) pairs a run_multi takes.
     int max_entries() const;
     int threads() const;
+    /// The workers a lane takes on this host: one a physical core the process may run on, but the first (the
+    /// caller's) - SMT siblings left out (strata::kernels::cpu::physical_cores).
+    static int auto_workers();
     /// f(0 .. n - 1) on the lane's threads (the caller one of them), back when all are done.
     void parallel_for(int n, const std::function<void(int)>& f);
     /// The experts' FFN width from here on (a multiple of 128, at most the constructor's): sub-experts' slices.
