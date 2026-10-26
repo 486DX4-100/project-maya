@@ -458,20 +458,37 @@ DS4_EXL3 = {"exl3": {"bits": "2.9", "manifest": DS4_MANIFEST, "weights_gb": 211,
                          "memory_gb": 280, "dir": DS4_35}}
 # MiniMax-M3.1-Flash: its own engine (src/mm3, build/maya-mm3) reads Mia-AiLab's EXL3 quant at 3.5 bits (EAQ v1) in place
 # from its safetensors; every file is pinned and checked (tools/mm3/download.json, its DSpark draft a download of its
-# own).  Linux and NVIDIA RTX 30 / A100 or newer: the layers split across the GPUs, the most-routed experts in VRAM
-# (data/expert-profile-mm3.bin), the others computed on the CPU from RAM.
+# own).  NVIDIA: the layers split across the GPUs, the most-routed experts in VRAM (data/expert-profile-mm3.bin), the
+# others computed on the CPU from RAM.  Its chat template is Maya's own (tools/mm3/chat_template.jinja: MiniMax's plus Off).
 MM3 = "MiniMax-M3.1-Flash"
-MM3_EXE = BUILD / "maya-mm3"
+MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
 MM3_MANIFEST = ROOT / "tools" / "mm3" / "download.json"
-MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/strata_tokenizer.py")
+MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/strata_tokenizer.py", "tools/mm3/chat_template.jinja")
 MM3_DIR = "MiniMax-M3.1-Flash-EXL3-3.5bpw"
-MM3_MIN_CC = 80                                    # (validated on RTX 30 and RTX 50: sm_86, sm_120)
+# Where its EXL3 quant is offered: everywhere DeepSeek's EXL3 runs (NVIDIA from V100, cc 7.0 = DS4_MIN_CC; Linux and
+# Windows) once maya-mm3 builds and runs there - MM3_ALL_PLATFORMS, the one switch.  Until then: Linux, RTX 30 / A100 or
+# newer (validated on sm_86 and sm_120); MAYA_MM3_MIN_CC=70 takes a V100 for testing.  AMD: never (EXL3 has no HIP port).
+MM3_ALL_PLATFORMS = False
+MM3_MIN_CC = 70                                    # (with MM3_ALL_PLATFORMS: DeepSeek's EXL3 reach)
+MM3_MIN_CC_NOW = 80                                # (until then)
 MM3_TEST_CC_ENV = "MAYA_MM3_MIN_CC"                # (testing only: 70 lets the setup take a V100 - see mm3_min_cc)
-MM3_CONTEXTS = [32768, 65536, 131072, 262144]
-MM3_DEFAULT_CONTEXT = 65536
+# Context: the model's own reach is 1M positions (config.json's max_position_embeddings).  With KV streaming (the
+# setup's default) every position's K / V sits in pinned RAM - per token, by the cache's format (maya-mm3 --kv-cache;
+# 60 layers x 4 KV heads x 128 dims x K and V, plus the scales) - and a ring of the newest 32K positions in VRAM; the
+# setup recommends the largest size whose cache fits beside the model in this PC's VRAM + RAM (mm3_recommended_context).
+MM3_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]
+MM3_DEFAULT_CONTEXT = 65536                        # (the smallest the setup recommends with the memory for it)
+MM3_TESTED_CONTEXT = 262144                        # (past it: not run end to end yet - said, as the dashboard does)
+# pinned RAM a context token, by --kv-cache format: half for K, half for V (the engine's row sizes: 60 x 4 rows of 256
+# bytes BF16, 128 + 4 INT8 / FP8, 64 + 8 FP4); "K,V" mixes add K's half and V's half
+MM3_KV_BYTES = {"bf16": 122880, "int8": 63360, "fp8": 63360, "fp4": 34560}
+MM3_KV_FORMAT = "int8"                             # the format the engine uses when the config names none
 MM3_MODEL_NAME = "minimax-m3.1-flash"
-MM3_SAMPLING = {"temperature": 1.0, "top_p": 0.95}   # MiniMax's recommendation
-MM3_EFFORT = "max"                                 # thinking level for requests that name none (its five: low .. max)
+# MiniMax's model card and generation_config.json (54e4e69): temperature 1.0, top-p 0.95 - no top-k, no min-p
+MM3_SAMPLING = {"temperature": 1.0, "top_p": 0.95}
+# thinking level for requests that name none: "auto" - the card names no default effort, so none is set and the
+# template's own default applies (adaptive: the model decides whether to think); the card's five efforts low .. max
+MM3_EFFORT = "auto"
 MM3_MEMORY_GB = 250                                # VRAM + RAM: 179 GiB of weights, the experts not in VRAM pinned
 MM3_PROFILE = ROOT / "data" / "expert-profile-mm3.bin"
 FAMILIES = ("glm", "deepseek", "minimax")
@@ -657,10 +674,11 @@ def fix_config_names(cfg: dict) -> bool:
 
 def select_build_backend(backend: str) -> None:
     """Separate build folders and stamps prevent reusing a binary from the other backend."""
-    global BUILD, EXE, STAMP, DS4_EXE
+    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE
     BUILD = ROOT / ("build-hip" if backend == "hip" else "build")
     EXE = BUILD / ("maya.exe" if WIN else "maya")
     DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
+    MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
     STAMP = BUILD / "MAYA-BUILD.json"
 
 
@@ -1022,9 +1040,12 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     step(1, "checking this PC")
     ds4 = family == "deepseek"
     mm3 = family == "minimax"
-    if mm3 and (a.backend == "hip" or not sys.platform.startswith("linux")):
-        fail(f"{MM3}'s engine (maya-mm3) runs on NVIDIA GPUs under Linux only for now",
-             "set it up on a Linux PC with an RTX 30 / A100 or newer")
+    if mm3 and a.backend == "hip":   # (as DeepSeek's EXL3 quant: EXL3 has no AMD port)
+        fail(f"{MM3}'s EXL3 quant runs on NVIDIA GPUs only (EXL3's kernels have no HIP port)",
+             f"set it up on a PC with an NVIDIA GPU ({mm3_gpus()})")
+    if mm3 and WIN and not MM3_ALL_PLATFORMS:
+        fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
+             f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
     if a.backend == "hip":
         if ds4 and not gguf:
             fail(f"{DS4}'s EXL3 quant runs on NVIDIA GPUs only (its prompt kernels have no HIP port)",
@@ -1291,9 +1312,10 @@ def choose_family(a, prev: dict) -> str:
              "fit are read from the SSD; tensor parallel across pairs of equal GPUs, a 256K context."),
             (MM3, "experimental",
              "MiniMax's MiniMax-M3.1-Flash (428B, 23B active per token) on its own engine: Mia-AiLab's EXL3 quant at "
-             f"3.5 bits (197 GB); NVIDIA RTX 30 / A100 or newer on Linux; about {MM3_MEMORY_GB} GB of VRAM and RAM "
-             f"together{here}; the layers split across the GPUs, the experts that do not fit computed on the CPU; "
-             "tool calls, thinking levels and pictures.")]
+             f"3.5 bits (197 GB); NVIDIA {mm3_gpus()}{'' if MM3_ALL_PLATFORMS else ' on Linux'}; about "
+             f"{MM3_MEMORY_GB} GB of VRAM and RAM together{here}; the layers split across the GPUs, the experts that "
+             "do not fit computed on the CPU; tool calls, MiniMax's thinking levels, pictures, DSpark drafting and "
+             "up to a 1M context.")]
     pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
     return FAMILIES[pick]
 
@@ -2542,6 +2564,10 @@ def calibrate_config(cfg_path: Path) -> bool:
     cfg = read_json(cfg_path)
     if config_family(cfg) == "deepseek":
         return calibrate_ds4_config(cfg_path)
+    if config_family(cfg) == "minimax":   # (maya-mm3 sizes its CPU lane by this PC's cores and its pools by its memory)
+        ok(f"{MM3}: the engine sets its CPU lane and memory from this PC itself - nothing to tune here yet "
+           f"({ME} --speed-calibration measures its DSpark drafter)")
+        return False
     if cfg.get("backend") == "hip":
         warn("the tuning measures the CUDA engine's CPU lane (NVIDIA GPUs): the HIP port keeps its own settings")
         return False
@@ -2657,7 +2683,7 @@ def needs_speed_calibration(cfg: dict) -> bool:
     calibration could not run then - the GPUs were busy): its next start measures first.  Not with --parallel above 1:
     the engine then decodes without the drafter."""
     args = cfg.get("args") or []
-    if config_family(cfg) == "deepseek":               # (its DSpark drafter: measured once too)
+    if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
         return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {})
     return "--dflash" in args[:-1] and parallel_of(cfg) <= 1 and \
         "speed_calibration" not in (cfg.get("installer") or {})
@@ -2670,7 +2696,7 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     that chooses DFlash2, or --speed-calibration, measures again.  False: not measured (the reason is shown; nothing
     changed, and a failure is recorded so that a start does not try again by itself)."""
     cfg = read_json(cfg_path)
-    if config_family(cfg) == "deepseek":
+    if config_family(cfg) in ("deepseek", "minimax"):
         return speed_calibration_ds4(cfg_path, cfg, why)
     drafter = drafter_file(cfg)
     if drafter is None or not drafter.is_file():
@@ -2741,11 +2767,11 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
 
 
 def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
-    """DeepSeek's speed calibration (tools/calibrate_ds4.py): the sustained decode speed with the DSpark drafter and
-    without it (--dspark none), measured on this PC's GPUs; the config keeps the faster - the drafter only when it wins
-    by more than CDS.MIN_GAIN - and the result (installer.speed_calibration)."""
+    """DeepSeek's and MiniMax's speed calibration (tools/calibrate_ds4.py): the sustained decode speed with the DSpark
+    drafter and without it (--dspark none / off), measured on this PC's GPUs; the config keeps the faster - the drafter
+    only when it wins by more than CDS.MIN_GAIN - and the result (installer.speed_calibration)."""
     if not CDS.has_drafter(cfg):
-        warn(f"the speed calibration compares DeepSeek's DSpark drafter with no drafting, and this pack has no "
+        warn(f"the speed calibration compares the model's DSpark drafter with no drafting, and this pack has no "
              f"drafter: {ME} --setup downloads it")
         return False
     busy = busy_gpus(cfg)
@@ -2812,7 +2838,7 @@ def keep_drafting(cfg_path: Path, on: bool) -> None:
     installer.speed_calibration records the choice - so a start does not measure by itself (--speed-calibration
     measures any time)."""
     cfg = read_json(cfg_path)
-    ds4 = config_family(cfg) == "deepseek"
+    ds4 = config_family(cfg) in ("deepseek", "minimax")   # (DSpark: DeepSeek's and MiniMax's drafter)
     if ds4:
         out, kept = CDS.with_dspark(cfg, "on" if on else "none"), ("dspark" if on else "none")
     else:
@@ -2885,7 +2911,8 @@ def server_command(cfg_path: Path, a) -> tuple:
     cfg_path.touch()                                   # the most recently used model
     refresh_engine(cfg)
     if needs_speed_calibration(cfg):                   # a drafter set up without its speed calibration: measured once
-        drafter = "DeepSeek's DSpark drafter" if config_family(cfg) == "deepseek" else "DFlash2"
+        drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter"}.get(
+            config_family(cfg), "DFlash2")
         if speed_calibration(cfg_path, f"once, for a setup that drafts with {drafter}"):
             cfg = read_json(cfg_path)
             args = cfg.get("args") or []
@@ -4002,14 +4029,59 @@ def set_up_ds4(a, prev: dict) -> Path | None:
 
 # ------------------------------------------------------------------------------------------------ MiniMax-M3.1-Flash
 def mm3_min_cc() -> int:
-    """The GPUs maya-mm3's setup takes: RTX 30 / A100 or newer (MM3_MIN_CC), or - for testing, opt-in - from the
-    compute capability MAYA_MM3_MIN_CC names (70: V100 on - the engine's portable kernels before sm_80)."""
+    """The GPUs maya-mm3's setup takes: DeepSeek's EXL3 reach (MM3_MIN_CC, V100 on) once MM3_ALL_PLATFORMS is on;
+    until then RTX 30 / A100 or newer (MM3_MIN_CC_NOW), or - for testing, opt-in - from the compute capability
+    MAYA_MM3_MIN_CC names (70: V100 on - the engine's portable kernels before sm_80)."""
+    if MM3_ALL_PLATFORMS:
+        return MM3_MIN_CC
     v = os.environ.get(MM3_TEST_CC_ENV, "").strip()
-    if v.isdigit() and 70 <= int(v) < MM3_MIN_CC:
+    if v.isdigit() and 70 <= int(v) < MM3_MIN_CC_NOW:
         warn(f"{MM3_TEST_CC_ENV}={v}: GPUs before RTX 30 / A100 are taken for testing - {MM3}'s engine has not been "
              "validated on them")
         return int(v)
-    return MM3_MIN_CC
+    return MM3_MIN_CC_NOW
+
+
+def mm3_gpus() -> str:
+    """The NVIDIA GPUs the setup offers MiniMax on, in words."""
+    return "V100 / RTX 20 or newer" if MM3_ALL_PLATFORMS else "RTX 30 / A100 or newer"
+
+
+def mm3_kv_format(args: list) -> str:
+    """The KV cache's format a maya-mm3 config runs with: its --kv-cache, else the engine's default."""
+    return args[args.index("--kv-cache") + 1] if "--kv-cache" in args[:-1] else MM3_KV_FORMAT
+
+
+def mm3_kv_gb(ctx: int, fmt: str) -> float:
+    """GB of pinned RAM the KV cache takes at a context (KV streaming: every position in RAM)."""
+    k, _, v = fmt.partition(",")
+    half = lambda x: MM3_KV_BYTES.get(x, MM3_KV_BYTES["bf16"]) / 2
+    return ctx * (half(k) + half(v or k)) / 2**30
+
+
+def mm3_recommended_context(vram: float, ram: float, fmt: str) -> int:
+    """The context the setup recommends on this PC: the largest (up to MM3_TESTED_CONTEXT) whose KV cache fits in
+    what VRAM + RAM hold beyond the model (MM3_MEMORY_GB) - so the cache does not push experts out of RAM - else the
+    smallest; MM3_DEFAULT_CONTEXT when the RAM could not be read."""
+    if ram <= 0:
+        return MM3_DEFAULT_CONTEXT
+    spare = vram + ram - MM3_MEMORY_GB
+    fits = [c for c in MM3_CONTEXTS if c <= MM3_TESTED_CONTEXT and mm3_kv_gb(c, fmt) <= spare]
+    return max(fits) if fits else MM3_CONTEXTS[0]
+
+
+def mm3_context_notes(ctx: int, vram: float, ram: float, fmt: str) -> None:
+    """What a context costs here, and the warnings (as the dashboard's): past what was run end to end, a cache that
+    takes RAM the experts need."""
+    kv, spare = mm3_kv_gb(ctx, fmt), vram + ram - MM3_MEMORY_GB
+    ok(f"the context's KV cache: about {kv:.0f} GB of pinned RAM ({fmt.upper()}), its newest 32K positions in VRAM too")
+    if ctx > MM3_TESTED_CONTEXT:
+        warn(f"past {context_label(MM3_TESTED_CONTEXT)} the engine has not been run end to end yet, and a prompt that "
+             "long reads slowly - tell us how it goes")
+    if kv > max(0.0, spare):
+        warn(f"{vram:.0f} GB of VRAM and {ram:.0f} GB of RAM: with a {context_label(ctx)} context's cache, fewer "
+             "experts stay in RAM (answers slower) and the engine may not start - "
+             f"{context_label(mm3_recommended_context(vram, ram, fmt))} fits this PC")
 
 
 def mm3_models() -> tuple:
@@ -4106,7 +4178,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                                                     "--kv-streaming", "--kv-resident"))
     # KV streaming (maya-mm3 --kv-streaming on), as the GLM engine's: 32768 positions of each layer's K / V in VRAM
     # (--kv-resident N sets another window), all of them in pinned RAM - a longer context leaves the VRAM to experts;
-    # 80 KB of RAM a context token in INT8, 160 KB in BF16 (10 / 20 GB at 128K)
+    # MM3_KV_BYTES of RAM a context token by the cache's format (BF16: 15 GB at 128K, 120 GB at 1M)
     if "--kv-streaming" not in args[:-1]:
         args += ["--kv-streaming", "on"]
     # tensor parallel (maya-mm3 --tp): the GPUs in groups of 4 (or 2), the first alone when the others make whole
@@ -4119,11 +4191,16 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                 args += ["--tp", str(tp)]
                 break
     # DSpark (the draft in the pack: tools/mm3/pack.py indexes dspark/): drafts verified by the model, the same tokens
-    # it would answer alone - about 1.6x the decode on the 3090 + 8x 5060 Ti it was measured on
+    # it would answer alone - about 1.6x the decode on the 3090 + 8x 5060 Ti it was measured on, but where most experts
+    # run on the CPU the drafts' windows cost more than they save (DeepSeek's lesson): off until this PC's speed
+    # calibration (tools/calibrate_ds4.py, as DeepSeek's) or the user's choice says it pays (set_up_mm3)
     if "--dspark" not in args[:-1] and "dspark.num_hidden_layers" in (pack / "mm3.txt").read_text(encoding="utf-8"):
-        args += ["--dspark", "on"]
-    # pictures: the pack's vision tower in the engine (~1.9 GB on the first GPU; --vision off frees it for experts)
-    if "--vision" not in args[:-1] and "vision.hidden_size" in (pack / "mm3.txt").read_text(encoding="utf-8"):
+        args += ["--dspark", "off"]
+    # pictures, ON by default: the pack's vision tower in the engine (~1.9 GB on the first GPU); --no-vision (or a
+    # config's --vision off, kept) frees it for experts
+    if getattr(a, "no_vision", False):
+        set_arg(args, "--vision", "off")
+    elif "--vision" not in args[:-1] and mm3_pack_has_vision(pack):
         args += ["--vision", "on"]
     cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": MM3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
@@ -4153,9 +4230,17 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     return cfg_path
 
 
+def mm3_pack_has_vision(pack: Path) -> bool:
+    """The pack indexes the model's vision tower (tools/mm3/pack.py's vision.* lines)."""
+    try:
+        return "vision.hidden_size" in (pack / "mm3.txt").read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
 def set_up_mm3(a, prev: dict) -> Path | None:
-    """MiniMax-M3.1-Flash's steps 1-8: the PC (Linux, RTX 30 / A100 or newer, the memory), the context, its engine
-    (build/maya-mm3), the files, the pack, the config."""
+    """MiniMax-M3.1-Flash's steps 1-8: the PC (NVIDIA - mm3_gpus(); the memory), the context (recommended by this PC's
+    memory), its engine (build/maya-mm3), the files, the pack, pictures, the config."""
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -4166,8 +4251,11 @@ def set_up_mm3(a, prev: dict) -> Path | None:
         warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{MM3_MEMORY_GB} GB that hold all of {MM3} "
              "(the engine reads what does not fit from the SSD as the page cache allows - slower)")
     step(2, "your choices")                            # 2
-    ctx = choose_context(a, prev_ctx, MM3_CONTEXTS, MM3_DEFAULT_CONTEXT)
-    ok(f"context: {ctx} tokens")
+    fmt = mm3_kv_format(prev_args)                     # (a setup again keeps the config's --kv-cache)
+    rec = mm3_recommended_context(vram, total, fmt)
+    ctx = choose_context(a, prev_ctx, MM3_CONTEXTS, rec)
+    ok(f"context: {ctx} tokens" + (" (recommended for this PC's memory)" if ctx == rec else ""))
+    mm3_context_notes(ctx, vram, total, fmt)
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
     d = mm3_dir(a, models, prev)
@@ -4179,11 +4267,23 @@ def set_up_mm3(a, prev: dict) -> Path | None:
         return None
     pack = mm3_pack_step(a, d, files)                  # 6
     step(7, "images (the vision tower)")
-    if "vision.hidden_size" in (pack / "mm3.txt").read_text(encoding="utf-8"):
-        ok("pictures: the model's vision tower runs in the engine (~1.9 GB on the first GPU)")
+    if a.no_vision:
+        ok("pictures: off (--no-vision): the model reads text only")
+    elif mm3_pack_has_vision(pack):
+        ok("pictures: ON - the model's own vision tower runs in the engine, on the first GPU (about 1.9 GB of its "
+           "memory); the server resizes the pictures, the Chat's picture button is shown")
     else:
         ok("no vision tower in this pack: text only")
-    return write_config_mm3(a, pc, meta, pack, ctx, models, d)   # 8
+    cfg_path = write_config_mm3(a, pc, meta, pack, ctx, models, d)   # 8
+    if CDS.has_drafter(read_json(cfg_path)):           # 9: the DSpark drafter, measured on this PC (or chosen)
+        how = drafting_choice(a, "MiniMax's DSpark drafter", "10-30")
+        if how != "measure":
+            keep_drafting(cfg_path, how == "on")
+        else:
+            if S.UI is not None:
+                S.UI.step(9, "speed calibration: the DSpark drafter or none")
+            speed_calibration(cfg_path)
+    return cfg_path
 
 
 def set_up_and_serve(a, prev: dict) -> tuple | None:
@@ -4216,8 +4316,8 @@ def main() -> int:
     ap.add_argument("--download-model", action="store_true",
                     help="download the model without asking (the commands and the size are still printed)")
     ap.add_argument("--model", choices=list(MODELS) + [DS4, MM3],
-                    help=f"which model (default: asked): {DS4}, or a GLM-5.3-Flash download ({next(iter(MODELS))} "
-                         "recommended)")
+                    help=f"which model (default: asked): {DS4}, {MM3}, or a GLM-5.3-Flash download "
+                         f"({next(iter(MODELS))} recommended)")
     ap.add_argument("--model-dir", help=f"use {DS4}'s files you already have: their folder (a GGUF's shards, or the "
                                         "EXL3 quant's files and the Engram shards 47 / 48 of DeepSeek's repo); it "
                                         "must be writable - the pack is written inside it")

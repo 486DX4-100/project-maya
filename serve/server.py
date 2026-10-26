@@ -55,8 +55,9 @@ from serve import ds4_vision, gpu_map, mm3_vision  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
-                            anthropic_to_messages, deepseek_effort_kwargs, deepseek_images, effort_kwargs, effort_level,
-                            effort_name, literal_tags, mark_literals, media_of, openai_to_messages, unmark_literals)
+                            EFFORT_WORDS, anthropic_to_messages, deepseek_effort_kwargs, deepseek_images, effort_kwargs,
+                            effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
+                            unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
                              new_response, response_collect, response_events)
@@ -112,8 +113,9 @@ def nvml_pids(pid: int | None, listed: set) -> set:
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
 CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
 # the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
-# GLM engine's 256K
-CONTEXT_TESTED = {"ds4": 1048576}
+# GLM engine's 256K, and maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
+# end yet)
+CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144}
 CONTEXT_TESTED_DEFAULT = 262144
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
 REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|"
@@ -961,6 +963,7 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
+                    self._done_after_err()        # (maya-ds4 / maya-mm3 end the request with a DONE after it)
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
@@ -980,11 +983,41 @@ class StrataEngine:
                         print(f"[maya] stopped, and the engine did not say the request had ended within {DRAIN_S:.0f} s "
                               "(STRATA_DRAIN_S) - going on; the engine may still be writing it", flush=True)
                         break
-                    if line is None or line.startswith("ERR"):
+                    if line is None:
+                        self.lines.put(None)                # (the engine is gone: the next reader hears it too)
+                        break
+                    if line.startswith("ERR"):
+                        self._done_after_err()
                         break
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         break
+
+    # How long, after an ERR, the reader waits for the DONE that may follow it: maya-ds4 and maya-mm3 print one right
+    # after (in the same flush), the GLM engine none for most errors - so a short wait, not DRAIN_S.
+    ERR_DONE_S = 0.5
+
+    def _done_after_err(self):
+        """After an ERR (single stream): take the DONE the engine may print after it, so the next request does not read
+        that stale DONE as its own end (it returned an empty answer).  STAT / NOTE lines meanwhile are handled; the
+        wait ends at another line, at the engine's end or after ERR_DONE_S."""
+        end = time.monotonic() + self.ERR_DONE_S
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.01, end - time.monotonic()))
+            except queue.Empty:
+                return
+            if line is None:
+                self.lines.put(None)
+                return
+            if line.startswith("DONE"):
+                return
+            if line.startswith("STAT "):
+                self._parse_stat(line)
+            elif line.startswith("NOTE "):
+                print("[maya] " + line[5:].strip(), flush=True)
+            else:
+                return                                  # (not this request's end: dropped, as before)
 
     def command(self, line: str, expect: str, timeout: float = 60.0) -> str:
         """One control line between requests (the GLM engine's VLEND / VRECLAIM) -> its answer line; ValueError on
@@ -1474,18 +1507,19 @@ def trained_context(model_dir) -> int | None:
 
 
 def trained_context_ds4(pack) -> int | None:
-    """DeepSeek's: the context its pack says the model was trained for (ds4.txt's max_position_embeddings, from the
-    model's config.json or a GGUF's context_length; V4.1-Flash: 1,048,576, its native reach), the top of the dashboard's
-    Context size.  None when the pack does not say."""
-    try:
-        with open(Path(pack) / "ds4.txt", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                k, _, v = line.strip().partition(" ")
-                if k == "max_position_embeddings":
-                    n = int(v.split()[0])
-                    return n if n > 0 else None
-    except (OSError, ValueError, IndexError):
-        pass
+    """DeepSeek's and MiniMax's: the context its pack says the model was trained for (ds4.txt's / mm3.txt's
+    max_position_embeddings, from the model's config.json or a GGUF's context_length; V4.1-Flash and M3.1-Flash:
+    1,048,576, their native reach), the top of the dashboard's Context size.  None when the pack does not say."""
+    for name in ("ds4.txt", "mm3.txt"):
+        try:
+            with open(Path(pack) / name, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    k, _, v = line.strip().partition(" ")
+                    if k == "max_position_embeddings":
+                        n = int(v.split()[0])
+                        return n if n > 0 else None
+        except (OSError, ValueError, IndexError):
+            continue
     return None
 
 
@@ -1797,11 +1831,23 @@ class Service:
         top = self.trained_context or CONTEXT_FALLBACK_MAX
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
+        # a streamed cache's RAM (KV streaming: maya-mm3's VRAM lines' kv_ram - every position's K / V in pinned RAM,
+        # the engine's own count at this context) and the RAM free now: the dashboard scales the one against the other
+        kv_ram = sum(int(p.get("kv_ram") or 0) for p in getattr(self.engine, "vram", None) or [])
+        ram = {}
+        if kv_ram:
+            try:
+                import psutil
+                vm = psutil.virtual_memory()
+                ram = {"ram_gb": round(vm.total / 2**30, 1), "ram_free_gb": round(vm.available / 2**30, 1)}
+            except Exception:  # noqa: BLE001 - psutil is optional: no RAM figures, no RAM warning
+                pass
         return {"context": self.engine.max_context, "min": CONTEXT_MIN, "max": max(top, self.engine.max_context),
                 "trained": self.trained_context,
                 "tested": CONTEXT_TESTED.get(str(info.get("engine_kind") or ""), CONTEXT_TESTED_DEFAULT),
                 "kv_gb": info.get("kv_gb"), "kv_ctx": info.get("kv_ctx"),
                 "kv_resident": info.get("kv_resident") or 0,
+                "kv_ram_gb": round(kv_ram / 2**30, 3) if kv_ram else None, **ram,
                 "vram_gb": info.get("vram_gb"), "vram_slots": info.get("vram_slots"), "reload": reload}
 
     def set_context(self, n: int) -> dict:
@@ -4140,7 +4186,7 @@ def clean_shared_defaults(d) -> dict:
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":   # (kept by its own name: medium / xhigh are MiniMax's, GLM's High / Max else)
             if effort_level(value) is None:
-                raise ValueError("reasoning_effort: none, low, medium, high, xhigh or max")
+                raise ValueError(f"reasoning_effort: {EFFORT_WORDS}")
             value = effort_name(value)
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
@@ -4532,7 +4578,7 @@ def main() -> int:
         svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
-    elif "--pack" in args[:-1]:                         # DeepSeek's pack: its ds4.txt
+    elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt)
         svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"

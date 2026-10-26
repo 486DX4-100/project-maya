@@ -54,13 +54,16 @@ class ChatTemplate:
         # DeepSeek-V4.1 (tools/ds4/chat_template.jinja): the levels by their own names (its budgets 50 / 75 / 100), tool
         # calls in DSML (OutputParser(dsml=True) reads them)
         self.deepseek = "｜DSML｜" in self.source
-        # MiniMax-M3.1 (its own chat_template.jinja): thinking_mode enabled / disabled / adaptive and reasoning_effort
+        # MiniMax-M3.1 (tools/mm3/chat_template.jinja: MiniMax's own plus thinking_mode "disabled"): reasoning_effort
         # low .. max; <mm:think> reasoning and ]<]minimax[>[-tagged tool calls (OutputParser(minimax=True) reads them)
         self.minimax = MINIMAX_NS in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
         name = kwargs.pop("effort_name", None)   # (effort_kwargs: the client's level where it is not GLM's - MiniMax's)
+        if kwargs.get("reasoning_effort") == AUTO:   # "auto": the model's own default - the template is told nothing
+            kwargs.pop("reasoning_effort")
+            name = None
         if self.deepseek:
             # Pinned, reviewed upstream encoder: keep its roles, tool ordering,
             # namespace semantics, tasks and thinking policy in one implementation.
@@ -89,19 +92,18 @@ class ChatTemplate:
                     prompt = prompt[:-len(header)]
             return prompt
         if self.minimax:
-            # its own five levels: off -> thinking disabled (the turn opens with </mm:think>); low -> adaptive (the
-            # model decides) at effort low; medium / high / xhigh / max -> thinking enabled (the turn opens with
-            # <mm:think>) at that effort; none named -> the template's default, adaptive
+            # MiniMax's card: "set reasoning_effort in the chat template: low, medium, high, xhigh or max" - its
+            # template has one thinking mode, adaptive (the model decides whether to think), and writes the effort
+            # beside it; none named (Auto) is the template's default.  Off is thinking_mode "disabled" (MiniMax-M3's
+            # words, the turn opened with </mm:think>) - the one place Maya's prompt differs from MiniMax's template.
             off = kwargs.pop("enable_thinking", None) is False
             level = kwargs.pop("reasoning_effort", None)
             level = name or level
+            kwargs.pop("thinking_mode", None)
             if off:
                 kwargs["thinking_mode"] = "disabled"
-            elif level in ("low", "medium", "high", "xhigh", "max"):
+            elif level in EFFORT_NAMES:
                 kwargs["reasoning_effort"] = level
-                kwargs["thinking_mode"] = "adaptive" if level == "low" else "enabled"
-            else:
-                kwargs["thinking_mode"] = "adaptive"
             # (its template reads tool.function: the server's flat tools go back into OpenAI's form)
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
@@ -140,16 +142,22 @@ VIDEO_PARTS = ("video_url", "input_video", "video")
 
 # Thinking levels: GLM-5.x's own - Off, Low, High and Max (its template's default, the most thorough).  Clients spell
 # them many ways and everything maps onto those four: OpenAI's "medium" (GLM has none) is High, "xhigh" is Max.
+# "auto" (or "default") is the model's own default: the template is told no level at all (MiniMax-M3.1's adaptive
+# thinking with no effort named, GLM's Max, DeepSeek's encoder default).
+AUTO = "auto"
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
-          "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
+          "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max", "maximum": "max",
+          "auto": AUTO, "default": AUTO}
 QWEN_EFFORT = {"low": "low", "high": "medium", "max": "xhigh"}   # the same levels in a Qwen3.x template's words
 # MiniMax-M3.1's template has five (low, medium, high, xhigh, max): the client's own word among them reaches it
 # (effort_kwargs' "effort_name"), the other templates get the four above
 EFFORT_NAMES = ("low", "medium", "high", "xhigh", "max")
+EFFORT_WORDS = "none, auto, low, medium, high, xhigh or max"
 
 
 def effort_level(value) -> str | None:
-    """A client's spelling -> the level's name (none / low / high / max); None when none is given or it is unknown."""
+    """A client's spelling -> the level's name (none / low / high / max, or auto: the model's own default); None when
+    none is given or it is unknown."""
     if value is None or value == "":
         return None
     if value is False:
@@ -159,8 +167,8 @@ def effort_level(value) -> str | None:
 
 
 def effort_name(value) -> str | None:
-    """A client's spelling -> MiniMax's level name (none / low / medium / high / xhigh / max); None when none is given
-    or it is unknown."""
+    """A client's spelling -> MiniMax's level name (none / auto / low / medium / high / xhigh / max); None when none is
+    given or it is unknown."""
     level = effort_level(value)
     if level is None or level == "none":
         return level
@@ -176,7 +184,7 @@ def effort_kwargs(value) -> dict:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
     if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, xhigh or max")
+        raise ValueError(f"unknown reasoning effort {value!r}: use {EFFORT_WORDS}")
     level = EFFORT[key]
     if level is None:
         return {"enable_thinking": False}
