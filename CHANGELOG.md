@@ -4,7 +4,7 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
-## v1.1.30 - (draft, not released)
+## v1.1.30 - 2026-10-27
 
 MiniMax-M3.1-Flash in Project Maya's own quants: the whole model in a 128 GB PC.
 
