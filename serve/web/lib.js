@@ -126,13 +126,16 @@ export function relTime(t) {
 
 // the model family's logo (web/logo-*.svg: lobe-icons' marks, MIT) and its name as people write it:
 // "glm-5.3-flash" -> "GLM 5.3 Flash", "deepseek-v4.1-flash" -> "DeepSeek V4.1 Flash", "qwen3.8-flash-next" -> "Qwen3.8 Flash Next"
-const MODEL_LOGOS = [[/glm/i, "glm", true], [/deepseek/i, "deepseek"], [/minimax/i, "minimax"], [/qwen/i, "qwen"]];
+// (CYBER-FROST-3.8-PS, a Qwen3.8-Flash-Next fine-tune: Qwen's mark, its own name as its card writes it)
+const MODEL_LOGOS = [[/glm/i, "glm", true], [/deepseek/i, "deepseek"], [/minimax/i, "minimax"], [/qwen|cyber-frost/i, "qwen"]];
 export function modelLogo(name) {
   const m = MODEL_LOGOS.find(([re]) => re.test(name || ""));
   return m ? {src: `web/logo-${m[1]}.svg`, mono: !!m[2]} : null;
 }
 const NAME_WORDS = {glm: "GLM", deepseek: "DeepSeek", minimax: "MiniMax", qwen: "Qwen"};
 export function modelName(id) {
+  const cf = String(id || "").match(/^cyber-frost-([\d.]+)/i);
+  if (cf) return `CYBER-FROST ${cf[1]}`;
   return String(id || "").split(/[-_\s]+/).filter(Boolean).map((w) => {
     const lw = w.toLowerCase(), m = lw.match(/^([a-z]+)(\d.*)$/);
     if (NAME_WORDS[lw]) return NAME_WORDS[lw];

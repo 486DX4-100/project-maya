@@ -55,7 +55,8 @@ from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, models, savings  
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
-                            EFFORT_WORDS, anthropic_to_messages, deepseek_effort_kwargs, deepseek_images, effort_kwargs,
+                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, deepseek_effort_kwargs, deepseek_images,
+                            effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
                             unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -3975,9 +3976,11 @@ def make_handler(svc: Service):
             elif path == "/health":
                 # the run config's recommended settings: the web app's Chat defaults until its user picks their own
                 rec = {k: v for k, v in svc.sampling_defaults.items() if k in ("temperature", "top_p", "top_k")}
-                if svc.default_effort:   # (MiniMax's by its own five names)
+                if svc.default_effort:   # (MiniMax's by its own five names, CYBER-FROST's by Qwen's three)
                     rec["reasoning_effort"] = (effort_name if getattr(svc.template, "minimax", False) else effort_level)(
                         svc.default_effort) or svc.default_effort
+                    if getattr(svc.template, "forced_thinking", False):
+                        rec["reasoning_effort"] = QWEN_EFFORT.get(rec["reasoning_effort"], rec["reasoning_effort"])
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
@@ -4979,6 +4982,8 @@ def main() -> int:
         level = (effort_name if svc.template.minimax else effort_level)(svc.default_effort) or \
             (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
                                                      else "none")
+        if getattr(svc.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)
+            level = QWEN_EFFORT.get(level, level)
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)

@@ -137,9 +137,10 @@ export function setScheme(c) {
 // "Medium" was GLM's High and its "High" GLM's Max: they are translated once (thinking_v 2)
 export const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0, max: "", seed: "", show: true,
                          mcp: true, system: "", sys_default: false, thinking_v: 2};
+// CYBER-FROST-3.8-PS (Qwen3.8's template, thinking always on): its three reasoning efforts, low / medium / xhigh
 const THINK_LEVELS = {glm: ["none", "low", "high", "max"], deepseek: ["none", "low", "high", "max"],
-                      minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"]};
-const THINK_DEFAULT = {glm: "high", deepseek: "high", minimax: "auto"};   // (the run config's level wins: loadHealth)
+                      minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"], qwen: ["low", "medium", "xhigh"]};
+const THINK_DEFAULT = {glm: "high", deepseek: "high", minimax: "auto", qwen: "xhigh"};   // (the run config's level wins: loadHealth)
 const LEVEL = {none: ["Off", "Answers right away"], auto: ["Auto", "It decides whether to think"], low: ["Low", "A short think"],
                medium: ["Medium", "A moderate think"], high: ["High", "Thinks it through"], xhigh: ["XHigh", "Thinks hard"],
                max: ["Max", "The most thorough, and the longest"]};
@@ -155,10 +156,13 @@ export const THINK_TITLES = {
             high: "Effort high: it decides whether to think, and thinks it through",
             xhigh: "Effort extra-high: it decides whether to think, and thinks hard",
             max: "Effort max: it decides whether to think - the most thorough, and the longest"},
+  qwen: {low: "Reasoning effort low: a short think", medium: "Reasoning effort medium: thinks it through",
+         xhigh: "Reasoning effort xhigh (its default): checks its assumptions and alternatives - the most thorough"},
 };
 // the running model's family, its thinking levels (THINKING, LEVELS: live bindings) and their titles
 export const familyOf = (model = S.health.model) =>
-  (/deepseek/i.test(model || "") ? "deepseek" : /minimax/i.test(model || "") ? "minimax" : "glm");
+  (/deepseek/i.test(model || "") ? "deepseek" : /minimax/i.test(model || "") ? "minimax"
+    : /cyber-frost|qwen/i.test(model || "") ? "qwen" : "glm");
 export let THINKING = THINK_LEVELS.glm;
 export let LEVELS = [];
 export function setFamily(model) {
@@ -182,7 +186,8 @@ export function presetOf(p) {
 }
 const glmLevel = (v) => ({medium: "high", high: "max", xhigh: "max"}[v] || v);
 
-export const prefsKey = () => ({deepseek: "sampling_deepseek", minimax: "sampling_minimax"}[familyOf()] || "sampling");
+export const prefsKey = () => ({deepseek: "sampling_deepseek", minimax: "sampling_minimax", qwen: "sampling_qwen"}[familyOf()] ||
+  "sampling");
 export let P = null;                     // the running model's chat settings
 export function loadPrefs(key = prefsKey()) {
   const p = {...DEFAULTS, ...store.get(key, {})};

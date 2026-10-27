@@ -1194,3 +1194,63 @@ Setup and debugging variables:
 The switch quantizes both the prompt activations and the FP16 SwiGLU intermediate to q8_1.
 This approximate prompt path can change answers; it is off by default. It uses a separate workspace for each
 host thread, device and stream, and keeps the existing path during graph capture.
+
+## CYBER-FROST-3.8-PS
+
+`./maya.sh --setup --model cyber-frost` sets up peasantsmith's GGUF of Blackfrost-AI's CYBER-FROST-3.8 (a fine-tune of
+Qwen3.8-Flash-Next: 512 experts, 10 a token, GatedDeltaNet and sparse-attention layers, an n-gram table, an MTP block;
+the Qwen Community License 1.0, `LICENSE.qwen-community-1.0`). One 112.5 GB file, downloaded from the commit
+`tools/qwen/download.json` pins and checked against its sha256. It runs on the `maya` engine's own Qwen path, from the
+file in place: the setup writes `maya-cyber-frost.json` (`maya-cyber-frost-hip.json` on AMD), the pack (the index of
+the file's tensors, its small float weights and the tokenizer with the model's chat template) and the MTP drafter, built
+from the file's NextN block (`tools/mtp_from_gguf.py`, in `<model folder>/pack/mtp`). Text only: there is no vision
+tower in its repo.
+
+**Where the experts live.** The most-used experts go to VRAM (`--expert-cache auto`: the free VRAM less the reserve).
+When this PC's RAM cannot hold all the others, the engine reads them straight from the GGUF: the next-most-used are
+copied into RAM, as many as the available RAM allows less 12% of it (at least 6 GB) for the system and the page cache,
+and the rest are read from the file when they are routed (from the page cache, or the SSD). The 52 GB n-gram table is
+always read from the SSD row by row and never enters RAM. With about 84 GB of VRAM and RAM together every expert stays
+in memory.
+
+**Defaults from the model card**: temperature 1.0, top-p 0.95, top-k 20 (the GGUF's `general.sampling`). Its template
+always thinks; its reasoning effort is the thinking level:
+
+| `reasoning_effort` | The prompt |
+|---|---|
+| `xhigh` (default; the server's `max`) | the template's default: a system note asks for careful reasoning |
+| `medium` (the server's `high`) | no note |
+| `low` | a note asks for brief thinking |
+| `none` | the think block closed at once (`<think>\n\n</think>`, as its Qwen base writes thinking off) |
+
+The prompt is the GGUF's own template, verbatim (`<pack>/tokenizer/chat_template.jinja`): it always adds a fixed
+system prompt of the model's makers ahead of any system message a request sends, and thinking is always on in
+it. Tool calls are Qwen's XML form. A
+thinking budget (`"thinking_budget"` in the config, 32768 by default) closes the think block when it is reached.
+
+**The context.** 32K to 256K (the model's reach). Only the 12 attention layers keep a KV cache, about 14 KB a token in
+INT8 (26 KB in FP16), in VRAM; the setup recommends the largest context whose cache takes at most ~12% of the VRAM.
+
+**Drafting.** The MTP drafter proposes up to three tokens a window; the model checks them, so the answer is the same.
+The setup measures whether it is faster on this PC (it is, by far, where most experts run on the GPU and on code; less
+where most run on the CPU) and keeps it only then; `./maya.sh --speed-calibration` measures again.
+
+Engine options, in the config's `"args"`:
+
+| Option | Default | What it does |
+|---|---|---|
+| `--max-context` | the setup's choice | the context, in tokens |
+| `--expert-cache` | `auto` | experts in VRAM: `auto` takes the free VRAM less the reserve; a number caps it |
+| `--vram-reserve-mib` | 700 | VRAM left free for the driver, the desktop and other programs |
+| `--expert-profile` | `<pack>/expert-profile.bin` | the ranking of every (layer, expert) pair: which start in VRAM, then RAM |
+| `--experts-from-gguf` | `auto` | `auto`: the experts from the GGUF (RAM tier, then the file) when the RAM cannot hold them all, else all in RAM; `on` / `off` force it |
+| `--mtp` | `<pack>/mtp` | the MTP drafter's folder - always loaded (the engine's server needs it) |
+| `--mtp-max-t` | the setup's measurement | `1`: the drafter's drafts off (windows of one token, prompt-lookup drafts only) - where drafting does not measure faster; unset: drafts up to `--spec` |
+| `--spec` | 4 | the decode window's tokens (the drafts plus one) |
+| `--prefill` | `auto` | the prompt's chunk: `auto` takes the largest the expert cache can lend |
+| `--kv` | `int8` (the setup) | the KV cache's format: `int8` (the model card's own llama.cpp line runs q8_0 K / V; the attention takes as long as in FP16, with half the VRAM), `fp16` (exact; the engine's default without the flag), `k8v4` (INT8 K, rotated 4-bit V) or `q4_0` |
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MAYA_EXPERT_RAM_GB` | unset (what the RAM allows) | caps the experts' RAM tier, in GB (the dashboard's Models page: Experts in RAM) |
+| `MAYA_EXPERT_STAGERS` | a quarter of the CPU threads, 2 to 8 | the threads that read a layer's experts from the file while the CPU prepares the layer (their reads overlap); `0`: read one by one when the CPU needs them |
