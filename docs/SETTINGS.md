@@ -176,6 +176,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_ENGINE_QUIT_S` | 50 | the server: how long the engine gets to end (and keep its conversation, with `MAYA_GLM_SLOT_KEEP`) after a stop - SIGTERM and SIGHUP are handled like Ctrl+C, a second one is ignored (a second Ctrl+C ends the server at once); a supervisor's own grace (llama-swap's `unloadTimeout`) should exceed it |
 | `MAYA_ENGINE_WRAP_S` | 40 | the server: on a stop, a request in progress is wrapped up instead of dropped - its thinking is closed at once and it answers for up to this long (then it is cut), so the client gets an answer and the turn ends; requests still queued are refused. Keep it plus the engine's end inside the supervisor's grace (llama-swap's `unloadTimeout`); `0` = cut at once |
 | `MAYA_FAIR_SLICE_S` | 0 (off) | the server: an answer that has been decoding this many seconds while another request waits gives the engine to it and continues afterwards, from where it was (the engine keeps its state with what it wrote: one token is read again). Concurrent chats and an agent's side requests no longer wait for a whole answer (4x RTX 4090, a short question during a 3000-token answer: first token after 34 s -> 13-17 s at 15-20). Each switch sets a conversation aside on disk (0.1-1 s up to 100K tokens on a SATA SSD array), so a slow disk wants a longer slice |
+| `MAYA_LOOP_GUARD` | on | the server, every model: an answer that falls into a loop (one block of tokens repeated back to back) is caught as it starts and steered out of it - see [The loop guard](#the-loop-guard). `0` = off (as `"loop_guard": false` in the config) |
 | `MAYA_VIDEO_MAX_FRAMES` | 240 | the server (GLM): the most frames a video may give (read at 4 a second, so 240 = a minute); a longer video is refused before it is decoded, with its length in the message. Every frame takes an image's share of the context. Videos need ffmpeg and ffprobe installed |
 
 **The expert profile** (`data/expert-profile-glm.bin`). At start the engine fills VRAM with the experts a profile ranks
@@ -295,6 +296,35 @@ penalized) and with several requests at once. DeepSeek-V4.1 applies them the sam
 included (a sampled request's drafts are then kept by the speculative-sampling rule over the penalized distribution). A
 repeat penalty of 1 and frequency and presence penalties of 0 are off: such a request decodes exactly as one without
 them.
+
+## The loop guard
+
+A quantized model, greedy above all, can fall into a loop: the same sentence, number sequence or block of code again
+and again until `max_tokens`. The server watches every answer for one, in the thinking and in the answer, on every
+model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short patterns (`MAYA_GLM_LOOP_THINK`,
+`MAYA_GLM_LOOP_ANSWER`).
+
+- **What counts as a loop:** the end of what was written is one block of 8-400 tokens repeated exactly, back to back
+  (4 times for a block under 32 tokens, 3 times for a longer one), over 96 tokens at least. A table's rows, an array,
+  a name used over and over or code lines alike are not exact copies of one block back to back, so they go on
+  untouched. The check costs a few microseconds a token.
+- **The first loop:** the repeats are dropped (the first copy stays) and the model goes on from there with a mild
+  repetition penalty (1.15 over the last 2 x the block's length, at least 128 tokens) for the next 2 x the block's
+  length + 128 tokens; then the request's own sampling again.
+- **A second loop in the thinking:** the repeats are dropped, the thinking is closed (the model's own end-of-thinking
+  token) and it answers, with the same short penalty at first.
+- **A second loop in the answer, or a third in all:** the answer ends there (`finish_reason` "stop").
+- **Streaming:** tokens that repeat what came just before them are held back while they do (two blocks at most), so
+  a client never receives repeats that are dropped; when the text moves on, they follow at once.
+- **Nothing changes without a loop:** the same engine calls with the same sampling, the same tokens.
+
+The server window gets a line for each loop broken (`[maya] loop guard: a 19-token block 5 times in the answer at
+token 1,763: repeats dropped, a short repetition penalty`); the dashboard's Monitor marks that request (Loop guard,
+on hover what it did) and counts the loops since the start, as do `/metrics` (`loop_guard`) and
+`/metrics/prometheus` (`maya:loop_guard_*_total`).
+
+Off for the server: `MAYA_LOOP_GUARD=0`, or `"loop_guard": false` in the run config. A request can choose for itself
+with `"loop_guard": false` (or `true`) beside its sampling fields (Chat Completions, Anthropic Messages).
 
 ## Several requests at once
 

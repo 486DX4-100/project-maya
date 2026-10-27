@@ -27,6 +27,8 @@ MiniMax-M3.1-Flash in Project Maya's own quants: the whole model in a 128 GB PC.
   and installed models and their configs carry on as they are.
 - **DeepSeek: a 256K context by default** wherever the PC's VRAM and RAM hold the model; PCs with less keep 64K. A
   setup again keeps the context you chose before.
+- **A loop guard for every model:** an answer that falls into repeating one block over and over, in the thinking or
+  the answer, is caught as it starts and steered out of it; on by default (`MAYA_LOOP_GUARD=0` turns it off).
 
 ## v1.1.29 - 2026-10-26
 

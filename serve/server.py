@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, mm3_vision  # noqa: E402
+from serve import ds4_vision, gpu_map, loop_guard, mm3_vision  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
@@ -333,6 +333,21 @@ def error_body(e: Exception, kind: str = "invalid_request_error") -> dict:
 # the engine's ERR when a route met a NaN or an infinity (Glm5Model::route_ok): it has dropped that conversation's state
 NONFINITE = "non-finite"
 
+# what Service._sliced yields when the loop guard ends an answer (a loop that came back): run() ends it, "stop"
+LOOP_STOP = object()
+
+
+def loop_guard_setting(cfg: dict | None, env=None) -> bool:
+    """The loop guard (serve/loop_guard.py), on unless MAYA_LOOP_GUARD (STRATA_LOOP_GUARD) says 0 / off / false / no
+    or the run config has "loop_guard": false; the environment, when set, wins over the config."""
+    off = ("0", "off", "false", "no", "none")
+    env = os.environ if env is None else env
+    v = env.get("STRATA_LOOP_GUARD", env.get("MAYA_LOOP_GUARD"))   # (main: MAYA_* aliased, the config's env applied)
+    if v is not None and str(v).strip():
+        return str(v).strip().lower() not in off
+    v = (cfg or {}).get("loop_guard")
+    return str(v).strip().lower() not in off if isinstance(v, str) else v is not False and v != 0
+
 
 def client_stop_strings(req: dict | None) -> list[str]:
     """A request's own stop strings: OpenAI's "stop" (a string or a list) or Anthropic's "stop_sequences" (from
@@ -394,6 +409,14 @@ def check_request_sampling(req: dict) -> None:
             raise ValueError(what)
     if isinstance(req.get("penalty_last_n"), int) and req["penalty_last_n"] < -1:
         raise ValueError(f"{window_key}: -1 (the whole context), 0 (no penalties) or a positive number of tokens")
+    guard = req.get("loop_guard")                   # the loop guard for this request only (serve/loop_guard.py)
+    if guard is not None and not isinstance(guard, bool):
+        if isinstance(guard, str) and guard.strip().lower() in ("true", "false", "on", "off", "1", "0"):
+            req["loop_guard"] = guard.strip().lower() in ("true", "on", "1")
+        elif isinstance(guard, int) and guard in (0, 1):
+            req["loop_guard"] = bool(guard)
+        else:
+            raise ValueError("loop_guard: true or false")
 
 
 def logit_bias_of(value, vocab_size: int | None = None) -> dict[int, float]:
@@ -1699,6 +1722,10 @@ class Service:
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0}
+        # the loop guard (serve/loop_guard.py; MAYA_LOOP_GUARD=0 / "loop_guard": false: off) and what it did since
+        # the server started: loops seen, and how each was broken (the Monitor's totals, /metrics, Prometheus)
+        self.loop_guard = True
+        self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0}
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
@@ -2176,6 +2203,7 @@ class Service:
             answering = self.latest_request in self.current_requests
             hist = list(self.history)
             totals = dict(self.totals)
+            guard = dict(self.loop_guard_counts, on=bool(self.loop_guard))   # (what the loop guard did since start)
             active = self.active
             writing = len(self.current_requests)        # (of the active ones, those past their prompt)
         now = time.time()
@@ -2218,7 +2246,7 @@ class Service:
         cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
         return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
                 "requests": hist[::-1][:None if all_requests else 12],
-                "requests_kept": len(hist), "totals": totals, "hardware": hw,
+                "requests_kept": len(hist), "totals": totals, "loop_guard": guard, "hardware": hw,
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage()}
 
@@ -2265,6 +2293,7 @@ class Service:
         maya:*."""
         with self.status_lock:
             s, t, active = dict(self.status), dict(self.totals), self.active
+            guard = dict(self.loop_guard_counts)
         stat = dict(getattr(self.engine, "stat", None) or {})
         prompt_n = t["prompt_tokens"] - t["reused"]               # what was read, as llama.cpp counts it
         prompt_s, decode_s = t["prompt_ms"] / 1000, t["decode_ms"] / 1000
@@ -2284,6 +2313,13 @@ class Service:
             ("maya:requests_total", "counter", "Requests finished", t["requests"]),
             ("maya:engine_alive", "gauge", "1 while the engine process runs",
              int(self.engine.alive()) if hasattr(self.engine, "alive") else 1),
+            ("maya:loop_guard_detected_total", "counter", "Loops the loop guard saw in answers", guard["detected"]),
+            ("maya:loop_guard_penalised_total", "counter",
+             "Loops broken by dropping the repeats and a short repetition penalty", guard["penalised"]),
+            ("maya:loop_guard_thinking_closed_total", "counter", "Loops in the thinking that closed it",
+             guard["thinking_closed"]),
+            ("maya:loop_guard_stopped_total", "counter", "Answers the loop guard ended (a loop that came back)",
+             guard["stopped"]),
         ]
         rows += [(f"maya:engine_{k}", "counter" if k in self.PROM_STAT_COUNTERS else "gauge", h, stat[k])
                  for k, h in self.PROM_STAT.items()
@@ -2596,7 +2632,37 @@ class Service:
             if not hold[0]:
                 self.fifo.leave(place)
 
-    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat) -> Iterator[int | None]:
+    @staticmethod
+    def _resumed_sampling(sampling, produced):
+        """The sampling for an engine call that goes on after `produced`: the thinking budget counts from where it got
+        to (and is gone once the thinking was closed)."""
+        tb = (sampling or {}).get("_think_budget")
+        if not (isinstance(tb, int) and tb > 0):
+            return sampling
+        smp = dict(sampling)
+        if (sampling or {}).get("_think_end") in produced:
+            smp.pop("_think_budget", None)
+            smp.pop("_think_end", None)
+        else:
+            smp["_think_budget"] = max(1, tb - len(produced))
+        return smp
+
+    def _loop_guard_on(self, sampling) -> bool:
+        """The loop guard for this request: its own "loop_guard" when it sends one, else the server's."""
+        own = (sampling or {}).get("loop_guard")
+        return own if isinstance(own, bool) else bool(self.loop_guard)
+
+    def _loop_noted(self, act, written: int):
+        """A loop the guard broke: a line in the server window, and the Monitor's count."""
+        print(f"[maya] loop guard: {act.describe()}"
+              f"{' (now ' + format(written, ',') + ' tokens)' if act.kind != loop_guard.STOP else ''}", flush=True)
+        with self.status_lock:
+            c = self.loop_guard_counts
+            c["detected"] += 1
+            c[{loop_guard.PENALTY: "penalised", loop_guard.CLOSE_THINKING: "thinking_closed",
+               loop_guard.STOP: "stopped"}[act.kind]] += 1
+
+    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat, guard=None) -> Iterator[int | None]:
         """engine.generate(), in fair slices (STRATA_FAIR_SLICE_S): once this answer has been decoding that long and
         another request waits for the engine, the engine stops here, the FIFO goes to the next request and this one
         queues behind it.  Back in turn, it goes on with prompt + what it already wrote as the new prompt: the
@@ -2604,20 +2670,41 @@ class Service:
         prompt read is ~30x a decode step's speed).  Concurrent chats then all move on instead of waiting behind the
         longest answer, and a short side request (an agent's title, a summary) no longer waits for a whole turn.
         The caller sees one stream of token ids (None: a heartbeat, also while queued again).  `hold[0]` says
-        whether this request holds the FIFO now.  Not for image prompts: their state is never kept in a slot."""
+        whether this request holds the FIFO now.  Not for image prompts: their state is never kept in a slot.
+
+        With the loop guard (`guard`, serve/loop_guard.py) every id goes through it and the caller gets only what
+        lies before the tail it holds back (what could still be a loop's repeats).  A loop restarts the engine the
+        same way, at once and still holding the FIFO: prompt + what is kept (the repeats dropped; after a second
+        loop in the thinking, the model's end-of-thinking token too) with a short repetition penalty, which a call
+        of its own ends and the request's own sampling follows; or the answer ends there (LOOP_STOP).  Until then the
+        engine calls and their sampling are the ones without it."""
         produced, cur, left, smp = [], list(ids), max_new, sampling
         segments = []                                   # each slice's DONE (engine.last), summed at the end
+        sent = 0                                        # produced[:sent] went to the caller (the guard holds the rest)
         while True:
             last0 = getattr(self.engine, "last", None)
-            gen = self.engine.generate(cur, left, smp, cancel, embeddings=emb) if emb else \
-                self.engine.generate(cur, left, smp, cancel)
+            smp_call, n_call = guard.sampling(smp, len(produced), left) if guard is not None else (smp, left)
+            gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb) if emb else \
+                self.engine.generate(cur, n_call, smp_call, cancel)
             slice_s, t0, cut, pausing = fair_slice_seconds(), None, False, False
+            act, got = None, 0                          # the loop guard's action; this call's tokens
             try:
                 for t in gen:
-                    yield t
+                    if guard is None:
+                        yield t
+                    elif t is None:
+                        yield None
                     if t is None:
                         continue
                     produced.append(t)
+                    if guard is not None:
+                        got += 1
+                        act = guard.push(t, len(produced))
+                        if act is not None:
+                            break                       # (gen.close(): STOP + drain, still holding the FIFO)
+                        while sent < len(produced) - guard.hold:
+                            sent += 1
+                            yield produced[sent - 1]
                     if t0 is None:
                         t0 = time.monotonic()
                     if slice_s > 0 and not pausing and not emb and not self.stopping and len(produced) < max_new \
@@ -2638,7 +2725,24 @@ class Service:
                 fresh = getattr(self.engine, "last", None)
                 if fresh is not None and fresh is not last0:
                     segments.append(fresh)
+            if act is not None:                         # a loop: what is kept, then on from there - or the end
+                del produced[max(sent, len(produced) - act.drop):]   # (what was sent stays: the hold-back covers it)
+                if act.kind == loop_guard.CLOSE_THINKING:
+                    produced.append(guard.think_end)
+                guard.resume(produced, act)
+                self._loop_noted(act, len(produced))
+                if act.kind == loop_guard.STOP or len(produced) >= max_new or cancel.is_set() or self.stopping:
+                    break
+                cur, left = list(ids) + produced, max_new - len(produced)
+                smp = self._resumed_sampling(sampling, produced)
+                continue
             if not cut:
+                if guard is not None and n_call < left and got >= n_call and produced[-1] not in self.stop_ids \
+                        and not cancel.is_set() and not self.stopping:
+                    # the guard's penalty ended that call: on with the request's own sampling, still holding the FIFO
+                    cur, left = list(ids) + produced, max_new - len(produced)
+                    smp = self._resumed_sampling(sampling, produced)
+                    continue
                 break
             with self.status_lock:
                 mine = dict(self.status)
@@ -2676,14 +2780,7 @@ class Service:
                 print("[maya] the engine had stopped; starting it again (a minute or two) ...", flush=True)
                 self.engine.restart()
             cur, left = list(ids) + produced, max_new - len(produced)
-            tb = (sampling or {}).get("_think_budget")
-            if isinstance(tb, int) and tb > 0:          # the thinking budget counts from where it got to
-                smp = dict(sampling)
-                if (sampling or {}).get("_think_end") in produced:
-                    smp.pop("_think_budget", None)
-                    smp.pop("_think_end", None)
-                else:
-                    smp["_think_budget"] = max(1, tb - len(produced))
+            smp = self._resumed_sampling(sampling, produced)   # (the thinking budget counts from where it got to)
         if len(segments) > 1:                           # the request's figures, over all its slices
             first, last = segments[0], segments[-1]
             merged = dict(last, prompt_tokens=first.get("prompt_tokens"), reused=first.get("reused"))
@@ -2691,6 +2788,12 @@ class Service:
                 if all(k in sg for sg in segments):
                     merged[k] = sum(sg[k] for sg in segments)
             self.engine.last = merged
+        if guard is not None and not cancel.is_set():   # the end: what the guard still held back
+            while sent < len(produced):
+                sent += 1
+                yield produced[sent - 1]
+            if guard.events and guard.events[-1].kind == loop_guard.STOP:
+                yield LOOP_STOP                         # (run(): the answer ends here, finish "stop")
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
@@ -2715,6 +2818,7 @@ class Service:
         matched = None                                  # the client stop string that ended the answer
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        guards = []                                     # this request's loop guard (the Monitor's row says what it did)
         emb = getattr(self.embeddings, "path", None)
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
@@ -2775,7 +2879,10 @@ class Service:
                     engine's ERR says "non-finite") before the first token, the engine has dropped that conversation's
                     state and the request runs once more, its prompt read from token 0."""
                     for again in (False, True):
-                        sliced, got = self._sliced(ids, max_new, sampling, cancel, emb, hold, stat), 0
+                        guard = loop_guard.LoopGuard(self.think_end_id, parser.state == "reasoning") \
+                            if guard_on else None       # (serve/loop_guard.py; a fresh one for a run again)
+                        guards[:] = [guard] if guard is not None else []
+                        sliced, got = self._sliced(ids, max_new, sampling, cancel, emb, hold, stat, guard), 0
                         try:
                             for t in sliced:
                                 got += t is not None
@@ -2788,6 +2895,7 @@ class Service:
                                   "running the request again from token 0", flush=True)
                         finally:
                             sliced.close()
+                guard_on = self._loop_guard_on(sampling)
                 gen = attempts()
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
@@ -2799,6 +2907,9 @@ class Service:
                             yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
                                             "time_ms": round(pr[3])} if pr and len(pr) >= 4 else None)
                             continue
+                        if t is LOOP_STOP:              # the loop guard ended the answer (a loop that persisted)
+                            finish = "stop"
+                            break
                         n += 1
                         if my_first is None:
                             my_first = time.time()
@@ -2897,7 +3008,8 @@ class Service:
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
-                        "hit_rate": hit_rate})
+                        "hit_rate": hit_rate,
+                        "loop_guard": guards[0].summary() if guards and guards[0].events else None})
                     t = self.totals
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
@@ -4220,7 +4332,7 @@ class Server(ThreadingHTTPServer):
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
               "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
-              "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE") + RESPONSE_ENV_KEYS
+              "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE", "STRATA_LOOP_GUARD") + RESPONSE_ENV_KEYS
 
 
 def apply_server_env(cfg: dict) -> None:
@@ -4676,6 +4788,9 @@ def main() -> int:
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
     if svc.think_budget:
         print(f"[maya] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
+    svc.loop_guard = loop_guard_setting(cfg)            # (MAYA_LOOP_GUARD=0 or "loop_guard": false: off)
+    if not svc.loop_guard:
+        print("[maya] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     try:
         svc.cors_origins = parse_cors_origins(cfg.get("cors_origins"))

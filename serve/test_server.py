@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import string
 import sys
 import threading
 import time
@@ -21,7 +23,8 @@ from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied,
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
-ANSWER = "x" * 2000                              # longer than the old 1024 fallback: one token per byte
+# longer than the old 1024 fallback: one token per byte - and no loop ("x" * 2000 is one: the loop guard ends it)
+ANSWER = "".join(random.Random(2000).choices(string.ascii_lowercase, k=2000))
 
 
 class RecordingEngine(MockEngine):
