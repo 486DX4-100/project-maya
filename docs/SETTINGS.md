@@ -554,6 +554,21 @@ on are used (`taskset`, a container's cpuset).
 | `MAYA_DS4_CPU_LANE` | measured | `cores`, `pcores`, `node` or `smt` (a thread per logical CPU): that way, nothing is measured |
 | `DS4_COPY_NUMA` (the config's `"env"`) | 2 parts at most | the CPU lane's RAM copies of its experts in this many NUMA parts, `1`-`4`, each on its own node with a worker pool there - so a host of three or four sockets uses them all (the default takes two). 4x Xeon E7-8880 v4 (88 cores), Maya-S + DSpark, `--mmap-experts off`: two RTX 3090s (a pair on sockets 0-1, and one on 2-3, two runs each on the first) 37-39 -> 49 tok/s decode, after a 68K prompt 24-26 -> 32-33 tok/s, the prompt read 644-655 -> 805 tok/s on the first pair (802 both ways on the second); four RTX 3090s (less on the CPU lane) unchanged |
 
+## DeepSeek: IQ1_S experts on AMD Zen, Zen+ and Zen 2 CPUs
+
+ggml-cpu builds IQ1_S's grid indices (Maya-XS's experts) with the BMI2 `pdep` instruction. AMD's family 17h CPUs
+(Zen, Zen+, Zen 2: Ryzen 1000 / 2000 / 3000 desktop, Ryzen 4000 and a few 5000 laptop chips, EPYC 7001 / 7002,
+Threadripper 1000-3000) and Hygon's
+run `pdep` in microcode, hundreds of cycles each, so the CPU lane spent most of an expert there. On those CPUs the
+CPU lane now takes its own IQ1_S rows, which build the indices with plain shifts: the same numbers bit for bit
+(checked against ggml-cpu's dot at the start; if they ever differ, ggml-cpu's rows are kept). A user's report from
+an EPYC (Zen 2) with Maya-XS: an expert on the CPU 1.6 -> 0.44 ms. Zen 3 and later and Intel CPUs keep the
+measured choice as before. The log says `ds4: CPU lane IQ1_S rows: ours without pdep (...)` when it applies.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_IQ1_PDEP` | `0` on AMD family 17h / Hygon, else `1` | `0`: the rows without `pdep` on any CPU (tests: `ds4_iq1_rows_test` checks them against ggml-cpu); `1`: the measured choice (ggml-cpu's dot for a single token) |
+
 ## DeepSeek: a GEMV call's int8 inputs rounded in one launch
 
 A GGUF pack's Q8_0 (and low-bit dense) GEMVs round their activations to int8 first, one small launch per job: a
