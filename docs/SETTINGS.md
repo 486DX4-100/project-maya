@@ -700,6 +700,26 @@ largest where the CPU lane runs many experts, and nothing where VRAM already hol
 | `MAYA_DS4_DENSE_REQ` | off | `q5_k`, `q4_k` or `iq4_xs`: the Q8_0 dense matrices below re-quantized to that type at load (changes the answers a little). The GPU kernels are in every build; the conversion needs the native-experts build (ggml) - without it the matrices stay Q8_0, with a log line |
 | `MAYA_DS4_DENSE_REQ_MATCH` | `attn.wq_b,attn.wo_a,attn.wo_b` | the matrices it takes: a comma-separated list, a tensor whose name contains one of them |
 
+## DeepSeek: projecting a direction out (`--ablate`)
+
+`--ablate FILE` removes one direction r from every residual write: each layer's attention output and MoE output
+become y - s r (r . y) right before `hc_post`. The use it is written for is abliteration (r a refusal direction), and
+the pack is not changed. The direction comes from a `llama-cvector-generator` file (`direction.N`, pick N with
+`--ablate-layer`) or from a rank-1 abliteration LoRA GGUF (`lora_a` = s r^T W, `lora_b` = -r, the
+`abliterate.direction_layer` and `abliterate.scale` keys), whose direction, layer and scale it reads. An adapter is
+applied only as a projection: it must carry the same direction on all three writers of every block (`attn_output_b`,
+`ffn_down_shexp`, `ffn_down_exps`); one for some blocks only, without the routed experts, or for another depth is
+refused. Its A halves are not used; on the weights it was computed against the result is the
+adapter's, on other weights it is the exact projection rather than the adapter. Without `--ablate` nothing runs.
+Measured with drafting off, 4x RTX 3090, four restart pairs alternating the two: decode 1.5-3.8% slower (about 3%),
+no consistent prompt-speed difference.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `--ablate FILE` (the config's engine `args`) | off | a control vector or a whole-model abliteration adapter (GGUF) |
+| `--ablate-layer N` | the adapter's, or a one-direction file's | which `direction.N` of a control vector (1-4096) |
+| `--ablate-scale F` | the adapter's `abliterate.scale` (x `adapter.lora.alpha`), else 1 | s, 1e-6 to 1e6; 1 removes the component along r, above 1 over-projects |
+
 ## DeepSeek: tensor parallel 2 on Maya's own quants
 
 `--tp n` splits each expert's FFN between the group's GPUs, and a GGUF's experts split only in whole blocks of their
