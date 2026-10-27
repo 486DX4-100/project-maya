@@ -40,7 +40,8 @@ struct Options {
     bool pin_pool = true;         // the experts not in VRAM assembled once in pinned host memory (a miss: one DMA)
     bool fast_decode = true;      // one token: the decode GEMVs and the token's fused experts (else the prompt path)
     int cpu_threads = -2;         // the CPU lane's workers besides the caller (-1: no CPU lane, misses are staged;
-                                  // -2: this host's, CpuLane::auto_workers - one a physical core, the first the caller's)
+                                  // -2: this host's, CpuLane::auto_workers - one a physical core, the first the caller's,
+                                  // 2 cores left free where there are no SMT siblings); --cpu-threads N: N - 1 of them
     bool dspark = false;          // load the DSpark draft (the pack's dspark/) on the head's GPU
     bool vision = true;           // load the vision tower (the pack's vision.*) on gpus[vision_gpu], before the experts
     bool vision_auto = true;      // (vision not asked for by name: a pack without a tower runs text only, no error)

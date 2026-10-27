@@ -51,6 +51,7 @@
 #include "mm3_cpu.hpp"
 #include "mm3_env.hpp"
 #include "mm3_kernels.cuh"
+#include "mm3_lane_plan.hpp"
 #include "mm3_model.hpp"
 #include "mm3_os.hpp"
 #include "mm3_pack.hpp"
@@ -1326,15 +1327,40 @@ int score_main(mm3::Model& m, const std::string& path, const std::string& out_pa
 // chunk above the default only where every routed expert is in VRAM at the largest one (else a larger chunk's
 // buffers would take room from the experts).  The fastest setting is kept for this PC in the pack's
 // prefill-tune.txt (the next starts take it) unless it beats the defaults by less than kKeepGain; OUT gets the
-// measurements (JSON) for the setup.
-int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& out_path) {
-    constexpr double kKeepGain = 0.02;
-    constexpr int kDefChunk = 1024;
-    const double t_start = now();
-    const auto& st = m.stats();
-    const int cmax = m.chunk_max();
-    const bool all_res = st.resident >= st.experts;
-    const int N = std::max(1, std::min(m.max_ctx() - 1, std::max(4096, cmax)));
+// measurements (JSON) for the setup.  Where not every expert is in VRAM the larger chunks are measured too (after the
+// rest: what is kept does not change) with the decode of this load's placement - each chunk stages the experts VRAM
+// does not hold, so there a larger one reads prompts much faster (#552: 4096 2.2x 1024's on one 48 GB GPU) - and
+// the setup (tools/calibrate_mm3_prefill.py) keeps one when a start with the default chunk does not decode faster.
+// decode_rate: tokens decoded one by one after the prompt's (whose logits are in lg), the faster of two runs
+// (-1: an error, 0: no room in the context)
+constexpr int kDecodeTokens = 32;
+double decode_rate(mm3::Model& m, int N, std::vector<float>& lg) {
+    if (N + kDecodeTokens >= m.max_ctx()) return 0.0;
+    const auto argmax = [&] { return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin()); };
+    const int tok0 = argmax();
+    std::string err;
+    double best = 0;
+    for (int r = 0; r < 2; ++r) {
+        int tok = tok0;
+        const double t0 = now();
+        for (int i = 0; i < kDecodeTokens; ++i) {
+            if (!m.forward(&tok, 1, N + i, 1, lg.data(), err)) {
+                std::fprintf(stderr, "maya-mm3: calibration: %s\n", err.c_str());
+                return -1.0;
+            }
+            tok = argmax();
+        }
+        best = std::max(best, (double) kDecodeTokens / (now() - t0));
+    }
+    std::fprintf(stderr, "calibration: decode %.2f tok/s (%ld of %ld experts in VRAM)\n", best,
+                 (long) m.stats().resident, (long) m.stats().experts);
+    return best;
+}
+
+// the calibration's prompt: `ids` (a real text's tokens) repeated to N - the calibration's 4096 or its largest chunk -
+// or, without them, a fixed pseudo-random text
+int calib_prompt(const mm3::Model& m, std::vector<int>& ids) {
+    const int N = std::max(1, std::min(m.max_ctx() - 1, std::max(4096, m.chunk_max())));
     if (ids.empty() || (ids.size() == 1 && ids[0] == 0)) {   // (no text: a fixed pseudo-random one)
         ids.clear();
         unsigned x = 12345u;
@@ -1345,6 +1371,41 @@ int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& ou
     }
     for (size_t i = 0; ids.size() < (size_t) N; ++i) ids.push_back(ids[i]);
     ids.resize((size_t) N);
+    return N;
+}
+
+// --calibrate-decode OUT (the setup's decode check, tools/calibrate_mm3_prefill.py): this load's decode - its placement
+// beside the buffers of its --chunk - after the calibration's prompt: {"decode_tok_s", "resident", "experts"}
+int calibrate_decode(mm3::Model& m, std::vector<int> ids, const std::string& out_path) {
+    const int N = calib_prompt(m, ids);
+    std::vector<float> lg((size_t) m.vocab());
+    std::string err;
+    if (!m.forward(ids.data(), N, 0, 1, lg.data(), err)) {
+        std::fprintf(stderr, "maya-mm3: calibration: %s\n", err.c_str());
+        return 1;
+    }
+    const double dec = decode_rate(m, N, lg);
+    if (dec < 0) return 1;
+    char buf[256];
+    std::snprintf(buf, sizeof buf, "{\"decode_tok_s\": %.2f, \"chunk\": %d, \"resident\": %ld, \"experts\": %ld}\n", dec,
+                  m.chunk_max(), (long) m.stats().resident, (long) m.stats().experts);
+    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+    f << buf;
+    if (!f) {
+        std::fprintf(stderr, "%s: cannot write\n", out_path.c_str());
+        return 1;
+    }
+    return 0;
+}
+
+int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& out_path) {
+    constexpr double kKeepGain = 0.02;
+    constexpr int kDefChunk = 1024;
+    const double t_start = now();
+    const auto& st = m.stats();
+    const int cmax = m.chunk_max();
+    const bool all_res = st.resident >= st.experts;
+    const int N = calib_prompt(m, ids);
     std::vector<float> lg((size_t) m.vocab());
     std::string err;
     struct Trial {
@@ -1370,9 +1431,9 @@ int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& ou
         std::fprintf(stderr, "calibration: chunk %d, %s GEMMs: %.1f tok/s\n", c, gm == 1 ? "hipBLASLt" : "BLAS", best);
         return best;
     };
-    std::vector<int> chunks;
+    std::vector<int> chunks, wide;   // (wide: the larger ones where not every expert is in VRAM - measured last)
     for (int c : {1024, 2048, 4096})
-        if (c <= cmax && (all_res || c <= kDefChunk)) chunks.push_back(c);
+        if (c <= cmax) (all_res || c <= kDefChunk ? chunks : wide).push_back(c);
     if (chunks.empty()) chunks.push_back(cmax);
     const int top = chunks.back();
     std::vector<int> gemms{0};
@@ -1394,6 +1455,17 @@ int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& ou
     const double def = measure(dc, 0);
     if (def < 0) return 1;
     if (bt < def * (1.0 + kKeepGain)) bc = dc, bg = 0, bt = def;   // (the defaults, unless the best is clearly faster)
+    int wc = 0;
+    double wt = 0, dec = 0;
+    for (int c : wide) {   // (with the kept GEMMs; the prompt's logits of the last one stay in lg for the decode)
+        const double r = measure(c, bg);
+        if (r < 0) return 1;
+        if (r > wt) wt = r, wc = c;
+    }
+    if (!wide.empty()) {
+        dec = decode_rate(m, N, lg);
+        if (dec < 0) return 1;
+    }
     char set[256];
     std::snprintf(set, sizeof set, "chunk=%d gemm=%d tok_s=%.1f default_tok_s=%.1f tokens=%d", bc, bg, bt, def, N);
     if (!m.write_tune(set, err)) {
@@ -1402,11 +1474,14 @@ int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& ou
     }
     std::string js = "{\"key\": \"" + m.tune_key() + "\", \"file\": \"";
     for (char ch : m.tune_file()) js += ch == '\\' ? std::string("\\\\") : std::string(1, ch);
-    char buf[512];
+    char buf[512], wbuf[256] = "";
+    if (wc > 0)   // (the setup's decode check: this load's decode - its buffers the largest chunk's)
+        std::snprintf(wbuf, sizeof wbuf, "\"wide_chunk\": %d, \"wide_tok_s\": %.1f, \"decode_tok_s\": %.2f, "
+                      "\"resident\": %ld, \"experts\": %ld, ", wc, wt, dec, (long) st.resident, (long) st.experts);
     std::snprintf(buf, sizeof buf, "\", \"chunk\": %d, \"gemm\": \"%s\", \"tok_s\": %.1f, \"default_tok_s\": %.1f, "
-                  "\"tokens\": %d, \"all_resident\": %s, \"lt_available\": %s, \"seconds\": %.0f, \"trials\": [",
+                  "\"tokens\": %d, \"all_resident\": %s, \"lt_available\": %s, \"seconds\": %.0f, %s\"trials\": [",
                   bc, bg == 1 ? "hipblaslt" : "blas", bt, def, N, all_res ? "true" : "false",
-                  m.lt_available() ? "true" : "false", now() - t_start);
+                  m.lt_available() ? "true" : "false", now() - t_start, wbuf);
     js += buf;
     for (size_t i = 0; i < trials.size(); ++i) {
         std::snprintf(buf, sizeof buf, "%s{\"chunk\": %d, \"gemm\": \"%s\", \"tok_s\": %.1f}", i ? ", " : "",
@@ -1439,7 +1514,7 @@ int usage() {
                  "                [--score REF [--write-ref OUT]] [--cpu-threads N] [--dspark on|off]\n"
                  "                [--kv-resident N] [--tp-chunk N] [--tp-ffn-rows N] [--dspark-cost X]\n"
                  "                [--prefill-gemm blas|hipblaslt|auto] [--prefill-tune FILE] [--no-prefill-tune]\n"
-                 "                [--calibrate-prefill OUT.json [--ids @prompt]] [--verbose]\n"
+                 "                [--calibrate-prefill OUT.json [--ids @prompt]] [--calibrate-decode OUT.json] [--verbose]\n"
                  "                [--serve [--parallel N (1-8: conversations at once)]] [--parallel N --rows-check G]\n"
                  "       maya-mm3 --pack DIR --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus N]\n");
     return 2;
@@ -1468,7 +1543,7 @@ int main(int argc, char** argv) {
 #endif
     mm3::Options o;
     std::string ids_arg, dump, profile_out, batch, eos_arg, images, enc_rgb, enc_size, enc_out, score_path, ref_out, learned;
-    std::string calib_out;
+    std::string calib_out, calib_dec;
     bool serve_mode = false;
     int kv_stream = -1;   // (--kv-streaming: -1 not given)
     int gen = 0, last = 1, ppl = 0, rows_steps = 0;
@@ -1502,6 +1577,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-tune") o.prefill_tune = val();
         else if (a == "--no-prefill-tune") o.tune = false;
         else if (a == "--calibrate-prefill") calib_out = val();
+        else if (a == "--calibrate-decode") calib_dec = val();
         else if (a == "--staging") o.staging = std::atoi(val().c_str());
         else if (a == "--resident-cap") o.resident_cap = std::atoi(val().c_str());
         else if (a == "--reserve-gb") o.reserve_gb = std::atof(val().c_str());
@@ -1513,7 +1589,8 @@ int main(int argc, char** argv) {
         else if (a == "--promote-lag") o.promote_lag = std::max(1, std::atoi(val().c_str()));
         else if (a == "--ppl") ppl = std::atoi(val().c_str());
         else if (a == "--batch") batch = val();
-        else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val().c_str());
+        else if (a == "--cpu-threads")   // (the lane's threads, the caller included: its workers one fewer - #552)
+            o.cpu_threads = mm3::lane_workers_of_threads(std::atoi(val().c_str()));
         else if (a == "--dspark") {
             const std::string v = val();
             o.dspark = v != "off" && v != "none";
@@ -1623,11 +1700,15 @@ int main(int argc, char** argv) {
         std::fclose(fo);
         return 0;
     }
-    if (o.pack.empty() || (ids_arg.empty() && batch.empty() && !serve_mode && score_path.empty() && calib_out.empty()))
+    if (o.pack.empty() || (ids_arg.empty() && batch.empty() && !serve_mode && score_path.empty() && calib_out.empty() &&
+                           calib_dec.empty()))
         return usage();
     if (!calib_out.empty()) {   // (the calibration: buffers for its largest chunk, measured from scratch - no cache)
         if (!o.chunk_given) o.chunk = 4096;
         o.chunk_given = true;
+        o.tune = false;
+        if (o.prefill_gemm < 0) o.prefill_gemm = 0;
+    } else if (!calib_dec.empty()) {   // (its decode check: the --chunk given, not a calibration's)
         o.tune = false;
         if (o.prefill_gemm < 0) o.prefill_gemm = 0;
     }
@@ -1660,6 +1741,10 @@ int main(int argc, char** argv) {
     if (!calib_out.empty()) {
         for (const auto& l : m.info_lines()) std::fprintf(stderr, "  %s\n", l.c_str());
         return calibrate_prefill(m, ids_arg.empty() ? std::vector<int>{} : ids, calib_out);
+    }
+    if (!calib_dec.empty()) {
+        for (const auto& l : m.info_lines()) std::fprintf(stderr, "  %s\n", l.c_str());
+        return calibrate_decode(m, ids_arg.empty() ? std::vector<int>{} : ids, calib_dec);
     }
     if (rows_steps > 0) return rows_check(m, ids, rows_steps);
     if (!score_path.empty()) {

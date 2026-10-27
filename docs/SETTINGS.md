@@ -1128,7 +1128,7 @@ Engine options, in the config's `"args"`:
 | `--tp-chunk` | 1024 | with `--tp`: the prompt's tokens a pipeline chunk takes |
 | `--tp-ffn-rows` | 0 | with `--tp`: a chunk's FFN in slices of this many tokens (0: the whole chunk; 256 keeps more experts in VRAM) |
 | `--dspark-cost` | 0 | (> 0) drafts are verified only while their confidences' product stays above this |
-| `--cpu-threads` | one a physical core | the CPU lane's workers (the experts VRAM does not hold are computed on the CPU from pinned RAM); `-1`: no CPU lane |
+| `--cpu-threads` | one a physical core (2 cores left free where there are no SMT siblings) | the CPU lane's threads, the calling one included (the experts VRAM does not hold are computed on the CPU from pinned RAM), at most one a physical core; `-1`: no CPU lane. Up to v1.1.33 the engine started one thread more than asked |
 | `--reserve-gb` | 1.0 (0.3 with `--tp`) | VRAM each GPU keeps free beyond the plan |
 | `--resident-cap` | as many as fit | routed experts kept in VRAM, a layer at most |
 | `--chunk` | the prefill calibration's (1024 before it) | prompt tokens a forward takes at most; given here, the calibration's is not taken |
@@ -1156,8 +1156,11 @@ AMD alike. The options above apply, but for `--tp` (the GGUFs run the layer spli
 **The prefill calibration.** How a PC reads prompts fastest depends on its GPU, so it is measured there: the setup
 (step 9), `./maya.sh --calibrate` and the first start of a MiniMax config set up before it run the engine once over a
 ~4K-token text (`maya-mm3 --calibrate-prefill`, tools/calibrate_mm3_prefill.py) with a few settings - the chunk of
-tokens a step takes (larger ones only where every expert still fits in VRAM) and, with Maya's GGUF quants on AMD, the
-matrix products' library - and keep the fastest. The engine stores it beside the model (`prefill-tune.txt`, a line
+tokens a step takes and, with Maya's GGUF quants on AMD, the matrix products' library - and keep the fastest. A larger
+chunk's buffers take VRAM from the experts: where every expert still fits it is simply taken when faster; where most
+experts stay in RAM (each chunk then copies them over PCIe, so a larger one reads prompts much faster) a second start
+with the default chunk measures the decode too, and the larger chunk is kept only when it reads prompts at least 25%
+faster and decodes at most 3% slower. The engine stores it beside the model (`prefill-tune.txt`, a line
 for this PC: its GPUs, their architecture, the GPU runtime and the driver) and takes it at every start; a new GPU or
 driver gets the defaults until it is measured again. The config records the result (`installer.prefill_calibration`).
 It takes one start of the model and a few minutes; the answers are the model's either way.
@@ -1172,6 +1175,7 @@ Setup and debugging variables:
 | `MAYA_MM3_WIN_SUBMIT` | `1` | Windows + AMD: each layer's queued work started as it is enqueued (the driver otherwise waits for the host); `0`: off |
 | `MAYA_MM3_ATTN_WIDE`, `MAYA_MM3_MSA_WIDE` | `1` | the sparse attention's decode kernel with more threads, the indexer's prompt scores in register tiles - each the same results as before; `0`: the earlier kernels |
 | `MAYA_MM3_LT_STORE` | the pack's `lt-picks.txt` | where hipBLASLt's measured kernels are kept |
+| `MAYA_MM3_LANE_FREE` | `2` | without `--cpu-threads`, on a CPU without SMT siblings free (a VM's vCPUs, a CPU without SMT): the cores the CPU lane leaves to the engine's other threads and the OS; `0`: every core, as before |
 | `MAYA_MM3_PROF` | off | debugging: `1` each forward's GPU time by part (events), `2` the same with the host waiting at each part (AMD), and the DSpark proposals' parts |
 | `MAYA_MM3_MIN_CC` | - | testing only: `70` lets the setup take GPUs before RTX 30 / A100 (a V100), with a warning |
 | `MAYA_MM3_IQ_Q8K` | `1` | GGUF quants: the routed experts' inputs rounded as the CPU lane rounds them (a scale every 256 values), so an expert gives the same sums on the GPU and the CPU; `0`: a scale every 32 |

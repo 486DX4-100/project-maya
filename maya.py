@@ -3065,7 +3065,8 @@ def prefill_calibration(cfg_path: Path, why: str = "") -> bool:
     say()
     say(f"  Prefill calibration: how this PC reads prompts fastest" + (f" ({why})" if why else ""))
     say("  The engine reads a ~4K-token text with a few settings - the chunk of tokens a step takes, and the matrix")
-    say("  products' library - and keeps the fastest for this PC. One start of the model; a few minutes.")
+    say("  products' library - and keeps the fastest for this PC. One start of the model (two where most experts stay")
+    say("  in RAM: a larger chunk's decode is checked against the default's); a few minutes.")
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:

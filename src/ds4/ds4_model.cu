@@ -12531,6 +12531,7 @@ struct Model::Impl {
         int dev = 0, il = -1;      // its device; the layer of it with the most CPU-lane experts (the calibration's)
         bool stream = false;       // its split streams for some request
         bool win = false;          // the unforced split's original verify-window eligibility
+        bool cold = false;         // a pick of it can be cold: some expert of its layers in neither VRAM nor the RAM tier
         pcie::Costs cost, start;   // the split's costs (decode may time them again); the start-up timing
         std::string key;           // its line in the times file
         LaneRetime rc, rs;         // decode's own timing of its CPU lane, of its stream lane (lane_note)
@@ -13028,7 +13029,7 @@ struct Model::Impl {
         lane_put(C.key, lane_vals(C));
         bool off = true;   // (every class of its GPU off: the next start takes no slots there)
         for (const LaneCls& K : ln_cls)
-            if (K.dev == C.dev && K.stream && (K.ab[0].verdict >= 0 || K.ab[1].verdict >= 0)) off = false;
+            if (K.dev == C.dev && K.stream && pcie::verdicts_allow(K.ab[0].verdict, K.ab[1].verdict, K.cold)) off = false;
         if (off && !ln_zc_all_live) lane_put(lane_dev_key(C.dev) + " | lane", "off");
     }
 
@@ -13339,6 +13340,10 @@ struct Model::Impl {
             LaneCls& C = ln_cls[(size_t) ci];
             if (C.il < 0 || L[(size_t) C.il].n_exp - L[(size_t) C.il].n_vram < l.n_exp - l.n_vram) C.il = l.il;
             cls_of[(size_t) l.il] = ci;
+            // (#551) a pick can be cold only where an expert is in neither VRAM nor the RAM tier (the RAM tier keeps its
+            // experts: an expert the VRAM cache gives back takes the RAM place of the one it lets in)
+            for (int e = 0; e < l.n_exp && !C.cold; ++e)
+                C.cold = l.slot[(size_t) e] < 0 && (l.ram.empty() || l.ram[(size_t) e] < 0);
         }
         std::string err;
         const char* rv = std::getenv("DS4_STREAM_THREADS");
@@ -13477,8 +13482,8 @@ struct Model::Impl {
             }
             if (C.cost.ok()) {
                 if (cpu == nullptr) cpu_done.push_back({C.fmt, C.start});
-                const bool measured = pcie::streams_any(C.cost, D.slots, l.k_exp) &&
-                                      (C.ab[0].verdict >= 0 || C.ab[1].verdict >= 0);
+                const bool measured = pcie::streams_any(C.cost, D.slots, l.k_exp, C.cold) &&
+                                      pcie::verdicts_allow(C.ab[0].verdict, C.ab[1].verdict, C.cold);
                 C.win = !ln_force.empty() || measured;   // the baseline's class decision, shared with verify windows
                 C.stream = C.win || ln_zc_all_live;
                 if (std::getenv("DS4_LANE_CHECK") != nullptr) lane_check(C, ex, b);
@@ -13498,7 +13503,8 @@ struct Model::Impl {
                           "(decode's check of streaming - picks all in RAM: %s, some from the disk: %s)\n",
                           d.id, C.fmt.c_str(), C.cost.c, C.cost.oc, C.cost.p, C.cost.op, D.direct ? ", read in place" : "",
                           C.cost.g, C.cost.disk, l.k_exp, pcie::table(C.cost, D.slots, l.k_exp).c_str(),
-                          vw[C.ab[0].verdict + 1], vw[C.ab[1].verdict + 1]);
+                          vw[C.ab[0].verdict + 1],
+                          C.cold ? vw[C.ab[1].verdict + 1] : "none can be, every expert in VRAM or RAM");
             report += line;
         }
         // the layers that stream; the GPUs none of whose layers do give their slots back (and the times file says so).

@@ -38,6 +38,7 @@
 #include "mm3_gguf.cuh"
 #include "mm3_gguf_host.hpp"
 #include "mm3_kernels.cuh"
+#include "mm3_lane_plan.hpp"
 #include "mm3_os.hpp"
 #include "mm3_tp.hpp"
 #include "mm3_vision.hpp"
@@ -664,6 +665,17 @@ struct Model::Impl {
     // an expert's copy from the pool, and the CPU lane's time for one expert and for four.  MM3_LANE_SPLIT=0: every such
     // expert on the CPU lane (as before)
     double lane_cpu1 = 0, lane_cpu_add = 0, lane_copy = 0;   // ms (lane_copy 0: not measured - no split)
+    LaneRetime lane_rt;   // (decode's own timing of the CPU lane: its decoded tokens' calls - mm3_lane_plan.hpp)
+
+    // a decoded token's CPU-lane call (n experts, ms): the split's costs timed again in decode where the start-up's do
+    // not hold (#552: a busy start staged experts the CPU lane computes faster for the whole run)
+    void lane_retime(int n, double ms) {
+        const double c1 = lane_cpu1, add = lane_cpu_add;
+        if (!lane_rt.note(n, ms, lane_cpu1, lane_cpu_add)) return;
+        std::fprintf(stderr, "maya-mm3: the CPU lane timed again in decode: an expert %.2f ms (+%.2f ms each more), "
+                             "planned with %.2f (+%.2f); %.2f ms to copy - 4 such experts: %d staged\n",
+                     lane_cpu1, lane_cpu_add, c1, add, lane_copy, lane_split(4));
+    }
 
     // of m such experts (each in the pool), how many to stage: the fewest that bring max(CPU lane, copies) down by more
     // than a tenth
@@ -2358,9 +2370,11 @@ struct Model::Impl {
             if (!cpu.empty()) {
                 const double tl = now();
                 lane_run(cpu, d.xh_h, part);
-                st.t_lane += now() - tl;
+                const double dt = now() - tl;
+                st.t_lane += dt;
                 flag = 1;
                 st.cpu_experts += (long) cpu.size();
+                if (lane_copy > 0) lane_retime((int) cpu.size(), 1e3 * dt);
             }
             std::memcpy(part + g.dim, &flag, 4);
             CK(cudaMemcpyAsync(d.cpu_d, part, (size_t) (g.dim + 1) * 4, cudaMemcpyHostToDevice, d.s));
