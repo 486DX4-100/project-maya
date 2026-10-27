@@ -9356,6 +9356,15 @@ struct Model::Impl {
             cudaSetDevice(devs[di].id);
             const int n = (int) std::min<size_t>(u.size() / 2, (size_t) kRcUpd);
             if (n > 0) {
+                // tab_set reads this host-mapped input only when it eventually executes. Before every overwrite,
+                // finish all earlier work on this stream (in particular back-to-back cache_drain / rc_drain flushes).
+                // Ordinary forward ticks already synchronized this stream, so their added wait is normally a no-op.
+                const cudaError_t update_sync = cudaStreamSynchronize(devs[di].st);
+                if (update_sync != cudaSuccess) {
+                    std::fprintf(stderr, "ds4: table-input predecessor sync: %s - the expert tables are unknown\n",
+                                 cudaGetErrorString(update_sync));
+                    std::abort();
+                }
                 std::memcpy(rc_upd[di], u.data(), (size_t) n * 16);
                 tab_set(rc_upd[di], n, devs[di].st);
             }
@@ -12699,7 +12708,9 @@ struct Model::Impl {
     // the window ends) and no fill or other landing holds - the device pulls the expert there instead of a staging slot,
     // and the tick after the window maps it: the bytes the link carried stay in VRAM, no second copy (rc_tick).  0: none
     unsigned long long land_dst(Layer& l, int e, int q, unsigned seq, const int (*ids)[kPicks], int T) {
-        if (!ln_land || l.rc_n == 0 || l.nm != 1) return 0ull;
+        // A pending swap already owns this expert's destination. Landing it too would leave two owners and
+        // publish two different vram_tab[e] values in one unordered tab_set batch.
+        if (!ln_land || l.rc_n == 0 || l.nm != 1 || e == l.sw_in) return 0ull;
         int v = -1;
         for (int i = 0; i < l.rc_n; ++i) {
             if (l.rc_fill[(size_t) i] >= 0 || l.rc_land[(size_t) i] >= 0) continue;
