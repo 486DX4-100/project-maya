@@ -1,6 +1,7 @@
 # Setting up Maya
 
-The setup in detail: what its first run does, starting again and updating, and its options. Back to the
+The setup in detail: what its first run does, starting again and updating, its options, and what to do if the build
+fails. Back to the
 [README](../README.md).
 
 ## What the first run does
@@ -180,3 +181,22 @@ in VRAM warm up again over the next answers. With `STRATA_GLM_SLOT_KEEP=1` the c
 the disk on the way out and read back, so the next turn of the same chat reads only its new tokens (1,630 of 1,690
 prompt tokens reused after an unload). `0` (the default): never. A new `--setup` writes the config again: add the
 lines back after it.
+
+## If the build fails
+
+- **"nvcc ... cannot build for these GPUs":** Volta needs CUDA 12.x, Blackwell 12.8 or newer. The setup takes the
+  newest installed toolkit that fits.
+- **"unsupported GNU version":** `./maya.sh --setup --host-compiler g++-12` (install `g++-12` first).
+- **`cuda_profiler_api.h` or `nvtx3/nvToolsExt.h` is missing:** Maya's CUDA build needs the profiler API and NVTX
+  headers as well as `nvcc` and the runtime. Install those development components for your toolkit. With a split
+  CUDA 13 toolkit, NVIDIA's official header wheels can also stay in a project-local folder:
+
+  ```sh
+  python3 -m pip install --target .cuda-headers \
+    nvidia-cuda-profiler-api==13.3.27 nvidia-nvtx==13.3.29
+  CPATH="$PWD/.cuda-headers/nvidia/cu13/include${CPATH:+:$CPATH}" ./maya.sh --setup
+  ```
+
+  Select wheel versions that match your toolkit. This include layout was checked with CUDA 13.3,
+  `nvidia-cuda-profiler-api==13.3.27` and `nvidia-nvtx==13.3.29`; other CUDA major versions can use a different
+  layout. Use the same `CPATH` when rebuilding after an update. No shared toolkit files need changing.
