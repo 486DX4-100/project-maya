@@ -603,6 +603,10 @@ MM3_TESTED_CONTEXT = 262144                        # (past it: not run end to en
 # bytes BF16, 128 + 4 INT8 / FP8, 64 + 8 FP4); "K,V" mixes add K's half and V's half
 MM3_KV_BYTES = {"bf16": 122880, "int8": 63360, "fp8": 63360, "fp4": 34560}
 MM3_KV_FORMAT = "int8"                             # the format the engine uses when the config names none
+# --parallel above 1: no KV streaming, every conversation's whole cache in VRAM (~61 KB a position with INT8) - the setup
+# recommends the context at which the caches take at most this share of the GPUs' memory, the rest left to the dense
+# weights and the expert pool (the engine shortens a context that does not fit, with a NOTE)
+MM3_PARALLEL_VRAM_SHARE = 1 / 3
 MM3_MODEL_NAME = "minimax-m3.1-flash"
 # MiniMax's model card and generation_config.json (54e4e69): temperature 1.0, top-p 0.95 - no top-k, no min-p
 MM3_SAMPLING = {"temperature": 1.0, "top_p": 0.95}
@@ -1470,14 +1474,16 @@ def config_family(cfg: dict) -> str:
 
 
 # the models whose engine answers several requests at once (--parallel): GLM-5.3-Flash's, DeepSeek-V4.1-Flash's
-# (maya-ds4 --parallel: a conversation's state each, their tokens decoded together)
-PARALLEL_FAMILIES = ("glm", "deepseek")
+# (maya-ds4 --parallel: a conversation's state each, their tokens decoded together), MiniMax-M3.1-Flash's (maya-mm3
+# --parallel: a KV cache each in VRAM - no KV streaming, no DSpark)
+PARALLEL_FAMILIES = ("glm", "deepseek", "minimax")
 
 
 def check_parallel(a, family: str) -> None:
     if getattr(a, "parallel", None) is not None and family not in PARALLEL_FAMILIES:
         model = DS4 if family == "deepseek" else MM3
-        fail(f"--parallel is supported by GLM-5.3-Flash and DeepSeek-V4.1-Flash; {model} serves one request at a time",
+        fail(f"--parallel is supported by GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash; {model} serves "
+             "one request at a time",
              "remove --parallel; saved conversations do not enable simultaneous decoding")
 
 
@@ -2955,7 +2961,8 @@ def needs_speed_calibration(cfg: dict) -> bool:
     the engine then decodes without the drafter."""
     args = cfg.get("args") or []
     if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
-        return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {})
+        return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and \
+            not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
     return "--dflash" in args[:-1] and parallel_of(cfg) <= 1 and \
         "speed_calibration" not in (cfg.get("installer") or {})
 
@@ -3091,6 +3098,9 @@ def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
     """DeepSeek's and MiniMax's speed calibration (tools/calibrate_ds4.py): the sustained decode speed with the DSpark
     drafter and without it (--dspark none / off), measured on this PC's GPUs; the config keeps the faster - the drafter
     only when it wins by more than CDS.MIN_GAIN - and the result (installer.speed_calibration)."""
+    if config_family(cfg) == "minimax" and parallel_of(cfg) > 1:
+        warn("with --parallel above 1 maya-mm3 decodes without the DSpark drafter: no speed calibration")
+        return False
     if not CDS.has_drafter(cfg):
         warn(f"the speed calibration compares the model's DSpark drafter with no drafting, and this pack has no "
              f"drafter: {ME} --setup downloads it")
@@ -4655,10 +4665,15 @@ def mm3_kv_gb(ctx: int, fmt: str) -> float:
     return ctx * (half(k) + half(v or k)) / 2**30
 
 
-def mm3_recommended_context(vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB) -> int:
+def mm3_recommended_context(vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB, parallel: int = 1) -> int:
     """The context the setup recommends on this PC: the largest (up to MM3_TESTED_CONTEXT) whose KV cache fits in
     what VRAM + RAM hold beyond the model (need: MM3_MEMORY_GB, a GGUF quant's own) - so the cache does not push experts
-    out of RAM - else the smallest; MM3_DEFAULT_CONTEXT when the RAM could not be read."""
+    out of RAM - else the smallest; MM3_DEFAULT_CONTEXT when the RAM could not be read.  parallel: --parallel's
+    conversations (above 1: no KV streaming - each conversation's whole cache in VRAM, MM3_PARALLEL_VRAM_SHARE)."""
+    n = max(1, int(parallel or 1))
+    if n > 1:
+        fits = [c for c in MM3_CONTEXTS if c <= MM3_TESTED_CONTEXT and n * mm3_kv_gb(c, fmt) <= vram * MM3_PARALLEL_VRAM_SHARE]
+        return max(fits) if fits else MM3_CONTEXTS[0]
     if ram <= 0:
         return MM3_DEFAULT_CONTEXT
     spare = vram + ram - need
@@ -4666,15 +4681,26 @@ def mm3_recommended_context(vram: float, ram: float, fmt: str, need: float = MM3
     return max(fits) if fits else MM3_CONTEXTS[0]
 
 
-def mm3_context_notes(ctx: int, vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB) -> None:
+def mm3_context_notes(ctx: int, vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB,
+                      parallel: int = 1) -> None:
     """What a context costs here, and the warnings (as the dashboard's): past what was run end to end, a cache that
-    takes RAM the experts need."""
+    takes RAM the experts need.  With --parallel above 1 the caches are in VRAM, a whole context each."""
+    n = max(1, int(parallel or 1))
     kv, spare = mm3_kv_gb(ctx, fmt), vram + ram - need
-    ok(f"the context's KV cache: about {kv:.0f} GB of pinned RAM ({fmt.upper()}), its newest 32K positions in VRAM too")
+    if n > 1:
+        ok(f"{n} conversations at once (--parallel): each its own KV cache of about {kv:.1f} GB ({fmt.upper()}), "
+           f"{n * kv:.1f} GB of VRAM in all - no KV streaming and no DSpark while it is above 1")
+    else:
+        ok(f"the context's KV cache: about {kv:.0f} GB of pinned RAM ({fmt.upper()}), its newest 32K positions in VRAM too")
     if ctx > MM3_TESTED_CONTEXT:
         warn(f"past {context_label(MM3_TESTED_CONTEXT)} the engine has not been run end to end yet, and a prompt that "
              "long reads slowly - tell us how it goes")
-    if kv > max(0.0, spare):
+    if n > 1:
+        if n * kv > vram * MM3_PARALLEL_VRAM_SHARE:
+            warn(f"{vram:.0f} GB of VRAM: {n} caches of a {context_label(ctx)} context leave fewer experts in VRAM "
+                 "(answers slower), and the engine shortens the context where they do not fit - "
+                 f"{context_label(mm3_recommended_context(vram, ram, fmt, need, n))} fits this PC for {n}")
+    elif kv > max(0.0, spare):
         warn(f"{vram:.0f} GB of VRAM and {ram:.0f} GB of RAM: with a {context_label(ctx)} context's cache, fewer "
              "experts stay in RAM (answers slower) and the engine may not start - "
              f"{context_label(mm3_recommended_context(vram, ram, fmt, need))} fits this PC")
@@ -4913,9 +4939,13 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     #  has them: a kept --vision on without a tower in the pack dropped)
     # (--tp: the config before's for the same GPUs only, else worked out again below from the GPUs chosen now - #436)
     keep = ("--chunk", "--staging", "--cpu-threads", "--reserve-gb", "--resident-cap", "--kv-cache", "--kv-streaming",
-            "--kv-resident", "--dspark", "--dspark-conf", "--vision", "--vision-gpu") + \
+            "--kv-resident", "--dspark", "--dspark-conf", "--vision", "--vision-gpu", "--parallel") + \
         (() if gguf else (("--tp",) if tp_keepable(old, pc) else ()) + ("--cache-gb",))
     kept = keep_args(old.get("args") or [], args, keep)
+    if getattr(a, "parallel", None):   # given now: written, and a later setup keeps it
+        set_arg(args, "--parallel", a.parallel)
+        ok(f"answers at once: {a.parallel} (--parallel; each its own KV cache in VRAM)")
+    par = int(flag_value(args, "--parallel") or 1)
     if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "on" and not mm3_pack_has_vision(pack):
         i = args.index("--vision")
         del args[i:i + 2]
@@ -4927,7 +4957,9 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     # KV streaming (maya-mm3 --kv-streaming on), as the GLM engine's: 32768 positions of each layer's K / V in VRAM
     # (--kv-resident N sets another window), all of them in pinned RAM - a longer context leaves the VRAM to experts;
     # MM3_KV_BYTES of RAM a context token by the cache's format (BF16: 15 GB at 128K, 120 GB at 1M)
-    if "--kv-streaming" not in args[:-1]:
+    # (--parallel above 1: the engine runs each conversation's whole cache in VRAM and turns streaming off with a NOTE -
+    #  so a new config does not ask for it; one kept from the config before stays, for the day --parallel is 1 again)
+    if "--kv-streaming" not in args[:-1] and par <= 1:
         args += ["--kv-streaming", "on"]
     # tensor parallel (maya-mm3 --tp): the GPUs in groups of 4 (or 2), the first alone when the others make whole
     # groups - each layer's work spread over a group's GPUs; on 3090 + 8 x 5060 Ti decode 27.7 -> 38 tok/s (code),
@@ -5020,10 +5052,12 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     step(2, "your choices")                            # 2
     ok(f"files: {name}" + (" (Maya's quant)" if gguf else " (Mia-AiLab's EXL3 quant)"))
     fmt = mm3_kv_format(prev_args)                     # (a setup again keeps the config's --kv-cache)
-    rec = mm3_recommended_context(vram, total, fmt, need)
+    par = getattr(a, "parallel", None) or int(flag_value(prev_args, "--parallel") or 1)   # (--parallel: kept)
+    rec = mm3_recommended_context(vram, total, fmt, need, par)
     ctx = choose_context(a, prev_ctx, MM3_CONTEXTS, rec)
-    ok(f"context: {ctx} tokens" + (" (recommended for this PC's memory)" if ctx == rec else ""))
-    mm3_context_notes(ctx, vram, total, fmt, need)
+    ok(f"context: {ctx} tokens" + (" (recommended for this PC's memory)" if ctx == rec else "") +
+       (f", for each of {par} conversations at once (--parallel)" if par > 1 else ""))
+    mm3_context_notes(ctx, vram, total, fmt, need, par)
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
     d = mm3_dir(a, models, prev, quant)
@@ -5050,7 +5084,10 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     if S.UI is not None:                               # 9: how this PC reads prompts fastest, measured
         S.UI.step(9, "prefill calibration")
     prefill_calibration(cfg_path, "once, for this setup")
-    if CDS.has_drafter(read_json(cfg_path)):           # 9: the DSpark drafter, measured on this PC (or chosen)
+    par = parallel_of(read_json(cfg_path))             # (as written: the config before's --parallel may be another quant's)
+    if par > 1:                                        # (the engine drafts for one conversation only: nothing to measure)
+        ok(f"DSpark: off while {par} conversations are answered at once; --parallel 1 brings it back")
+    elif CDS.has_drafter(read_json(cfg_path)):         # 9: the DSpark drafter, measured on this PC (or chosen)
         how = drafting_choice(a, "MiniMax's DSpark drafter", "10-30")
         if how != "measure":
             keep_drafting(cfg_path, how == "on")
@@ -5160,9 +5197,10 @@ def main() -> int:
                                    "0,1,2,3")
     ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
     ap.add_argument("--parallel", type=int, choices=range(1, 9), metavar="N",
-                    help="GLM-5.3-Flash and DeepSeek-V4.1-Flash: answer up to N requests at once (1-8, default 1), "
-                         "kept in the config: they are decoded together, more tokens per second in all; each extra "
-                         "conversation keeps its own context in VRAM, which the expert cache gives up")
+                    help="GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash: answer up to N requests at once "
+                         "(1-8, default 1), kept in the config: they are decoded together, more tokens per second in "
+                         "all; each extra conversation keeps its own context in VRAM, which the expert cache gives "
+                         "up (MiniMax: no KV streaming and no DSpark while N is above 1)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
                          "programs (default 700), kept in the config")

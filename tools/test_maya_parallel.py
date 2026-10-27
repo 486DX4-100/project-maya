@@ -1,5 +1,5 @@
-"""--parallel: GLM-5.3-Flash and DeepSeek-V4.1-Flash take it (kept in the config), MiniMax is refused before its
-config changes; no GPU needed."""
+"""--parallel: GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash take it (kept in the config); a family that
+does not is refused before its config changes; no GPU needed."""
 import json
 import os
 from pathlib import Path
@@ -43,19 +43,31 @@ class ParallelOptionTests(unittest.TestCase):
         self.path.write_text(json.dumps(cfg), encoding="utf-8")
         return cfg
 
-    def test_start_rejects_parallel_before_mutating_minimax_config(self):
-        for family in ("minimax",):
-            for parallel in (1, 4):
-                with self.subTest(family=family, parallel=parallel):
-                    self.config(family)
-                    self.args.parallel = parallel
-                    before = self.path.read_bytes()
-                    with patch.object(maya, "rename_programs") as rename, \
-                            self.assertRaises(SystemExit):
-                        maya.server_command(self.path, self.args)
-                    rename.assert_not_called()
-                    self.assertEqual(self.path.read_bytes(), before)
-                    self.mocks["refresh_engine"].assert_not_called()
+    def test_start_rejects_parallel_before_mutating_the_config_of_a_family_without_it(self):
+        # (every family of today takes it: the gate stays for the next one)
+        for family in ("glm", "deepseek", "minimax"):
+            self.assertIn(family, maya.PARALLEL_FAMILIES)
+        for parallel in (1, 4):
+            with self.subTest(parallel=parallel):
+                self.config("minimax")
+                self.args.parallel = parallel
+                before = self.path.read_bytes()
+                with patch.object(maya, "PARALLEL_FAMILIES", ("glm", "deepseek")), \
+                        patch.object(maya, "rename_programs") as rename, self.assertRaises(SystemExit):
+                    maya.server_command(self.path, self.args)
+                rename.assert_not_called()
+                self.assertEqual(self.path.read_bytes(), before)
+                self.mocks["refresh_engine"].assert_not_called()
+
+    def test_minimax_start_saves_parallel_once(self):
+        self.config("minimax")
+        for parallel in (4, 2, 1):
+            self.args.parallel = parallel
+            with patch.object(maya, "rename_programs"):
+                maya.server_command(self.path, self.args)
+            args = maya.read_json(self.path)["args"]
+            self.assertEqual(args.count("--parallel"), 1)
+            self.assertEqual(args[args.index("--parallel") + 1], str(parallel))
 
     def test_deepseek_start_saves_parallel_once(self):
         self.config("deepseek")
@@ -100,33 +112,51 @@ class ParallelOptionTests(unittest.TestCase):
             maya.set_up(self.args, {"installer": {"family": "deepseek"}})
         setup.assert_called_once()
 
-    def test_setup_rejects_parallel_before_minimax_setup(self):
-        for family, setup_name in (("minimax", "set_up_mm3"),):
-            with self.subTest(family=family), \
-                    patch.object(maya, "choose_family", return_value=family), \
-                    patch.object(maya, setup_name, return_value=None) as setup, \
-                    self.assertRaises(SystemExit):
-                maya.set_up(self.args, {"installer": {"family": family}})
-            setup.assert_not_called()
+    def test_setup_takes_parallel_for_minimax(self):
+        with patch.object(maya, "choose_family", return_value="minimax"), \
+                patch.object(maya, "set_up_mm3", return_value=None) as setup:
+            maya.set_up(self.args, {"installer": {"family": "minimax"}})
+        setup.assert_called_once()
 
-    def test_cli_rejects_parallel_before_minimax_calibration(self):
-        for family in ("minimax",):
-            for action in ("--calibrate", "--speed-calibration"):
-                with self.subTest(family=family, action=action):
-                    self.config(family)
-                    before = self.path.read_bytes()
-                    with patch.dict(os.environ, MAYA_SH="1"), \
-                            patch.object(sys, "argv", ["maya.py", "--config", str(self.path),
-                                                       "--parallel", "4", action, "--no-start"]), \
-                            patch.object(maya, "stop_signals"), \
-                            patch.object(maya, "calibrate_config", return_value=True) as tune, \
-                            patch.object(maya, "speed_calibration", return_value=True) as speed, \
-                            self.assertRaises(SystemExit):
-                        maya.main()
-                    tune.assert_not_called()
-                    speed.assert_not_called()
-                    self.mocks["refresh_engine"].assert_not_called()
-                    self.assertEqual(self.path.read_bytes(), before)
+    def test_setup_rejects_parallel_before_a_setup_of_a_family_without_it(self):
+        with patch.object(maya, "PARALLEL_FAMILIES", ("glm", "deepseek")), \
+                patch.object(maya, "choose_family", return_value="minimax"), \
+                patch.object(maya, "set_up_mm3", return_value=None) as setup, self.assertRaises(SystemExit):
+            maya.set_up(self.args, {"installer": {"family": "minimax"}})
+        setup.assert_not_called()
+
+    def test_cli_calibrates_a_minimax_config_with_parallel(self):
+        # (--parallel on a start is kept in the config; the speed calibration then declines for MiniMax - no DSpark
+        #  with --parallel above 1 - which its own test below pins)
+        for action, mocked in (("--calibrate", "calibrate_config"), ("--speed-calibration", "speed_calibration")):
+            with self.subTest(action=action):
+                self.config("minimax")
+                with patch.dict(os.environ, MAYA_SH="1"), \
+                        patch.object(sys, "argv", ["maya.py", "--config", str(self.path),
+                                                   "--parallel", "4", action, "--no-start"]), \
+                        patch.object(maya, "stop_signals"), \
+                        patch.object(maya, mocked, return_value=True) as run:
+                    self.assertEqual(maya.main(), 0)
+                run.assert_called_once()
+
+
+class MinimaxCalibrationTests(unittest.TestCase):
+    """maya-mm3 --parallel above 1 decodes without DSpark: the speed calibration has nothing to measure."""
+
+    def test_declines_with_parallel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.json"
+            cfg = {"exe": "maya-mm3", "installer": {"family": "minimax"}, "args": ["--pack", "pack", "--dspark", "off",
+                                                                                 "--parallel", "4"]}
+            path.write_text(json.dumps(cfg), encoding="utf-8")
+            with patch.object(maya.CDS, "has_drafter", return_value=True),                     patch.object(maya.CDS, "run") as run, patch.object(maya, "warn") as warn:
+                self.assertFalse(maya.needs_speed_calibration(cfg))
+                self.assertFalse(maya.speed_calibration(path, "asked for"))
+            run.assert_not_called()
+            self.assertIn("--parallel", warn.call_args[0][0])
+            cfg["args"][cfg["args"].index("--parallel") + 1] = "1"
+            with patch.object(maya.CDS, "has_drafter", return_value=True):
+                self.assertTrue(maya.needs_speed_calibration(cfg))           # (one conversation: measured as before)
 
 
 if __name__ == "__main__":

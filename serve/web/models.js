@@ -300,13 +300,19 @@ function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
   return [
     {label: "Model", rows: [
       html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")}
-        hint=${d.kv_streaming ? `Every position's cache sits in RAM: ${ram}, its newest ${ctxfmt(win)} in VRAM too.${d.context > 262144 ? " Past 256K it has not been run end to end." : ""}`
+        hint=${d.parallel > 1 ? `${d.parallel} answers at once: each keeps a whole cache of this size in VRAM (${fmt((d.parallel * d.context * (kv ? kv.bytes : 63360)) / 2 ** 30, 1)} GB in all at ${ctxfmt(d.context)}), which the experts give up. The engine shortens a context that does not fit.`
+          : d.kv_streaming ? `Every position's cache sits in RAM: ${ram}, its newest ${ctxfmt(win)} in VRAM too.${d.context > 262144 ? " Past 256K it has not been run end to end." : ""}`
           : "The whole cache in VRAM: more context takes GPU memory from the experts."}>
         <${Seg} label="Context size" value=${Number(d.context)} options=${ctxs.map((n) => ({id: n, label: ctxfmt(n)}))}
           onChange=${(v) => setDraft({context: v})}/><//>`,
+      html`<${Row} label="Answers at once" flag="--parallel" changed=${ch("parallel")}
+        hint="Up to 8. Each extra conversation keeps its own context's cache in VRAM, which the experts give up. With more than one the answers are decoded together: no KV streaming and no DSpark."
+        warn=${d.parallel > 1 && d.context * d.parallel > 1048576 ? `${d.parallel} conversations of ${ctxfmt(d.context)} each: a smaller context leaves the experts more VRAM.` : null}>
+        <${Stepper} label="Answers at once" value=${d.parallel} min=${1} max=${8} on=${(v) => setDraft({parallel: v})}/><//>`,
       html`<${Row} label="Drafting" flag="--dspark" changed=${ch("draft")}
         hint=${dspark ? "DSpark drafts a few tokens at a time for the model to check: the same answer. The speed calibration picks the faster on this PC."
-          : "This pack has no DSpark drafter."}>
+          : "This pack has no DSpark drafter."}
+        warn=${d.draft === "dspark" && d.parallel > 1 ? `DSpark drafts for one answer at a time: with ${d.parallel} at once the engine decodes without it.` : null}>
         <${Seg} label="Drafting" value=${d.draft} options=${[...(dspark ? [{id: "dspark", label: "DSpark"}] : []), {id: "none", label: "Off"}]}
           onChange=${(v) => setDraft({draft: v})}/><//>`,
       images]},
@@ -322,7 +328,8 @@ function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
         <${Seg} label="KV cache" value=${d.kv_cache} options=${(kv ? MM3_KV : [...MM3_KV, {id: d.kv_cache, label: d.kv_cache}]).map((f) => ({id: f.id, label: f.label}))}
           onChange=${(v) => setDraft({kv_cache: v})}/><//>`,
       html`<${Row} label="KV streaming" flag="--kv-streaming" changed=${ch("kv_streaming", "kv_resident")}
-        hint="The attention cache lives in pinned RAM, with each layer's newest positions in VRAM. Off: all of it in VRAM."
+        hint=${d.parallel > 1 ? "Off while several answers are written at once (each conversation's whole cache is in VRAM); the choice below returns with one."
+          : "The attention cache lives in pinned RAM, with each layer's newest positions in VRAM. Off: all of it in VRAM."}
         below=${d.kv_streaming ? html`<div class="mdl-sub"><span>Positions each layer keeps in VRAM (--kv-resident)</span>
           <${Num} label="Positions each layer keeps in VRAM" value=${d.kv_resident} ph="32768" unit="tokens" on=${(v) => setDraft({kv_resident: v})}/></div>` : null}
         warn=${whole(d.kv_resident) ? null : "A whole number, or empty for 32,768."}>

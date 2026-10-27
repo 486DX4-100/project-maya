@@ -200,8 +200,8 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.family(cfg), "minimax")
         self.assertEqual(M.family({"exe": "/b/maya-mm3", "args": ["--pack", "/p"]}), "minimax")   # (no installer)
         self.assertEqual(M.settings_of(cfg), {"context": 65536, "gpus": list(range(9)), "env": {}, "images": True,
-                                              "draft": "none", "tp": 4, "kv_cache": "int8", "kv_streaming": True,
-                                              "kv_resident": None, "cpu_threads": None})
+                                              "parallel": 1, "draft": "none", "tp": 4, "kv_cache": "int8",
+                                              "kv_streaming": True, "kv_resident": None, "cpu_threads": None})
         self.assertEqual(M.choices(cfg), {"draft": ["dspark", "none"], "images": True})
         new = M.apply(cfg, {"context": 262144, "draft": "dspark", "images": False, "tp": 2, "kv_cache": "fp8",
                             "kv_resident": 65536, "cpu_threads": 24})
@@ -211,8 +211,9 @@ class Settings(unittest.TestCase):
                      ("--cpu-threads", "24")):
             self.assertEqual(M.flag(a, f), v, f)
         # maya-mm3 stops at a flag it does not know: none of DeepSeek's or GLM's are written
-        for f in ("--mmap-experts", "--prefill-chunk", "--reserve-mib", "--vram-reserve-mib", "--parallel", "--prefill"):
+        for f in ("--mmap-experts", "--prefill-chunk", "--reserve-mib", "--vram-reserve-mib", "--prefill"):
             self.assertNotIn(f, a)
+        self.assertNotIn("--parallel", a)                                       # (1 and not in the config: as it was)
         with self.assertRaisesRegex(ValueError, "not a setting of this model: mmap"):
             M.apply(cfg, {"mmap": "on"})
         # tp 0: the layers split (no --tp); 3 is not a group the engine takes
@@ -230,6 +231,22 @@ class Settings(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no DSpark drafter"):
             M.apply(bare, {"draft": "dspark"})
         self.assertEqual(M.quant_label(cfg, Path("maya-mm3.json")), "EXL3 3.5 bpw")
+
+    def test_minimax_answers_at_once(self):
+        """maya-mm3 --parallel: read (1 where the config names none), written where it changes, 1-8; the KV streaming and
+        DSpark choices stay as they are for the day it is 1 again (the engine leaves both out while it is above 1)."""
+        cfg = M.read(mm3_cfg(self.d))
+        self.assertEqual(M.settings_of(cfg)["parallel"], 1)
+        self.assertNotIn("--parallel", M.apply(cfg, {"cpu_threads": 8})["args"])   # (an older config: as it was)
+        new = M.apply(cfg, {"parallel": 4, "draft": "dspark"})
+        self.assertEqual(M.flag(new["args"], "--parallel"), "4")
+        self.assertEqual((M.flag(new["args"], "--kv-streaming"), M.flag(new["args"], "--dspark")), ("on", "on"))
+        s = M.settings_of(new)
+        self.assertEqual((s["parallel"], s["kv_streaming"], s["draft"]), (4, True, "dspark"))
+        self.assertEqual(M.flag(M.apply(new, {"parallel": 1})["args"], "--parallel"), "1")
+        for bad in (0, 9):
+            with self.assertRaisesRegex(ValueError, "Answers at once"):
+                M.apply(cfg, {"parallel": bad})
 
     def test_listing(self):
         g, ds = glm_cfg(self.d), ds4_cfg(self.d)

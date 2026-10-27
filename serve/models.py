@@ -5,8 +5,8 @@ A config's settings, as the page shows them (None: the engine's own default, or 
   both:      context, images, gpus, reserve_mib, env
   GLM:       parallel, draft ("mtp" | "dflash2"), expert_cache, prefill, kv_streaming, kv_resident
   DeepSeek:  parallel, draft ("dspark" | "none"), tp, mmap ("auto" | "on" | "off"), prefill_chunk, cpu_threads
-  MiniMax:   draft ("dspark" | "none"), tp (0: the layers split, no groups), kv_cache, kv_streaming, kv_resident,
-             cpu_threads (maya-mm3 stops at a flag it does not know: only its own are written)
+  MiniMax:   parallel, draft ("dspark" | "none"), tp (0: the layers split, no groups), kv_cache, kv_streaming,
+             kv_resident, cpu_threads (maya-mm3 stops at a flag it does not know: only its own are written)
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ GLM_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draf
             "kv_streaming", "kv_resident")
 DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "tp", "mmap", "prefill_chunk",
             "cpu_threads")
-MM3_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
+MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
             "cpu_threads")
 
 
@@ -167,6 +167,7 @@ def settings_of(cfg: dict) -> dict:
     if family(cfg) == "minimax":                       # (maya-mm3's own defaults where the config names none)
         vision, kvs = flag(args, "--vision"), flag(args, "--kv-streaming")
         out.update(images=vision == "on" or (vision is None and mm3_pack_has(cfg, "vision.hidden_size")),
+                   parallel=_int(flag(args, "--parallel"), 1),
                    draft="dspark" if flag(args, "--dspark", "off") not in ("off", "none") else "none",
                    tp=_int(flag(args, "--tp"), 0), kv_cache=flag(args, "--kv-cache", "int8"),
                    kv_streaming=kvs == "on" or (kvs is None and _int(flag(args, "--kv-resident"), 0) > 0),
@@ -262,6 +263,10 @@ def apply(cfg: dict, settings: dict) -> dict:
 
     reserve = _num(s, "reserve_mib", 0, 65536, "VRAM kept free") if fam != "minimax" else None
     if fam == "minimax":
+        # (maya-mm3 --parallel: n conversations at once - each its own KV cache in VRAM, so no KV streaming and no DSpark
+        #  while it is above 1; those two settings stay as chosen for the day it is 1 again; written where it changes)
+        par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
+        args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this pack has no DSpark drafter" if s.get("draft") == "dspark"
                              else "Drafting: DSpark or none")

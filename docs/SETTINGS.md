@@ -329,9 +329,15 @@ with `"loop_guard": false` (or `true`) beside its sampling fields (Chat Completi
 
 ## Several requests at once
 
-This is a **GLM-5.3-Flash** and **DeepSeek-V4.1-Flash** setting ([DeepSeek's below](#deepseek-v41-flash-several-requests-at-once)).
-MiniMax currently serves one request at a time; the launcher rejects `--parallel` for it before changing a config or
-starting setup/calibration.
+This is a setting of **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash** ([DeepSeek's below](#deepseek-v41-flash-several-requests-at-once))
+and **MiniMax-M3.1-Flash**. A saved conversation slot reuses earlier state; it does not decode requests at the same time.
+
+**MiniMax-M3.1-Flash:** `maya-mm3 --parallel N` (the setup and `START-MAYA.bat --parallel 4` write it into the config)
+gives every conversation its own KV cache, always in VRAM: KV streaming and the DSpark drafter are off while N is above
+1 (the engine says so with a NOTE; the config keeps both settings for the day N is 1 again), and `--tp` runs the layer
+split. The cache takes about 61 KB a position with INT8, so N conversations of a context need N x 61 KB x context of
+VRAM: the setup recommends the context at which they take a third of the GPUs' memory (4 conversations: 128K on three
+32 GB cards), and the engine shortens a context that does not fit beside the model, with a NOTE.
 
 `--parallel N` (1-8, default 1). `./maya.sh --parallel 4` (Windows:
 `START-MAYA.bat --parallel 4`) keeps it in the config's `"args"` (the dashboard's Models page: Answers at once). Maya
@@ -1130,6 +1136,7 @@ Engine options, in the config's `"args"`:
 | `--no-prefill-tune` | - | the engine's defaults instead of this PC's prefill calibration (`--prefill-tune FILE`: another file than the pack's `prefill-tune.txt`) |
 | `--staging` | 48 | expert staging slots a GPU |
 | `--profile` | `data/expert-profile-mm3.bin` | the routing profile: the most-routed experts are placed in VRAM |
+| `--parallel` | 1 | up to N conversations at once (1-8): a KV cache each (the context the engine fits is for every one of them), a token of each running conversation through the model together - the dense matrices read once for all of them, each conversation's attention over its own cache, so each answer is the one it gets alone (greedy, the CPU lane off). On a layer split the GPUs work as a pipeline, each on a different group of the conversations. Above 1: no DSpark drafting, no KV streaming, and `--tp` runs the layer split |
 
 **Maya's GGUF quants.** `./maya.sh --setup --model minimax-maya-xs` (or `minimax-maya-s`; before:
 `--model MiniMax-M3.1-Flash --mm3-quant gguf-xs`, which still works) sets up Project Maya's own quants instead of the
@@ -1160,6 +1167,7 @@ Setup and debugging variables:
 | Variable | Default | What it does |
 |---|---|---|
 | `MAYA_MM3_HOST_FREE` | `1` | decode: a layer whose routed experts are all in VRAM plans them on the GPU, so a token or a verify window runs without waiting for the host at each layer; `0`: the host plans every layer (the same tokens) |
+| `MAYA_MM3_PIPE` | `1` | `--parallel` on a layer split: the GPUs as a pipeline (each holds a different group of the running conversations, the same tokens); `0`: all of them through the GPUs together, one GPU at a time |
 | `MAYA_MM3_GRAPH` | `1` | decode on one GPU with every MoE layer host-free: a token's and a verify window's forward replayed as one graph (the same tokens); `0`: launched kernel by kernel |
 | `MAYA_MM3_WIN_SUBMIT` | `1` | Windows + AMD: each layer's queued work started as it is enqueued (the driver otherwise waits for the host); `0`: off |
 | `MAYA_MM3_ATTN_WIDE`, `MAYA_MM3_MSA_WIDE` | `1` | the sparse attention's decode kernel with more threads, the indexer's prompt scores in register tiles - each the same results as before; `0`: the earlier kernels |
