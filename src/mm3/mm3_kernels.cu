@@ -1115,10 +1115,24 @@ __device__ uint32_t kth_key(const F& val, int V, int k, SelScratch& S) {
                 bin = (key >> shift) & 255u;
             }
             const unsigned act = __ballot_sync(0xffffffffu, in);
+#if defined(STRATA_USE_HIP)
+            // (HIP has no 32-lane-mask __match_any_sync: the same peer masks from one ballot per distinct bin, the
+            //  whole warp in the loop - act and rest are the warp's own, so every lane takes the same turns)
+            unsigned peers = 0;
+            for (unsigned rest = act; rest != 0u;) {
+                const uint32_t sv = __shfl_sync(0xffffffffu, bin, __ffs(rest) - 1);
+                const bool same = in && bin == sv;
+                const unsigned m = __ballot_sync(0xffffffffu, same);
+                if (same) peers = m;
+                rest &= ~m;
+            }
+            if (in && __ffs(peers) - 1 == lane) S.wh[w][bin] += __popc(peers);
+#else
             if (in) {
                 const unsigned peers = __match_any_sync(act, bin);
                 if (__ffs(peers) - 1 == lane) S.wh[w][bin] += __popc(peers);
             }
+#endif
             __syncwarp();
         }
         __syncthreads();

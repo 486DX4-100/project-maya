@@ -499,8 +499,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
 
   # MiniMax-M3.1-Flash (EXL3, tools/mm3/pack.py): its own engine (src/mm3), with its own copy of the EXL3 device kernels
-  # (swigluoai) - none of the other engines' code but maya-ds4's OS helpers (src/ds4/ds4_os.hpp).  CUDA, on Linux and
-  # Windows.  For sm_70 and newer only: its EXL3 kernels take more than the 4 KB of parameters before Volta allows
+  # (swigluoai) - none of the other engines' code but maya-ds4's OS helpers (src/ds4/ds4_os.hpp).  CUDA and AMD (HIP),
+  # on Linux and Windows.  CUDA: sm_70 and newer only - its EXL3 kernels take more than the 4 KB of parameters before Volta allows
   # (a "native" build on a PC with an older display card beside its GPUs - a Quadro P400 - leaves that card out).
   set(_mm3_archs)
   set(_mm3_filter OFF)
@@ -523,29 +523,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     #  on the device and its CPU rows on the CPU lane - mm3_gguf.cu, mm3_cpu_gg.cpp)
     set(_mm3_gguf_sources src/mm3/mm3_gguf.cu src/ds4/ds4_iq.cu)
     set(_mm3_gguf_cpu_sources src/mm3/mm3_cpu_gg.cpp src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
-    if(STRATA_ENABLE_HIP)
-      # AMD (HIP): a GGUF pack's engine.  The EXL3 kernels (never ported to HIP), tensor parallel, the DSpark draft and
-      # the vision tower (both from the EXL3 repo's files) stay NVIDIA's: mm3_hip_stubs.cu stands in for them
-      set(_mm3_nv_sources src/mm3/mm3_hip_stubs.cu)
-    else()
-      set(_mm3_nv_sources src/mm3/mm3_exl3.cu src/mm3/mm3_dspark.cu src/mm3/mm3_vision.cu src/mm3/mm3_tp.cu)
-    endif()
+    # (AMD (HIP) builds the same engine: the EXL3 kernels' HIP paths as the shared exl3.cu's, tensor parallel over
+    #  peer copies, the DSpark draft and the vision tower through hipBLAS - include/strata/hip_compat)
+    set(_mm3_nv_sources src/mm3/mm3_exl3.cu src/mm3/mm3_dspark.cu src/mm3/mm3_vision.cu src/mm3/mm3_tp.cu)
     add_executable(maya-mm3 src/mm3/mm3_main.cpp src/mm3/mm3_model.cu src/mm3/mm3_kernels.cu src/mm3/mm3_cpu.cpp
                             src/mm3/mm3_host.cpp ${_mm3_nv_sources} ${_mm3_gguf_sources} ${_mm3_gguf_cpu_sources})
     target_include_directories(maya-mm3 PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
     # (the CPU lane: the shared CPU EXL3 kernels, used as they are; ggml-cpu's dots for a GGUF's experts)
     target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
-    if(STRATA_BUILD_TESTS AND STRATA_ENABLE_HIP)
-      # (AMD: the GGUF kernels' test - the stubs' entry points hand its matrices on as maya-mm3's do)
-      add_executable(mm3_gguf_test tests/mm3_gguf_test.cu src/mm3/mm3_cpu.cpp ${_mm3_nv_sources}
-                                   ${_mm3_gguf_sources} ${_mm3_gguf_cpu_sources})
-      target_include_directories(mm3_gguf_test PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
-      target_link_libraries(mm3_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target}
-                            ${_strata_gpu_blas_target})
-      add_test(NAME mm3_gguf_test COMMAND mm3_gguf_test)
-      set_tests_properties(mm3_gguf_test PROPERTIES TIMEOUT 600)
-    endif()
-    if(STRATA_BUILD_TESTS AND NOT STRATA_ENABLE_HIP)
+    if(STRATA_BUILD_TESTS)
       # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with
       # swigluoai, the Volta / Turing tensor-core tiles and the FP16 GEMM path before sm_80
       add_executable(mm3_exl3_test tests/mm3_exl3_test.cu src/mm3/mm3_exl3.cu ${_mm3_gguf_sources})
@@ -571,7 +557,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(mm3_kv_test PRIVATE ${_strata_gpu_runtime_target})
       add_test(NAME mm3_kv_test COMMAND mm3_kv_test)
       set_tests_properties(mm3_kv_test PROPERTIES TIMEOUT 600)
-      if(NOT WIN32)
+      if(NOT WIN32 OR STRATA_ENABLE_HIP)
         # maya-mm3's kernels against F64 host references: the candidates' top-k, the INT8 / rotated K / V attention and
         # its split, the sampled draft step, the pipeline's waits (no model)
         add_executable(mm3_kernels_test tests/mm3_kernels_test.cu src/mm3/mm3_kernels.cu)
@@ -579,6 +565,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_link_libraries(mm3_kernels_test PRIVATE ${_strata_gpu_runtime_target})
         add_test(NAME mm3_kernels_test COMMAND mm3_kernels_test)
         set_tests_properties(mm3_kernels_test PROPERTIES TIMEOUT 600)
+      endif()
+      if(NOT WIN32)
         # the CPU lane's one-dispatch schedule against its four phases on random EXL3 sub-experts: the same bits
         # (its own stubs of expert_layout.cpp / pool.cpp: the shared CPU EXL3 kernels' source alone, not the library)
         add_executable(mm3_lane_test tests/mm3_lane_test.cpp src/mm3/mm3_cpu.cpp src/kernels/cpu/exl3_cpu.cpp)

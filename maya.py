@@ -574,7 +574,8 @@ MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/strata_tokenize
 MM3_DIR = "MiniMax-M3.1-Flash-EXL3-3.5bpw"
 # Where its EXL3 quant is offered: everywhere DeepSeek's EXL3 runs (NVIDIA from V100, cc 7.0 = DS4_MIN_CC; Linux and
 # Windows) once maya-mm3 builds and runs there - MM3_ALL_PLATFORMS, the one switch.  Until then: Linux, RTX 30 / A100 or
-# newer (validated on sm_86 and sm_120); MAYA_MM3_MIN_CC=70 takes a V100 for testing.  AMD: never (EXL3 has no HIP port).
+# newer (validated on sm_86 and sm_120); MAYA_MM3_MIN_CC=70 takes a V100 for testing.  AMD (HIP): experimental, as GLM's
+# EXL3 quants there - maya-mm3's EXL3 kernels take the shared exl3.cu's HIP paths (their tests pass on a Radeon 8065S).
 MM3_ALL_PLATFORMS = True
 MM3_MIN_CC = 70                                    # (with MM3_ALL_PLATFORMS: DeepSeek's EXL3 reach)
 MM3_MIN_CC_NOW = 80                                # (until then)
@@ -600,7 +601,7 @@ MM3_MEMORY_GB = 250                                # VRAM + RAM: 179 GiB of weig
 MM3_PROFILE = ROOT / "data" / "expert-profile-mm3.bin"
 # ... or Project Maya's own GGUF quants of it (tools/mm3/download_gguf.json, packed by tools/mm3/pack_gguf.py): the routed
 # experts in ~1.6 bits (Maya-XS, ~93 GB) or ~2.1 bits (Maya-S, ~122 GB) on maya-ds4's low-bit kernels - NVIDIA from V100
-# on and AMD (HIP), Linux and Windows; the set has no vision tower or DSpark draft (NVIDIA: the companions' below).
+# on and AMD (HIP), Linux and Windows; pictures and DSpark drafting from the companion files (MM3_COMPANIONS, below).
 # Listed (and offered) once published: until then --model minimax-maya-xs / minimax-maya-s (--mm3-quant gguf-xs /
 # gguf-s before) with --model-dir takes files already there.  Named as every Maya quant (tools/maya_quants.py): the
 # model first, in the repo peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF (Maya-XS/, Maya-S/), each in <models folder>/<its
@@ -613,7 +614,8 @@ MM3_GGUF_PACK_TOOLS = ("tools/mm3/pack_gguf.py", "tools/ds4/pack_gguf.py", "tool
 # the GGUFs' pictures and drafting: the EXL3 repo's vision tower (model-vision-00001-of-00001.safetensors, 1.7 GB, with
 # config.json / preprocessor_config.json) and DSpark draft (dspark/, 2.3 GB) - download.json's own pinned files, the same
 # for any quant - in <models folder>/MiniMax-M3.1-Flash-companions (the repo's layout; a whole EXL3 download beside the
-# GGUF serves as well), indexed by pack_gguf.py.  NVIDIA: maya-mm3's vision tower and draft have no HIP port.
+# GGUF serves as well), indexed by pack_gguf.py.  NVIDIA and AMD: the tower's and the draft's matrix products run on
+# cuBLAS / hipBLAS.
 MM3_COMPANIONS = "MiniMax-M3.1-Flash-companions"
 MM3_VISION_FILES = ("config.json", "preprocessor_config.json", "model-vision-00001-of-00001.safetensors")
 MM3_GGUF_MIN_CC = 70                               # (maya-ds4's GGUF kernels' reach: V100 on)
@@ -920,7 +922,7 @@ def install_rocm(a, chosen) -> None:
              "messages")
 
 
-def check_hip_pc(a, installed=False) -> dict:
+def check_hip_pc(a, installed=False, text_only=True) -> dict:
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
         fail("Maya's experimental HIP backend runs on native Linux or Windows")
     if WIN and S.find_vcvars(cuda=False) is None:      # (before ROCm's download: ROCm's clang needs its headers)
@@ -1008,7 +1010,8 @@ def check_hip_pc(a, installed=False) -> dict:
         fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
     total, avail = mem_gb()
     split = f"{len(chosen)} GPUs (layer split)" if len(chosen) > 1 else "one GPU"
-    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, {split}, text only")
+    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, {split}" +
+       (", text only" if text_only else ""))
     ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'})")
     ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
     if any(hip_unified_memory(g) for g in chosen) and WIN:
@@ -1169,9 +1172,10 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     step(1, "checking this PC")
     ds4 = family == "deepseek"
     mm3 = family == "minimax"
-    if mm3 and a.backend == "hip" and not gguf:   # (as DeepSeek's EXL3 quant: EXL3 has no AMD port)
-        fail(f"{MM3}'s EXL3 quant runs on NVIDIA GPUs only (EXL3's kernels have no HIP port)",
-             f"set up Maya's GGUF quant of it instead: {ME} --setup --backend hip --model minimax-maya-xs")
+    if mm3 and a.backend == "hip" and not gguf:   # (as GLM's EXL3 quants on AMD: experimental)
+        warn(f"{MM3}'s EXL3 quant on AMD is experimental: its kernels pass their tests on AMD GPUs, but the whole "
+             f"model has not been run on one yet - Maya's GGUF quants (--model minimax-maya-xs / minimax-maya-s) are the tested "
+             "way there")
     if mm3 and WIN and not MM3_ALL_PLATFORMS:
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
@@ -1179,7 +1183,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         if ds4 and not gguf:
             fail(f"{DS4}'s EXL3 quant runs on NVIDIA GPUs only (its prompt kernels have no HIP port)",
                  f"set up its GGUF instead: {ME} --setup --model {DS4} --ds4-quant gguf-q8")
-        return check_hip_pc(a)
+        return check_hip_pc(a, text_only=not mm3)
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows", "the engine needs an NVIDIA GPU and CUDA")
     min_cc = ((DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else (MM3_GGUF_MIN_CC if gguf else mm3_min_cc()) if mm3
@@ -4314,19 +4318,16 @@ def mm3_memory_gb(quant: str) -> float:
 
 def choose_mm3_quant(a, prev: dict) -> str:
     """--mm3-quant, else the one set up before, else asked among those this PC runs: Maya's GGUF quants once published
-    (AMD: those alone), the EXL3 quant on NVIDIA - by this PC's memory the one recommended."""
+    and the EXL3 quant (on AMD: experimental) - by this PC's memory the one recommended."""
     if getattr(a, "mm3_quant", None):
         return a.mm3_quant
     hip = getattr(a, "backend", None) == "hip"
     ggufs = [k for k in ("gguf-xs", "gguf-s") if mm3_gguf_published(k)]
-    keys = ([] if hip else ["exl3"]) + ggufs
-    if not keys:
-        fail(f"{MM3} on AMD runs Maya's GGUF quants, which are not published yet",
-             f"with their files in a folder: {ME} --setup --backend hip --model minimax-maya-xs --model-dir <folder>")
+    keys = ["exl3"] + ggufs
     before = (prev.get("installer") or {}).get("mm3_quant")
     total, _ = mem_gb()
     try:
-        vram = 0.0 if hip else sum(g["vram_gb"] for g in S.gpus())
+        vram = sum(g["vram_gb"] for g in (S.amd_gpus() if hip else S.gpus()))
     except Exception:  # noqa: BLE001 - no NVIDIA tools
         vram = 0.0
     have = vram + total
@@ -4335,15 +4336,15 @@ def choose_mm3_quant(a, prev: dict) -> str:
     if len(keys) == 1:
         return keys[0]
     gb = {k: mm3_models()[0]["download_gb"] if k == "exl3" else mm3_gguf_entry(k)["download_gb"] for k in keys}
-    about = {"exl3": f"Mia-AiLab's quant: pictures and DSpark drafting; ~{MM3_MEMORY_GB} GB of VRAM + RAM; NVIDIA",
+    about = {"exl3": f"Mia-AiLab's quant: pictures and DSpark drafting; ~{MM3_MEMORY_GB} GB of VRAM + RAM" + ("; experimental on AMD" if hip else ""),
              "gguf-xs": "Maya's quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory",
              "gguf-s": "Maya's quant: experts in ~2.1 bits"}
-    pics = "; pictures and DSpark drafting on NVIDIA (their files, ~4 GB, beside it)"
+    pics = "; pictures and DSpark drafting (their files, ~4 GB, beside it)"
     label = {k: (Q.shown("minimax", k, gb[k]), about[k] + ("" if k == "exl3" else pics)) for k in keys}
     order = sorted(keys, key=lambda k: k != rec)
     default = before if before in order else rec
     pick = choose(f"Which files of {MM3}?", ["Maya's GGUF quants run on NVIDIA from V100 on and on AMD; the EXL3 quant "
-                                             "on NVIDIA:"],
+                                             "on NVIDIA (on AMD: experimental):"],
                   [(label[k][0], "recommended" if k == rec else None, label[k][1]) for k in order],
                   order.index(default), a.yes or a.check)
     return order[pick]
@@ -4419,11 +4420,7 @@ def mm3_companions_step(a, d: Path, hip: bool) -> Path | None:
     """A GGUF quant's pictures and drafting: the EXL3 repo's vision tower (MM3_VISION_FILES; not with --no-vision) and
     DSpark draft (dspark/) - download.json's pinned files - in <models folder>/MiniMax-M3.1-Flash-companions, downloaded
     when they are not there (a whole EXL3 download beside the GGUF is used as it is).  The folder pack_gguf.py takes, or
-    None: text only, no draft (AMD; or the download declined)."""
-    if hip:
-        ok("pictures and DSpark drafting: NVIDIA only for now (maya-mm3's vision tower and draft have no AMD port) - "
-           "text only here")
-        return None
+    None: text only, no draft (the download declined).  NVIDIA and AMD alike (hip: kept for the callers)."""
     exl3 = d.parent / MM3_DIR
     if all((exl3 / n).exists() for n in MM3_VISION_FILES) and (exl3 / "dspark" / "config.json").exists():
         ok(f"pictures and drafting: from the EXL3 download beside it ({exl3})")

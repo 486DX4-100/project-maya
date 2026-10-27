@@ -1020,21 +1020,43 @@ __global__ void EXL3_BOUNDS(2) win_down_mix_kernel(const KWin a, const KMix mx) 
 
 // (a host that never answers: the wait gives up after 120 s and wait_timeouts() counts it - no GPU left spinning)
 __device__ unsigned g_win_timeouts = 0;
-__global__ void win_wait_kernel(const unsigned* p, unsigned v) {
+__global__ void win_wait_kernel(const unsigned* p, unsigned v, unsigned long long limit) {
     if (threadIdx.x != 0) return;
     unsigned long long t0, t;
+#if defined(STRATA_USE_HIP)
+    t0 = wall_clock64();   // (limit: 120 s of its ticks - win_wait_limit)
+#else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+#endif
     while (*(volatile const unsigned*) p != v) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
+#if defined(STRATA_USE_HIP)
+        t = wall_clock64();
+#else
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-        if (t - t0 > 120ull * 1000000000ull) {
+#endif
+        if (t - t0 > limit) {
             atomicAdd(&g_win_timeouts, 1u);
             break;
         }
     }
     __threadfence_system();
+}
+unsigned long long win_wait_limit() {   // 120 s in win_wait_kernel's clock
+#if defined(STRATA_USE_HIP)
+    static const unsigned long long l = [] {
+        int dev = 0, khz = 0;
+        if (hipGetDevice(&dev) != hipSuccess || hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) !=
+                                                    hipSuccess || khz <= 0)
+            khz = 100000;   // (100 MHz, RDNA's usual)
+        return 120ull * 1000ull * (unsigned long long) khz;
+    }();
+    return l;
+#else
+    return 120ull * 1000000000ull;
+#endif
 }
 
 // ---------------------------------------------------------------- reconstruction
@@ -2402,7 +2424,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
                !dispatch<RunWinDown>(a.lay.k2[2], a.lay.cb, w, groups, s)) {
         return false;
     }
-    if (a.wait_ptr != nullptr) win_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
+    if (a.wait_ptr != nullptr) win_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val, win_wait_limit());
     win_combine_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.T), kCols, 0, s>>>(w);
     launch_check("win_experts");
     return true;

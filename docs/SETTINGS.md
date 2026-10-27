@@ -753,8 +753,8 @@ from V100 on and on AMD, Linux and Windows. The files follow llama.cpp's MiniMax
 indexers of the first three layers sit in a small file of their own beside them (`...-maya-indexers.gguf`), which
 Maya loads so the model runs as MiniMax defines it - keep it with the other files. Pictures and the DSpark drafter
 come from the EXL3 repo's own files (its vision tower and its draft, about 4 GB, downloaded into
-`MiniMax-M3.1-Flash-companions` beside the model, or taken from an EXL3 download already there); on AMD the GGUFs
-read text only for now. The options above apply, but for `--tp` (the GGUFs run the layer split) and `--cache-gb`;
+`MiniMax-M3.1-Flash-companions` beside the model, or taken from an EXL3 download already there), on NVIDIA and on
+AMD alike. The options above apply, but for `--tp` (the GGUFs run the layer split) and `--cache-gb`;
 `tools/mm3/pack_gguf.py --model <folder>` builds the pack by hand (`--text-only`: without the companions).
 
 Setup and debugging variables:

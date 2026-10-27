@@ -41,8 +41,10 @@ It first asks which model to set up:
   99 tokens/s in windows, 1010 in chunks). The GGUFs have no DSpark drafter and no vision tower.
 - **MiniMax-M3.1-Flash** (experimental; `--model MiniMax-M3.1-Flash`) - [Mia-AiLab's EXL3 quant at 3.5 bits](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw)
   (197 GB with MiniMax's DSpark drafter; every file pinned and checked, `tools/mm3/download.json`) on its own engine
-  (`build/maya-mm3`): Linux and Windows, NVIDIA V100 / RTX 20 or newer; AMD runs Maya's GGUF quants of it instead
-  (`--model minimax-maya-xs` / `minimax-maya-s`: [SETTINGS.md](SETTINGS.md#minimax-m31-flash)). About 250 GB of VRAM
+  (`build/maya-mm3`): NVIDIA from V100 on, Linux and Windows; AMD experimental (as GLM's EXL3 quants there: the
+  kernels pass their tests on AMD, the whole model has not run on one yet) - on AMD, Maya's GGUF quants
+  (`--model minimax-maya-xs` / `minimax-maya-s`: [SETTINGS.md](SETTINGS.md#minimax-m31-flash)) are the tested way.
+  About 250 GB of VRAM
   and RAM hold all of it; with less the setup warns. The same steps with these differences: the contexts are 32K-1M,
   the recommended one the largest (up to 256K) whose KV cache fits beside the model in this PC's VRAM + RAM, its RAM
   said, with warnings past 256K and when the cache would take the experts' RAM; the pack is `DIR/maya-mm3/`

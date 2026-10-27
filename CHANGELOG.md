@@ -14,8 +14,10 @@ MiniMax-M3.1-Flash in Project Maya's own quants: the whole model in a 128 GB PC.
   scores within a hair of the quant's own measurement (top token the same on 81% of the answer tokens).
 - **NVIDIA from V100 on and AMD, Linux and Windows**, with the experts VRAM cannot hold computed on the CPU from RAM,
   the INT8 K/V cache and the context fitted to the PC's memory, as for the EXL3 quant.
-- **Pictures and DSpark drafting with the GGUFs** (NVIDIA): the vision tower and the drafter come from the EXL3 repo's
-  own files (about 4 GB), downloaded once beside the model.
+- **Pictures and DSpark drafting with the GGUFs**, on NVIDIA and AMD: the vision tower and the drafter come from the
+  EXL3 repo's own files (about 4 GB), downloaded once beside the model.
+- **MiniMax's EXL3 quant on AMD, experimental**, as GLM's EXL3 quants there: `maya-mm3` builds for AMD GPUs with its
+  EXL3 kernels, and the setup offers the quant there too.
 - **The same files work in llama.cpp:** the three dense layers' indexers are kept in a small file of their own, which
   Maya loads to run MiniMax's sparse attention in every layer.
 - **One naming scheme for every model's quants:** the model first, then the tier by the experts' bits - XS (~1.6),
