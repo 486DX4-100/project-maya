@@ -259,15 +259,21 @@ class Gguf(unittest.TestCase):
             self.assertTrue(any(n.endswith("-maya-indexers.gguf") for n in m["files"]))
             self.assertTrue(all(n.startswith(name) for n in m["files"]))
             self.assertGreater(m["memory_gb"], m["download_gb"])
-            self.assertFalse(maya.mm3_gguf_published(q))              # (until the upload fills in revision / sha256)
+            self.assertTrue(maya.mm3_gguf_published(q))               # (uploaded: the revision and every sha256)
         self.assertEqual(maya.mm3_memory_gb("exl3"), maya.MM3_MEMORY_GB)
 
     def test_choice(self):
         with patch.object(maya, "fail", fail):
             self.assertEqual(maya.choose_mm3_quant(args(mm3_quant="gguf-s"), {}), "gguf-s")
-            self.assertEqual(maya.choose_mm3_quant(args(mm3_quant=None), {}), "exl3")   # (NVIDIA, none published)
-            with patch.object(maya.S, "amd_gpus", return_value=[]):
-                self.assertEqual(maya.choose_mm3_quant(args(mm3_quant=None, backend="hip"), {}), "exl3")   # (AMD too)
+            # the one recommended by the PC's VRAM + RAM: the EXL3 quant where it fits (250 GB), else the biggest GGUF
+            # that fits, else the smallest
+            for ram, vram, want in ((256, 96, "exl3"), (128, 32, "gguf-s"), (96, 24, "gguf-xs"), (32, 8, "gguf-xs")):
+                with patch.object(maya, "mem_gb", return_value=(float(ram), float(ram))), \
+                        patch.object(maya.S, "gpus", return_value=[{"vram_gb": float(vram)}]):
+                    self.assertEqual(maya.choose_mm3_quant(args(mm3_quant=None), {}), want, (ram, vram))
+            with patch.object(maya.S, "amd_gpus", return_value=[]), \
+                    patch.object(maya, "mem_gb", return_value=(128.0, 128.0)):   # (AMD too: a 128 GB Strix Halo)
+                self.assertEqual(maya.choose_mm3_quant(args(mm3_quant=None, backend="hip"), {}), "gguf-xs")
 
     def test_amd_allowed_for_gguf(self):
         with patch.object(maya, "fail", fail), patch.object(maya, "step", lambda *a: None), \
@@ -320,6 +326,7 @@ class Gguf(unittest.TestCase):
         """Before it is published, a GGUF quant is set up only from files already there (--model-dir), by their sizes."""
         m = maya.mm3_gguf_entry("gguf-xs")
         m["files"] = {n: 1000 + i for i, n in enumerate(m["files"])}   # (small stand-ins for the real sizes)
+        m["revision"], m["sha256"] = "", {n: "" for n in m["files"]}   # (as before its upload)
         with tempfile.TemporaryDirectory() as d, patch.object(maya, "fail", fail), \
                 patch.object(maya, "step", lambda *a: None), patch.object(maya, "warn", lambda *a: None), \
                 patch.object(maya, "ok", lambda *a: None), patch.object(maya, "rotational", return_value=False), \

@@ -56,6 +56,13 @@ void set_down(const x3::SetArgs& a, const uint16_t* h16, int ldh, float* y, int 
 /// cuBLAS handle): allocated here at the load, so the plan counts it.  scratch_bytes(): what prepare() takes a stream.
 bool prepare(cudaStream_t s);
 size_t scratch_bytes();
+/// The prompt path's dense GEMMs (gemm_rows with beta 0): 0 the BLAS (cuBLAS / hipBLAS's FP16 GEMM), 1 hipBLASLt with
+/// each shape's fastest kernel measured on this GPU at its first product (src/ds4/ds4_lt; the picks kept in
+/// set_lt_store's file) - an AMD build with hipBLASLt only, else the BLAS.  The prefill calibration chooses.
+void set_gemm(int backend);
+int gemm_backend();
+bool gemm_lt_available();
+void set_lt_store(const char* path);
 /// Launch failures since the process started (each printed); the device waits on the host that gave up after 120 s.
 int launch_errors();
 unsigned wait_timeouts();

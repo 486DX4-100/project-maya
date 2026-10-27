@@ -28,7 +28,8 @@ from __future__ import annotations
 from typing import NamedTuple
 
 P_MIN = 8               # the shortest block: shorter loops (one token, "0, 0, 0") repeat a multiple of it in 8..15
-P_MAX = 400             # the longest: a loop of a whole paragraph or function
+P_MAX = 2048            # the longest: a loop of whole paragraphs or a plan written again (Maya-S thought a ~1,170-
+                        # token plan four times); answers without a loop hold back and cost the same as with 400
 SHORT_BELOW = 32        # blocks under this many tokens must repeat REPS_SHORT times, longer ones REPS_LONG times
 REPS_SHORT = 4
 REPS_LONG = 3

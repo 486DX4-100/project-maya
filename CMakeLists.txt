@@ -521,7 +521,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if((STRATA_ENABLE_CUDA AND (_mm3_archs OR NOT _mm3_filter)) OR STRATA_ENABLE_HIP)
     # (a GGUF's weights - tools/mm3/pack_gguf.py, MiniMax's Maya quants: maya-ds4's ggml block-type kernels, src/ds4/ds4_iq,
     #  on the device and its CPU rows on the CPU lane - mm3_gguf.cu, mm3_cpu_gg.cpp)
-    set(_mm3_gguf_sources src/mm3/mm3_gguf.cu src/ds4/ds4_iq.cu)
+    set(_mm3_gguf_sources src/mm3/mm3_gguf.cu src/ds4/ds4_iq.cu src/ds4/ds4_lt.cu)   # (ds4_lt: mm3_gguf.cu's AMD GEMMs)
     set(_mm3_gguf_cpu_sources src/mm3/mm3_cpu_gg.cpp src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
     # (AMD (HIP) builds the same engine: the EXL3 kernels' HIP paths as the shared exl3.cu's, tensor parallel over
     #  peer copies, the DSpark draft and the vision tower through hipBLAS - include/strata/hip_compat)
@@ -531,6 +531,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(maya-mm3 PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
     # (the CPU lane: the shared CPU EXL3 kernels, used as they are; ggml-cpu's dots for a GGUF's experts)
     target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs on AMD: ds4_lt.cu, measured)
+      set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS STRATA_HIPBLASLT_AVAILABLE=1)
+      target_link_libraries(maya-mm3 PRIVATE roc::hipblaslt)
+    endif()
     if(STRATA_BUILD_TESTS)
       # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with
       # swigluoai, the Volta / Turing tensor-core tiles and the FP16 GEMM path before sm_80
@@ -538,6 +542,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_include_directories(mm3_exl3_test PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
       target_link_libraries(mm3_exl3_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target}
                             ${_strata_gpu_blas_target})
+      if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
+        target_link_libraries(mm3_exl3_test PRIVATE roc::hipblaslt)
+      endif()
       add_test(NAME mm3_exl3_test COMMAND mm3_exl3_test)
       set_tests_properties(mm3_exl3_test PROPERTIES TIMEOUT 300)
       # the GGUF weights (no model): the dense types' values, rows and GEMVs against ggml's dequantize_row_*, the GEMMs,
@@ -548,6 +555,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_include_directories(mm3_gguf_test PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
       target_link_libraries(mm3_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target}
                             ${_strata_gpu_blas_target})
+      if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
+        target_link_libraries(mm3_gguf_test PRIVATE roc::hipblaslt)
+      endif()
       add_test(NAME mm3_gguf_test COMMAND mm3_gguf_test)
       set_tests_properties(mm3_gguf_test PROPERTIES TIMEOUT 600)
       # the K / V caches in every format (BF16, INT8, FP8, FP4, mixed; rows rotated or not) and the sparse attention

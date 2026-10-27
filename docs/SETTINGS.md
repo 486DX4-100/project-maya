@@ -304,7 +304,7 @@ and again until `max_tokens`. The server watches every answer for one, in the th
 model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short patterns (`MAYA_GLM_LOOP_THINK`,
 `MAYA_GLM_LOOP_ANSWER`).
 
-- **What counts as a loop:** the end of what was written is one block of 8-400 tokens repeated exactly, back to back
+- **What counts as a loop:** the end of what was written is one block of 8-2048 tokens repeated exactly, back to back
   (4 times for a block under 32 tokens, 3 times for a longer one), over 96 tokens at least. A table's rows, an array,
   a name used over and over or code lines alike are not exact copies of one block back to back, so they go on
   untouched. The check costs a few microseconds a token.
@@ -768,7 +768,9 @@ Engine options, in the config's `"args"`:
 | `--cpu-threads` | one a physical core | the CPU lane's workers (the experts VRAM does not hold are computed on the CPU from pinned RAM); `-1`: no CPU lane |
 | `--reserve-gb` | 1.0 (0.3 with `--tp`) | VRAM each GPU keeps free beyond the plan |
 | `--resident-cap` | as many as fit | routed experts kept in VRAM, a layer at most |
-| `--chunk` | 1024 | prompt tokens a forward takes at most |
+| `--chunk` | the prefill calibration's (1024 before it) | prompt tokens a forward takes at most; given here, the calibration's is not taken |
+| `--prefill-gemm` | the prefill calibration's (`blas` before it) | Maya's GGUF quants: the prompt's dense matrix products through the BLAS (cuBLAS / hipBLAS) or, on AMD, `hipblaslt` (each shape's fastest kernel timed on this GPU once, kept beside the model in `lt-picks.txt`); `auto`: the calibration's |
+| `--no-prefill-tune` | - | the engine's defaults instead of this PC's prefill calibration (`--prefill-tune FILE`: another file than the pack's `prefill-tune.txt`) |
 | `--staging` | 48 | expert staging slots a GPU |
 | `--profile` | `data/expert-profile-mm3.bin` | the routing profile: the most-routed experts are placed in VRAM |
 
@@ -787,10 +789,25 @@ come from the EXL3 repo's own files (its vision tower and its draft, about 4 GB,
 AMD alike. The options above apply, but for `--tp` (the GGUFs run the layer split) and `--cache-gb`;
 `tools/mm3/pack_gguf.py --model <folder>` builds the pack by hand (`--text-only`: without the companions).
 
+**The prefill calibration.** How a PC reads prompts fastest depends on its GPU, so it is measured there: the setup
+(step 9), `./maya.sh --calibrate` and the first start of a MiniMax config set up before it run the engine once over a
+~4K-token text (`maya-mm3 --calibrate-prefill`, tools/calibrate_mm3_prefill.py) with a few settings - the chunk of
+tokens a step takes (larger ones only where every expert still fits in VRAM) and, with Maya's GGUF quants on AMD, the
+matrix products' library - and keep the fastest. The engine stores it beside the model (`prefill-tune.txt`, a line
+for this PC: its GPUs, their architecture, the GPU runtime and the driver) and takes it at every start; a new GPU or
+driver gets the defaults until it is measured again. The config records the result (`installer.prefill_calibration`).
+It takes one start of the model and a few minutes; the answers are the model's either way.
+
 Setup and debugging variables:
 
 | Variable | Default | What it does |
 |---|---|---|
+| `MAYA_MM3_HOST_FREE` | `1` | decode: a layer whose routed experts are all in VRAM plans them on the GPU, so a token or a verify window runs without waiting for the host at each layer; `0`: the host plans every layer (the same tokens) |
+| `MAYA_MM3_GRAPH` | `1` | decode on one GPU with every MoE layer host-free: a token's and a verify window's forward replayed as one graph (the same tokens); `0`: launched kernel by kernel |
+| `MAYA_MM3_WIN_SUBMIT` | `1` | Windows + AMD: each layer's queued work started as it is enqueued (the driver otherwise waits for the host); `0`: off |
+| `MAYA_MM3_ATTN_WIDE`, `MAYA_MM3_MSA_WIDE` | `1` | the sparse attention's decode kernel with more threads, the indexer's prompt scores in register tiles - each the same results as before; `0`: the earlier kernels |
+| `MAYA_MM3_LT_STORE` | the pack's `lt-picks.txt` | where hipBLASLt's measured kernels are kept |
+| `MAYA_MM3_PROF` | off | debugging: `1` each forward's GPU time by part (events), `2` the same with the host waiting at each part (AMD), and the DSpark proposals' parts |
 | `MAYA_MM3_MIN_CC` | - | testing only: `70` lets the setup take GPUs before RTX 30 / A100 (a V100), with a warning |
 | `MAYA_MM3_IQ_Q8K` | `1` | GGUF quants: the routed experts' inputs rounded as the CPU lane rounds them (a scale every 256 values), so an expert gives the same sums on the GPU and the CPU; `0`: a scale every 32 |
 | `MM3_TIMING`, `MM3_CONF`, `MM3_LANE_PROF`, `MM3_MISS_STATS`, `MM3_TP_PROF`, `MM3_TP_TRACE`, `MM3_NSYS` | off | debugging: the engine prints timings, the drafts' confidences, the CPU lane's and tensor parallel's profiles |

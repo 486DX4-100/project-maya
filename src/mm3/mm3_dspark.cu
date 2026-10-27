@@ -4,7 +4,10 @@
 #include <functional>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "mm3_kernels.cuh"
@@ -31,6 +34,36 @@ namespace x3 = strata::mm3::exl3;
 
 namespace {
 const std::string DP = "dspark.language_model.model.dspark.";
+// MAYA_MM3_PROF=2: a proposal's parts timed (the host waits at each) and printed at the end
+struct DraftProf {
+    bool on = [] {
+        const char* v = std::getenv("MAYA_MM3_PROF");
+        return v != nullptr && std::atoi(v) == 2;
+    }();
+    double ms[4] = {};
+    long n = 0;
+    double last = 0;
+    static double now() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void start(cudaStream_t s) {
+        if (!on) return;
+        cudaStreamSynchronize(s);
+        last = now();
+    }
+    void mark(cudaStream_t s, int part) {
+        if (!on) return;
+        cudaStreamSynchronize(s);
+        const double t = now();
+        ms[part] += 1e3 * (t - last);
+        last = t;
+    }
+    ~DraftProf() {
+        if (on && n > 0)
+            std::fprintf(stderr, "MM3 PROF draft: %ld proposals, layers %.2f head %.2f markov %.2f ms a proposal\n", n,
+                         ms[0] / n, ms[1] / n, ms[2] / n);
+    }
+};
 }
 
 struct Draft::Impl {
@@ -71,6 +104,8 @@ struct Draft::Impl {
     uint16_t* anc = nullptr;   // (mapped) the anchor's embedding row, BF16
     float* maskf = nullptr;    // the mask token's embedding row, F32 (device)
     k::QRow* qh = nullptr;   // (mapped) a sampled proposal's distributions, a row a position
+    DraftProf prof;
+    bool anc_busy = false;   // a proposal enqueued that may still read anc (one that failed before its own wait)
 
     ~Impl() {
         cudaSetDevice(dev);
@@ -317,8 +352,12 @@ struct Draft::Impl {
         cudaSetDevice(dev);
         // the block's embeddings: the anchor, then the mask token (the target's table, BF16 -> F32), and the
         // positions - made on the device (the anchor's row read where the host put it)
-        DK(cudaStreamSynchronize(s));   // (the last proposal done with anc)
+        // (the last proposal done with anc: it waited for its drafts at its end, unless it failed before that - no
+        //  wait here otherwise, so the target's context rows queued before it go to the GPU with this proposal)
+        if (anc_busy) DK(cudaStreamSynchronize(s));
+        anc_busy = true;
         row(anchor, anc);
+        prof.start(s);
         k::draft_block(anc, maskf, D, B, P, g.window, h, pos, lo, s);
         const float scale = 1.0f / std::sqrt((float) g.hd);
         for (auto& l : L) {
@@ -337,6 +376,7 @@ struct Draft::Impl {
             mxg(l.d, gt, B, F, h, D, 1.0f);   // h += mlp
         }
         k::rms(h, fin1, B, D, g.eps, hid, hid16, s);
+        prof.mark(s, 0);
         // (the target's head on mv, F32 inputs: one pass for the block's rows - gemm_rows took ~1.8 ms on the 3090)
         for (int c0 = 0; c0 < n;) {
             x3::MvJob j;
@@ -352,6 +392,7 @@ struct Draft::Impl {
             }
             c0 += j.ncol;
         }
+        prof.mark(s, 1);
         k::set_int(prev, anchor, s);
         for (int i = 0; i < n; ++i) {
             k::gather_row(w1, R, prev, embb, embf, s);
@@ -371,6 +412,9 @@ struct Draft::Impl {
         DK(cudaMemcpyAsync(host, out, (size_t) n * 4, cudaMemcpyDeviceToHost, s));
         DK(cudaMemcpyAsync(host + B, conf, (size_t) n * 4, cudaMemcpyDeviceToHost, s));
         DK(cudaStreamSynchronize(s));
+        prof.mark(s, 2);
+        ++prof.n;
+        anc_busy = false;
         drafts.assign(host, host + n);
         cf.resize((size_t) n);
         std::memcpy(cf.data(), host + B, (size_t) n * 4);

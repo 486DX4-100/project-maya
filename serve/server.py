@@ -134,7 +134,7 @@ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean s
 # logged, a queue that had stopped moving (and requests piling up behind it) was indistinguishable from a busy server.
 QUEUE_LOG_S = 5.0
 # A queued request's keep-alive while it waits for its first turn (#483): often enough for any stream-idle timeout,
-# seldom enough to cost nothing (queue_ping_seconds: STRATA_QUEUE_PING_S sets another).
+# seldom enough to cost nothing (queue_ping_seconds: MAYA_QUEUE_PING_S sets another).
 QUEUE_PING_S = 2.0
 # The queue watchdog (Service.start_queue_watch): how often it looks, the age at which the first waiter means the
 # queue has stopped moving, and how often it says so again while it stays that way.
@@ -295,9 +295,9 @@ class FairLock:
 
 
 def queue_ping_seconds() -> float:
-    """STRATA_QUEUE_PING_S: how often a request waiting for its first turn sends a keep-alive (QUEUE_PING_S)."""
+    """MAYA_QUEUE_PING_S: how often a request waiting for its first turn sends a keep-alive (QUEUE_PING_S)."""
     try:
-        return max(0.01, float(os.environ.get("STRATA_QUEUE_PING_S", "") or QUEUE_PING_S))
+        return max(0.01, float(os.environ.get("MAYA_QUEUE_PING_S", "") or QUEUE_PING_S))
     except ValueError:
         return QUEUE_PING_S
 
@@ -2788,6 +2788,9 @@ class Service:
                 if all(k in sg for sg in segments):
                     merged[k] = sum(sg[k] for sg in segments)
             self.engine.last = merged
+        lastd = getattr(self.engine, "last", None)
+        if isinstance(lastd, dict) and (lastd.get("prompt_tokens") or 0) > len(ids):
+            self.engine.last = own_prompt_figures(lastd, len(ids))   # (the first call's DONE was not seen)
         if guard is not None and not cancel.is_set():   # the end: what the guard still held back
             while sent < len(produced):
                 sent += 1
@@ -3045,6 +3048,16 @@ class Service:
         yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
                        "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}
+
+
+def own_prompt_figures(last: dict, n_prompt: int) -> dict:
+    """A request's figures when its last engine call went on from what it had written (after the loop guard or a fair
+    slice): that call's prompt was the request's prompt plus the tokens kept, all of them in the conversation cache,
+    so its prompt_tokens and reused count those too - a guarded answer reported 5,919 cached tokens of a 246-token
+    prompt.  The request's own: its prompt, and what the cache held of it (the call's reused less the kept tokens)."""
+    extra = int(last.get("prompt_tokens") or 0) - n_prompt
+    reused = max(0, min(n_prompt, int(last.get("reused") or 0) - max(0, extra)))
+    return dict(last, prompt_tokens=n_prompt, reused=reused)
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:

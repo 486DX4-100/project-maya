@@ -2,7 +2,7 @@
 """Project Maya - set up and start GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017 or MiniMax-M3.1-Flash on your own GPU(s).
 GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
 validated), Linux and Windows, text only.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
-and Windows; their GGUFs on HIP too.
+and Windows; their GGUFs on HIP too (their EXL3 quants: experimental there).
 The quants are named model first, then the tier by the experts' bits (XS, S, M, L): --model glm-maya-s,
 deepseek-maya-xs, minimax-maya-xs ... (tools/maya_quants.py); every name used before still works.
 
@@ -81,6 +81,7 @@ import calibrate_glm as CAL  # noqa: E402  the CPU lane's tuning for this PC (./
 import calibrate_ds4_tp as CAL4  # noqa: E402  DeepSeek's: --tp and the CPU threads (./maya.sh --calibrate)
 import calibrate_draft as CD  # noqa: E402  the speed calibration: DFlash2 or the MTP block on this PC
 import calibrate_ds4 as CDS  # noqa: E402  DeepSeek's: the DSpark drafter or none, on this PC
+import calibrate_mm3_prefill as CPF  # noqa: E402  MiniMax's: how this PC reads prompts fastest (chunk, GEMMs)
 
 WIN = S.WIN
 ME = "START-MAYA.bat" if WIN else "./maya.sh"      # how this is started, for the messages
@@ -1180,9 +1181,10 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
     if a.backend == "hip":
-        if ds4 and not gguf:
-            fail(f"{DS4}'s EXL3 quant runs on NVIDIA GPUs only (its prompt kernels have no HIP port)",
-                 f"set up its GGUF instead: {ME} --setup --model {DS4} --ds4-quant gguf-q8")
+        if ds4 and not gguf:   # (as GLM's and MiniMax's EXL3 quants on AMD: experimental)
+            warn(f"{DS4}'s EXL3 quants on AMD are experimental: their kernels pass their tests on AMD GPUs, but the "
+                 f"whole model has not been measured on one - Maya's GGUF quants (--model deepseek-maya-s / "
+                 "deepseek-maya-xs) are the tested way there")
         return check_hip_pc(a, text_only=not mm3)
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows", "the engine needs an NVIDIA GPU and CUDA")
@@ -2703,10 +2705,9 @@ def calibrate_config(cfg_path: Path) -> bool:
     cfg = read_json(cfg_path)
     if config_family(cfg) == "deepseek":
         return calibrate_ds4_config(cfg_path)
-    if config_family(cfg) == "minimax":   # (maya-mm3 sizes its CPU lane by this PC's cores and its pools by its memory)
-        ok(f"{MM3}: the engine sets its CPU lane and memory from this PC itself - nothing to tune here yet "
-           f"({ME} --speed-calibration measures its DSpark drafter)")
-        return False
+    if config_family(cfg) == "minimax":   # (maya-mm3 sizes its CPU lane by this PC's cores and its pools by its memory:
+        #  what it reads prompts with is measured - the prefill calibration)
+        return prefill_calibration(cfg_path, "asked for")
     if cfg.get("backend") == "hip":
         warn("the tuning measures the CUDA engine's CPU lane (NVIDIA GPUs): the HIP port keeps its own settings")
         return False
@@ -2905,6 +2906,56 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     return True
 
 
+def needs_prefill_calibration(cfg: dict) -> bool:
+    """A MiniMax config whose prompt settings were never measured on this PC (set up before there was the prefill
+    calibration): its next start measures them once (a failed one is not tried again by itself: --calibrate)."""
+    return config_family(cfg) == "minimax" and "prefill_calibration" not in (cfg.get("installer") or {})
+
+
+def prefill_calibration(cfg_path: Path, why: str = "") -> bool:
+    """MiniMax's prefill calibration (tools/calibrate_mm3_prefill.py): the chunk a prompt is read in and the dense GEMMs'
+    backend, measured on this PC by the engine itself and kept by it for this PC (the pack's prefill-tune.txt, read at
+    every start); the result also in the config (installer.prefill_calibration).  False: not measured (the reason is
+    shown; the engine then reads prompts with its defaults)."""
+    cfg = read_json(cfg_path)
+    busy = busy_gpus(cfg)
+    if busy:
+        warn("the prefill calibration needs the GPU(s) to itself: " +
+             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
+             f" (a model server still running?) - {ME} --calibrate measures it later")
+        return False
+    say()
+    say(f"  Prefill calibration: how this PC reads prompts fastest" + (f" ({why})" if why else ""))
+    say("  The engine reads a ~4K-token text with a few settings - the chunk of tokens a step takes, and the matrix")
+    say("  products' library - and keeps the fastest for this PC. One start of the model; a few minutes.")
+    log = cfg.get("log")
+    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
+    try:
+        res = CPF.run(cfg, say=say)
+    except Exception as e:                             # never stops a setup or a start: the engine's defaults stay
+        warn(f"the prefill calibration did not finish ({e}): the engine reads prompts with its defaults; "
+             f"{ME} --calibrate tries again")
+        why_not = CAL.engine_error(log, since)
+        if why_not:
+            say(f"       the engine said: {why_not}")
+        cfg.setdefault("installer", {})["prefill_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
+                                                                  "failed": str(e)[:300]}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        return False
+    cfg.setdefault("installer", {})["prefill_calibration"] = {
+        "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "chunk": res.get("chunk"),
+        "gemm": res.get("gemm"), "tok_s": res.get("tok_s"), "default_tok_s": res.get("default_tok_s"),
+        "tokens": res.get("tokens"), "file": res.get("file")}
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    t, d = res.get("tok_s") or 0, res.get("default_tok_s") or 0
+    gemm = {"hipblaslt": "hipBLASLt", "blas": "the BLAS's"}.get(res.get("gemm"), res.get("gemm"))
+    gain = f" (+{(t / d - 1) * 100:.0f}% over the defaults' {d:.0f})" if d > 0 and t > d * 1.005 else \
+        " (the engine's defaults are the fastest here)"
+    ok(f"prefill calibration: chunks of {res.get('chunk')} tokens, {gemm} matrix products - {t:.0f} tokens/s "
+       f"reading a {res.get('tokens')}-token prompt{gain}; kept for this PC")
+    return True
+
+
 def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
     """DeepSeek's and MiniMax's speed calibration (tools/calibrate_ds4.py): the sustained decode speed with the DSpark
     drafter and without it (--dspark none / off), measured on this PC's GPUs; the config keeps the faster - the drafter
@@ -3049,6 +3100,10 @@ def server_command(cfg_path: Path, a) -> tuple:
         ok(f"{cfg_path.name}: starts from DeepSeek's shipped expert profile ({DS4_PROFILE.name}, copied into the pack)")
     cfg_path.touch()                                   # the most recently used model
     refresh_engine(cfg)
+    if needs_prefill_calibration(cfg):                 # MiniMax set up before the prefill calibration: measured once
+        prefill_calibration(cfg_path, "once, for a setup from before it")
+        cfg = read_json(cfg_path)
+        args = cfg.get("args") or []
     if needs_speed_calibration(cfg):                   # a drafter set up without its speed calibration: measured once
         drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter"}.get(
             config_family(cfg), "DFlash2")
@@ -3855,13 +3910,14 @@ def choose_ds4_quant(a, prev: dict) -> str:
         return a.ds4_quant
     hip = getattr(a, "backend", None) == "hip"
     maya = [k for k in DS4_MAYA if ds4_maya_published(k)]
-    # the EXL3 quants only where they run: NVIDIA V100 or newer (compute capability 7.0+; not AMD yet) - a PC whose
-    # GPUs are all older is not offered them (nvidia-smi silent: offered, the PC check says)
+    # the EXL3 quants where they run: NVIDIA V100 or newer (compute capability 7.0+), and AMD (experimental, as GLM's
+    # EXL3 quants there) - a PC whose NVIDIA GPUs are all older is not offered them (nvidia-smi silent: offered, the
+    # PC check says)
     try:
         ccs = [] if hip else [int(g["arch"]) for g in S.gpus()]
     except Exception:  # noqa: BLE001 - no NVIDIA tools
         ccs = []
-    exl3_ok = not hip and (not ccs or max(ccs) >= DS4_MIN_CC)
+    exl3_ok = hip or not ccs or max(ccs) >= DS4_MIN_CC
     keys = maya + [k for k in DS4_QUANTS if k not in DS4_MAYA and (exl3_ok or k not in DS4_EXL3)]
     before = (prev.get("installer") or {}).get("ds4_quant")
     default = before if before in keys else maya[0] if maya else DS4_DEFAULT_QUANT
@@ -3880,9 +3936,10 @@ def choose_ds4_quant(a, prev: dict) -> str:
     label = {k: (Q.shown("deepseek", k, gb.get(k)), about[k]) for k in DS4_QUANTS}
     pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
                                              "the memory: the experts that do not", "fit in VRAM are read from RAM and "
-                                             "the SSD. The EXL3 quants need a V100 or newer and ~230 / ~280 GB of "
-                                             "VRAM + RAM:"],
-                  [(label[k][0], "recommended" if k == keys[0] else None, label[k][1]) for k in keys],
+                                             "the SSD. The EXL3 quants need a V100 or newer (AMD: experimental) and "
+                                             "~230 / ~280 GB of VRAM + RAM:"],
+                  [(label[k][0], "recommended" if k == keys[0] else
+                    "experimental on AMD" if hip and k in DS4_EXL3 else None, label[k][1]) for k in keys],
                   keys.index(default), a.yes or a.check)
     return keys[pick]
 
@@ -4632,6 +4689,9 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     else:
         ok("no vision tower in this pack: text only")
     cfg_path = write_config_mm3(a, pc, meta, pack, ctx, models, d, quant)   # 8
+    if S.UI is not None:                               # 9: how this PC reads prompts fastest, measured
+        S.UI.step(9, "prefill calibration")
+    prefill_calibration(cfg_path, "once, for this setup")
     if CDS.has_drafter(read_json(cfg_path)):           # 9: the DSpark drafter, measured on this PC (or chosen)
         how = drafting_choice(a, "MiniMax's DSpark drafter", "10-30")
         if how != "measure":
@@ -4713,7 +4773,7 @@ def main() -> int:
                          "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, with its own "
                          "2-bit drafter: the whole model in a 128 GB PC's memory), gguf-q8 = unsloth's UD-Q8_K_XL GGUF, gguf-q4 = its UD-Q4_K_XL "
                          "(dense weights Q8_0: less VRAM), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
-                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer); a Maya "
+                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer, AMD experimental); a Maya "
                          "quant also as --model deepseek-maya-s / -maya-m / -maya-xs")
     ap.add_argument("--mm3-quant", choices=list(MM3_QUANTS) + list(Q.MM3_QUANT_ALIASES),
                     help=f"{MM3}'s files: exl3 = Mia-AiLab's EXL3 quant at 3.5 bits (NVIDIA; pictures, DSpark), "

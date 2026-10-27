@@ -51,8 +51,12 @@ def numbers_table(rows):
         f"| {i} | user{i * 7 % 13} | {(i * 37) % 100} | city{i % 5} |\n" for i in range(rows))
 
 
+LONG_BLOCK = " ".join(random.Random(11).choices(   # a plan of several hundred tokens (Maya-S thought one 4 times)
+    "check the metric logs then the deploy diff and the gc pauses before the p99 of each host".split(), k=600)) + "\n"
+
 LEGIT = {
     "markdown table": numbers_table(60),
+    "a long block twice": "Draft:\n" + LONG_BLOCK + "Final:\n" + LONG_BLOCK + "Done.",
     "JSON array": json.dumps(list(range(300))),
     "JSON objects": json.dumps([{"id": i, "name": f"item {i}", "tags": ["a", "b"], "price": i * 3}
                                 for i in range(40)], indent=2),
@@ -78,6 +82,7 @@ class Detection(unittest.TestCase):
             "code block": ("```python\n", "def step(state):\n    state.count += 1\n    if state.count > 10:\n"
                                           "        state.reset()\n    return state\n\n", 10),
             "one token": ("Result: ", "0 ", 300),
+            "a long plan in thinking": ("Let me plan. ", LONG_BLOCK, 3),
         }
         for name, (head, block, n) in cases.items():
             with self.subTest(name):
@@ -122,7 +127,9 @@ class Detection(unittest.TestCase):
         prose = Words()(LEGIT["prose"])
         det = LG.LoopDetector()
         holds = [det.push(t) or det.hold for t in prose]
-        self.assertLess(sum(holds) / len(holds), 2.0)               # ordinary text: hardly held at all
+        # ordinary text: hardly held at all (this prose draws on 22 words, so a 2048-token window finds a few more
+        # chance runs of a token or two than 400 did: 2.01 against 1.9; recorded answers hold back the same)
+        self.assertLess(sum(holds) / len(holds), 2.5)
 
     def test_reset_keeps_checking(self):
         w = Words()
@@ -441,6 +448,18 @@ class Http(unittest.TestCase):
         off = json.loads(self.post(dict(msg, loop_guard=False, max_tokens=400)))
         self.assertEqual(off["choices"][0]["finish_reason"], "length")
         self.assertGreater(off["choices"][0]["message"]["content"].count(BLOCK), 8)
+
+
+class GuardedUsage(unittest.TestCase):
+    """After the guard, the engine goes on from prompt + the kept tokens: the request reports its own prompt's
+    figures, not that call's (a guarded MiniMax answer said 5,919 cached tokens of a 246-token prompt)."""
+
+    def test_the_request_prompt_not_the_resumed_call(self):
+        from serve.server import own_prompt_figures
+        got = own_prompt_figures({"prompt_tokens": 246 + 5546, "reused": 5546 + 127, "prompt_ms": 9.5}, 246)
+        self.assertEqual((got["prompt_tokens"], got["reused"], got["prompt_ms"]), (246, 127, 9.5))
+        self.assertEqual(own_prompt_figures({"prompt_tokens": 1300, "reused": 300}, 1000)["reused"], 0)
+        self.assertEqual(own_prompt_figures({"prompt_tokens": 1300, "reused": 5000}, 1000)["reused"], 1000)
 
 
 if __name__ == "__main__":

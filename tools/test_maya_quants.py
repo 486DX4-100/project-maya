@@ -266,7 +266,9 @@ class MiniMaxFiles(unittest.TestCase):
             self.assertEqual(maya.hf_url(m["repo"], "main", m["folder"], f"{base}-00001-of-{n:05d}.gguf"),
                              f"https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF/resolve/main/{tier}/"
                              f"{base}-00001-of-{n:05d}.gguf")
-            self.assertFalse(maya.mm3_gguf_published(q))                     # (blank revision / sha256 until uploaded)
+            self.assertTrue(maya.mm3_gguf_published(q))                      # (uploaded: the commit and every sha256)
+            self.assertRegex(m["revision"], r"^[0-9a-f]{40}$")
+            self.assertTrue(all(len(h) == 64 for h in m["sha256"].values()))
 
     def test_files_under_their_earlier_names(self):
         m = maya.mm3_gguf_entry("gguf-xs")

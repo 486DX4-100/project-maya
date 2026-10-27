@@ -2040,11 +2040,11 @@ class GoneClients(unittest.TestCase):
 
 class QueuedKeepAlives(GoneClients):
     """#483: a streamed request waiting in the queue for its first turn sends SSE keep-alive comments (every
-    STRATA_QUEUE_PING_S) - before, nothing at all, and a client with a stream-idle timeout gave up on a turn that was
+    MAYA_QUEUE_PING_S) - before, nothing at all, and a client with a stream-idle timeout gave up on a turn that was
     only waiting.  The answer after the wait is the same; the OpenAI and Anthropic streams alike."""
 
     def setUp(self):
-        self.env = unittest.mock.patch.dict(os.environ, {"STRATA_QUEUE_PING_S": "0.1"})
+        self.env = unittest.mock.patch.dict(os.environ, {"MAYA_QUEUE_PING_S": "0.1"})
         self.env.start()
         super().setUp()
 

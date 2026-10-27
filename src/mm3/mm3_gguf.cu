@@ -4,6 +4,7 @@
 
 #include "mm3_env.hpp"
 #include "../ds4/ds4_iq.cuh"
+#include "../ds4/ds4_lt.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -23,6 +24,7 @@ namespace iq = strata::ds4::gguf::iq;
 namespace {
 
 std::atomic<int> g_errors{0};
+std::atomic<int> g_gemm{0};   // set_gemm's backend: 0 the BLAS, 1 hipBLASLt (measured kernels) where it runs
 
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
@@ -274,6 +276,16 @@ size_t row_bytes(int t, int64_t k) {
 }
 
 bool prepare(cudaStream_t s) { return scratch(s) != nullptr; }
+void set_gemm(int backend) { g_gemm.store(backend == 1 && gemm_lt_available() ? 1 : 0); }
+int gemm_backend() { return g_gemm.load(); }
+bool gemm_lt_available() {
+#if defined(STRATA_USE_HIP)
+    return strata::ds4::lt::available();
+#else
+    return false;
+#endif
+}
+void set_lt_store(const char* path) { strata::ds4::lt::set_store(path); }
 size_t scratch_bytes() {
     // (+ cuBLAS' workspace, and ds4_iq's light sets' int8 rows - 512 experts x 16 rows of up to 8192 values - which it
     //  takes on a stream's first prompt)
@@ -356,6 +368,10 @@ void gemm_rows(const x3::Mat& m, const uint16_t* x16, int ldx, int rows, float* 
             fail("gemm_rows: f16_rows");
             return;
         }
+        // (hipBLASLt: this shape's fastest kernel on this GPU, measured at its first product - ds4_lt)
+        if (beta == 0.0f && g_gemm.load(std::memory_order_relaxed) == 1 &&
+            strata::ds4::lt::gemm(s, sc->wb, nc, m.k, x16, ldx, rows, y + c0, ldy))
+            continue;
         // Y^T [nc][rows] (column-major, ldy) = W [nc][k] (row-major: A^T) x X^T [k][rows] (ldx)
         if (cublasGemmEx(sc->blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one, sc->wb, CUDA_R_16F, m.k, x16, CUDA_R_16F,
                          ldx, &beta, y + c0, CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) !=
