@@ -11,6 +11,7 @@
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
+#include "ds4_borrow.hpp"
 #include "ds4_engram_io.hpp"
 
 #include "ds4_gguf.cuh"
@@ -631,8 +632,9 @@ struct Chunk {
     int HQ = 0, OG = 0, FF = 0;              // (lay_chunk: this device's heads' width, wo_a groups, FFN share)
     bool has_first = false, has_eg = false;
     // the buffers' room: borrowed (a run lays them out in the device's tail of expert slots at its own chunk size,
-    // Dev::tail) or their own (laid out once at the largest chunk)
-    bool borrow = false;
+    // Dev::tail) or their own (laid out once at the largest chunk); tp_lend: borrowed as a tensor-parallel group's
+    // member (DS4_TP_BORROW=1: each member its own part of the group's last slots, the group's members all or none)
+    bool borrow = false, tp_lend = false;
     uint8_t* own = nullptr;
     float *h = nullptr, *x = nullptr, *acc = nullptr, *qr = nullptr, *kvr = nullptr, *ckr = nullptr, *cgr = nullptr,
           *latent = nullptr, *ikr = nullptr, *q = nullptr, *o = nullptr, *oa = nullptr, *iq = nullptr, *iw = nullptr,
@@ -1637,7 +1639,12 @@ struct Model::Impl {
     // a run of chunks borrowing the lending devices' tails (borrow_begin / borrow_end): whether one does now, the
     // pinned staging that reads the experts back after it (rf_bytes each), what that read back in all
     bool lent = false;
-    std::vector<uint8_t*> rf_stage;
+    // a hand-back that could not finish (a device selection, sync, copy or table write failed): an expert table may
+    // name a slot the prompt path's buffers overwrote - no later request runs (forward / forward_chunks refuse)
+    bool lend_broken = false;
+    static constexpr const char* kLendBroken =
+        "the prompt path's room could not be handed back - the expert tables are unknown; restart the engine";
+    std::vector<uint8_t*> rf_stage, rf_half;   // (rf_half: DS4_TP_BORROW's member parts, one a thread)
     size_t rf_bytes = 0;
     int64_t lent_experts = 0;
     double lent_ms = 0;
@@ -1912,6 +1919,12 @@ struct Model::Impl {
     bool one_gpu_or(const char* k) const {
         const char* v = std::getenv(k);
         return v != nullptr ? std::atoi(v) != 0 : devs.size() == 1;
+    }
+    // DS4_TP_BORROW=1 (off by default): a tensor-parallel group's members lend the prompt path their experts' room too
+    // (Chunk::tp_lend) - on the flow only (DS4_FLOW_TP=1), which streams the lent slots' experts, each member its part
+    static bool tp_borrow_on() {
+        const auto on = [](const char* v) { return v != nullptr && std::atoi(v) != 0; };
+        return on(ds4_env("DS4_TP_BORROW")) && on(std::getenv("DS4_FLOW_TP"));
     }
     // VRAM slot s of layer l, member x's part of it: u bytes a slot in its own allocation, the tail's xstep apart
     static uint8_t* sat(const Layer& l, const Layer& x, int s, size_t u) {
@@ -3755,9 +3768,10 @@ struct Model::Impl {
     // else c0
     int chunk_default(int c0) const {
         const auto env_on = [](const char* k) { return std::getenv(k) == nullptr || std::atoi(std::getenv(k)) != 0; };
-        if (!pk.gguf || !file_experts || !one_gpu_or("DS4_BORROW") || !env_on("DS4_FLOW")) return c0;
+        const bool tp_lend = tp_borrow_on();   // (DS4_TP_BORROW: a group's members lend their room as one GPU does)
+        if (!pk.gguf || !file_experts || !(one_gpu_or("DS4_BORROW") || tp_lend) || !env_on("DS4_FLOW")) return c0;
         for (const Group& G : groups)
-            if (G.mem.size() > 1) return c0;
+            if (G.mem.size() > 1 && !tp_lend) return c0;
         double other_b = 0;
         for (const auto& kt : pk.t) {
             const std::string& n = kt.first;
@@ -3829,6 +3843,29 @@ struct Model::Impl {
         // =0: its own room, as before)
         const bool borrow_on = file_experts && one_gpu_or("DS4_BORROW") &&
                                (std::getenv("DS4_FLOW") == nullptr || std::atoi(std::getenv("DS4_FLOW")) != 0);
+        // DS4_TP_BORROW=1: a device whose every trunk layer is a tensor-parallel group's member on the flow (the flow's
+        // own condition for a member, below in load) lends as such - only when every member of its group does (a
+        // group's slots past n_main lie in each member's tail, or in none)
+        std::vector<char> tp_ok(devs.size(), 0);
+        if (file_experts && tp_borrow_on() &&
+            (std::getenv("DS4_FLOW") == nullptr || std::atoi(std::getenv("DS4_FLOW")) != 0)) {
+            std::vector<char> any(devs.size(), 0);
+            for (size_t di = 0; di < devs.size(); ++di) tp_ok[di] = 1;
+            for (const Layer& l : L)
+                for (int m = 0; m < l.nm && !l.mtp; ++m) {
+                    const size_t di = (size_t) member(l, m).dev;
+                    any[di] = 1;
+                    tp_ok[di] = tp_ok[di] && l.nm > 1 && l.lay.fmt == gg::kFmtMXFP4 &&
+                                (tp_uneven ||
+                                 (g.ff / l.nm) % std::max(1, gg::type_block(gg::expert_type(l.lay, 2))) == 0);
+                }
+            for (size_t di = 0; di < devs.size(); ++di) tp_ok[di] = tp_ok[di] && any[di];
+            for (const Group& G : groups) {
+                bool all = G.mem.size() > 1;
+                for (int m : G.mem) all = all && tp_ok[(size_t) m];
+                for (int m : G.mem) tp_ok[(size_t) m] = all;
+            }
+        }
         for (size_t di = 0; di < devs.size(); ++di) {
             Dev& d = devs[di];
             cudaSetDevice(d.id);
@@ -3852,7 +3889,8 @@ struct Model::Impl {
                         lend = lend && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4;
                     }
             c.has_eg = has_eg, c.has_first = has_first;
-            c.borrow = lend && stride > 0;
+            c.tp_lend = tp_ok[di] && stride > 0;   // (DS4_TP_BORROW: lend is false here - its layers are a group's)
+            c.borrow = (lend || c.tp_lend) && stride > 0;
             {   // (its own room, laid out once: all of it, or a lending device's buffers of a fixed size)
                 const int part = c.borrow ? 1 : 3;
                 if (!dalloc(d, c.own, lay_chunk(c, chunk, nullptr, part), err)) return false;
@@ -5214,7 +5252,7 @@ struct Model::Impl {
         // a lending device (Chunk::borrow) whose experts' room would hardly hold the prompt path's (a GPU with little
         // left for experts, --vram-experts near 0): its own room after all, taken before the experts' as before
         for (size_t di = 0; di < devs.size() && chunk > 0; ++di) {
-            if (di >= chunks.size() || chunks[di] == nullptr || !chunks[di]->borrow) continue;
+            if (di >= chunks.size() || chunks[di] == nullptr || !chunks[di]->borrow || chunks[di]->tp_lend) continue;
             Dev& d = devs[di];
             Chunk& c = *chunks[di];
             cudaSetDevice(d.id);
@@ -5230,6 +5268,41 @@ struct Model::Impl {
             if (o.verbose)
                 std::fprintf(stderr, "ds4: CUDA%d keeps the prompt path's room for itself (%.2f GB): its experts' room "
                                      "(%.2f GB) holds too little to lend it\n", d.id, need / 1e9, room_e / 1e9);
+        }
+        // (DS4_TP_BORROW) a tensor-parallel group's lending members, all or none: one whose experts' room would hardly
+        // hold its buffers keeps its own room, and so does every other member of its group (the same bound as above)
+        for (const Group& G : groups) {
+            if (G.mem.size() < 2 || chunk <= 0) continue;
+            bool any = false, lend = !mixed;
+            for (int m : G.mem) {
+                if ((size_t) m >= chunks.size() || chunks[(size_t) m] == nullptr || !chunks[(size_t) m]->tp_lend)
+                    continue;
+                any = true;
+                Dev& d = devs[(size_t) m];
+                cudaSetDevice(d.id);
+                size_t fr = 0, tot = 0;
+                CK(mem_info(&fr, &tot));
+                const double room_e =
+                    std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+                lend = lend && room_e >= 2.0 * (double) lay_chunk(*chunks[(size_t) m], chunk, nullptr, 2);
+            }
+            if (!any || lend) continue;
+            for (int m : G.mem) {
+                if ((size_t) m >= chunks.size() || chunks[(size_t) m] == nullptr || !chunks[(size_t) m]->tp_lend)
+                    continue;
+                Dev& d = devs[(size_t) m];
+                Chunk& c = *chunks[(size_t) m];
+                cudaSetDevice(d.id);
+                c.borrow = c.tp_lend = false;
+                const size_t need = lay_chunk(c, chunk, nullptr, 2);
+                uint8_t* rows = nullptr;
+                if (!dalloc(d, rows, need, err)) return false;
+                lay_chunk(c, chunk, rows, 2);
+                std::fprintf(stderr, "ds4: CUDA%d keeps the prompt path's room for itself (%.2f GB), as every member "
+                                     "of its group does: one's experts' room holds too little to lend it "
+                                     "(DS4_TP_BORROW)\n",
+                             d.id, need / 1e9);
+            }
         }
         // (Windows, an integrated GPU: what its experts may commit - commit_room - and what that kept off the GPU)
         double room = 1e300, kept = 0;
@@ -5433,7 +5506,7 @@ struct Model::Impl {
         // end), the experts' slots the rest of the time
         std::vector<int> n_tail(L.size(), 0);
         for (size_t di = 0; di < devs.size() && chunk > 0; ++di) {
-            if (di >= chunks.size() || chunks[di] == nullptr || !chunks[di]->borrow) continue;
+            if (di >= chunks.size() || chunks[di] == nullptr || !chunks[di]->borrow || chunks[di]->tp_lend) continue;
             Dev& d = devs[di];
             Chunk& c = *chunks[di];
             size_t step = 0;
@@ -5478,6 +5551,78 @@ struct Model::Impl {
             if (o.verbose)
                 std::fprintf(stderr, "ds4: CUDA%d lends the prompt path up to %.2f GB of its experts' VRAM (%d slots a "
                                      "layer) while a prompt runs: chunks of up to %d tokens\n", d.id, cap / 1e9, k, chunk);
+        }
+        // (DS4_TP_BORROW) a tensor-parallel group's lending members: one k for the group's layers (a slot past n_main
+        // lies in every member's tail: sat() takes each member's xbase / xstep), each member's tail k of its own parts
+        // of a slot of each of its layers, its buffers at the tail's end - k the most any member needs (tp_tail_k)
+        for (size_t gi = 0; gi < groups.size() && chunk > 0; ++gi) {
+            std::vector<int> mems;
+            for (int m : groups[gi].mem)
+                if ((size_t) m < chunks.size() && chunks[(size_t) m] != nullptr && chunks[(size_t) m]->tp_lend)
+                    mems.push_back(m);
+            if (mems.empty()) continue;
+            std::vector<size_t> step(mems.size(), 0), need(mems.size(), 0);
+            int min_slots = 1 << 30;
+            for (const Layer& l : L) {
+                if (l.grp != (int) gi || l.mtp) continue;
+                min_slots = std::min(min_slots, std::min(l.n_vram, l.n_exp));
+                for (int m = 0; m < l.nm; ++m)
+                    for (size_t i = 0; i < mems.size(); ++i)
+                        if (member(l, m).dev == mems[i]) step[i] += align256(unit(member(l, m)));
+            }
+            const auto needs = [&](int C) {
+                for (size_t i = 0; i < mems.size(); ++i) need[i] = lay_chunk(*chunks[(size_t) mems[i]], C, nullptr, 2);
+            };
+            needs(chunk);
+            const int k = tp_tail_k(need, step, min_slots - 1);
+            if (k > 0 && !tp_tail_fits(need, step, k)) {   // (few VRAM slots a layer: chunks the tails hold)
+                int c2 = chunk;
+                while (c2 > 256 && !tp_tail_fits(need, step, k)) {
+                    c2 = (c2 - 1) / 256 * 256;
+                    needs(c2);
+                }
+                if (tp_tail_fits(need, step, k)) {
+                    std::fprintf(stderr, "ds4: CUDA%d's tensor-parallel group lends the prompt path room for chunks of "
+                                         "%d tokens (not %d): %d VRAM experts a layer (DS4_TP_BORROW)\n",
+                                 devs[(size_t) mems[0]].id, c2, chunk, min_slots);
+                    chunk = c2;
+                }
+            }
+            if (k <= 0 || !tp_tail_fits(need, step, k)) {
+                std::fprintf(stderr, "ds4: CUDA%d's tensor-parallel group keeps too few experts in VRAM (%d a layer) "
+                                     "to lend the prompt path its room: prompts in windows of %d (DS4_TP_BORROW)\n",
+                             devs[(size_t) mems[0]].id, min_slots, kWin);
+                chunk = 0;
+                for (int& t : n_tail) t = 0;
+                break;
+            }
+            for (size_t i = 0; i < mems.size(); ++i) {
+                Dev& d = devs[(size_t) mems[i]];
+                cudaSetDevice(d.id);
+                const size_t cap = (size_t) k * step[i];
+                uint8_t* t = nullptr;
+                if (!dalloc(d, t, cap, err)) return false;
+                d.tail = t;
+                d.tail_bytes = cap;
+                d.tail_step = step[i];
+                d.tail_k = k;
+                d.experts += cap;
+                size_t xoff = 0;
+                for (Layer& l : L) {
+                    if (l.grp != (int) gi || l.mtp) continue;
+                    for (int m = 0; m < l.nm; ++m) {
+                        Layer& x = member(l, m);
+                        if (x.dev != mems[i]) continue;
+                        x.xbase = t + xoff;
+                        x.xstep = step[i];
+                        xoff += align256(unit(x));
+                        n_tail[(size_t) (&l - &L[0])] = k;
+                    }
+                }
+                std::fprintf(stderr, "ds4: CUDA%d lends the prompt path up to %.2f GB of its experts' VRAM (%d slots a "
+                                     "layer, its part of each) while a prompt runs: chunks of up to %d tokens "
+                                     "(DS4_TP_BORROW)\n", d.id, cap / 1e9, k, chunk);
+            }
         }
         for (Layer& l : L) {
             // the hottest experts of the profile first, then by index
@@ -13646,22 +13791,56 @@ struct Model::Impl {
         if (!any) return true;
         cache_drain();
         if (ln_one || ln_land) rc_drain();   // (the one-GPU path's; elsewhere v1.1.27's: no wait)
+        bool tp = false;   // (DS4_TP_BORROW: a group's layer keeps the fewest of its members' slots - from all of them)
+        for (const auto& cp : chunks) tp = tp || (cp != nullptr && cp->tp_lend);
+        // (every lending device's room first, before any is touched: a refusal leaves every slot as it was)
+        for (size_t di = 0; di < chunks.size(); ++di) {
+            if (chunks[di] == nullptr || !chunks[di]->borrow) continue;
+            const Dev& d = devs[di];
+            const size_t need = lay_chunk(*chunks[di], C, nullptr, 2);
+            if (d.tail == nullptr || !chunks[di]->flow || need + 256 > d.tail_bytes) {   // (only the flow streams them)
+                err = "the prompt path's room on CUDA" + std::to_string(d.id) + ": " + std::to_string(need >> 20) +
+                      " MiB for chunks of " + std::to_string(C) + " tokens, " + std::to_string(d.tail_bytes >> 20) +
+                      " lent";
+                return false;
+            }
+        }
+        if (tp)
+            for (Layer& l : L) l.pv_n = l.n_slots;
         for (size_t di = 0; di < chunks.size(); ++di) {
             if (chunks[di] == nullptr || !chunks[di]->borrow) continue;
             Dev& d = devs[di];
             Chunk& c = *chunks[di];
             const size_t need = lay_chunk(c, C, nullptr, 2);
-            if (d.tail == nullptr || !c.flow || need + 256 > d.tail_bytes) {   // (only the flow streams the lent ones)
-                err = "the prompt path's room on CUDA" + std::to_string(d.id) + ": " + std::to_string(need >> 20) +
-                      " MiB for chunks of " + std::to_string(C) + " tokens, " + std::to_string(d.tail_bytes >> 20) + " lent";
-                return false;
-            }
             const size_t b0 = (d.tail_bytes - need) & ~(size_t) 255;
             lay_chunk(c, C, d.tail + b0, 2);
             c.C = C;
-            cudaSetDevice(d.id);
-            CK(cudaMemsetAsync(d.tail + b0, 0, d.tail_bytes - b0, d.st));
-            CK(cudaStreamSynchronize(d.st));
+            // (the clear writes over slots still mapped: a failure leaves them unknown - sticky, no later request runs;
+            //  a device lent before this one is handed back by the caller's guard)
+            cudaError_t e = cudaSetDevice(d.id);
+            if (e == cudaSuccess) e = cudaMemsetAsync(d.tail + b0, 0, d.tail_bytes - b0, d.st);
+            if (e == cudaSuccess) e = cudaStreamSynchronize(d.st);
+            if (e != cudaSuccess) {
+                lend_broken = true;
+                err = std::string("the prompt path's room on CUDA") + std::to_string(d.id) + ": " +
+                      cudaGetErrorString(e) + " - " + kLendBroken;
+                std::fprintf(stderr, "ds4: %s - the device's state unknown; no further request runs\n", err.c_str());
+                return false;
+            }
+            if (c.tp_lend) {   // (DS4_TP_BORROW) its parts of the slots under its buffers; the group keeps the fewest
+                for (Layer& l : L) {
+                    if (l.mtp || l.n_main >= l.n_slots) continue;
+                    for (int m = 0; m < l.nm; ++m) {
+                        const Layer& x = member(l, m);
+                        if (x.dev != (int) di) continue;
+                        const int keep = tail_keep((size_t) (x.xbase - d.tail), align256(unit(x)), d.tail_step, b0,
+                                                   l.n_slots - l.n_main);
+                        l.pv_n = std::min(l.pv_n, l.n_main + keep);
+                    }
+                }
+                lent = true;
+                continue;
+            }
             for (Layer& l : L) {
                 if (l.dev != (int) di || l.mtp || l.n_main >= l.n_slots) continue;
                 const size_t off = (size_t) (l.xbase - d.tail), u = align256(unit(l));
@@ -13675,14 +13854,29 @@ struct Model::Impl {
     }
     // after the run (every device done with its buffers): the experts under them read back into their slots, in file
     // order by a few threads - one that cannot be read leaves VRAM for the CPU lane (the decode finds every other one
-    // where it was)
-    void borrow_end() {
-        if (!lent) return;
+    // where it was).  false: DS4_CHECK_LEND found a part read back different from the file - those experts went to the
+    // CPU lane too (nothing reads those slots), and the caller fails the prompt before any decode - or a device
+    // selection, sync, copy into a slot or table write failed: lend_broken (sticky), no later request runs
+    bool borrow_end() {
+        if (!lent) return true;
         lent = false;
-        for (size_t di = 0; di < devs.size(); ++di) {
-            cudaSetDevice(devs[di].id);
-            cudaStreamSynchronize(devs[di].st);
-            if (di < chunks.size() && chunks[di] != nullptr && chunks[di]->cs != nullptr) cudaStreamSynchronize(chunks[di]->cs);
+        std::atomic<bool> broken{false};   // (a runtime failure: the expert tables can no longer be vouched for)
+        std::string why;
+        for (size_t di = 0; di < devs.size() && !broken; ++di) {
+            cudaError_t e = cudaSetDevice(devs[di].id);
+            if (e == cudaSuccess) e = cudaStreamSynchronize(devs[di].st);
+            if (e == cudaSuccess && di < chunks.size() && chunks[di] != nullptr && chunks[di]->cs != nullptr)
+                e = cudaStreamSynchronize(chunks[di]->cs);
+            if (e != cudaSuccess) {
+                broken = true;
+                why = "CUDA" + std::to_string(devs[di].id) + "'s streams: " + cudaGetErrorString(e);
+            }
+        }
+        if (broken) {   // (the devices may still use the buffers: nothing is read back over them)
+            lend_broken = true;
+            std::fprintf(stderr, "ds4: the prompt path's room was not handed back (%s) - the device's state unknown; "
+                                 "no further request runs\n", why.c_str());
+            return false;
         }
         struct Job {
             int layer, e;
@@ -13694,7 +13888,7 @@ struct Model::Impl {
                     if (l.slot[(size_t) e] >= l.pv_n) jobs.push_back({l.il, e});
             l.pv_n = l.n_slots;
         }
-        if (jobs.empty()) return;
+        if (jobs.empty()) return true;
         std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
             const Layer &la = L[(size_t) a.layer], &lb = L[(size_t) b.layer];
             if (la.mx_file[0] != lb.mx_file[0]) return la.mx_file[0] < lb.mx_file[0];
@@ -13710,12 +13904,25 @@ struct Model::Impl {
             host_allocs.push_back(p);
             rf_stage.push_back(p);
         }
+        // (DS4_TP_BORROW: a group's layer's expert read once, each member's part of it split off into a second pinned
+        //  staging and copied into that member's slot - as the load and the cache's swaps do)
+        bool tp = false;
+        for (const Job& j : jobs) tp = tp || L[(size_t) j.layer].nm > 1;
+        while (tp && rf_half.size() < rf_stage.size()) {
+            uint8_t* p = nullptr;
+            if (cudaHostAlloc((void**) &p, rf_bytes, cudaHostAllocPortable) != cudaSuccess) break;
+            host_allocs.push_back(p);
+            rf_half.push_back(p);
+        }
+        const size_t n_th = tp ? std::min(rf_stage.size(), rf_half.size()) : rf_stage.size();
+        std::vector<std::atomic<size_t>> dev_bytes(devs.size());   // (each device's parts read back)
+        for (auto& b : dev_bytes) b.store(0);
         std::atomic<size_t> next{0};
         std::atomic<int> differ{0};
         static const bool check = std::getenv("DS4_CHECK_LEND") != nullptr;   // (each one read back, against the file)
         std::vector<char> bad(jobs.size(), 0);
         std::vector<std::thread> th;
-        for (int t = 0; t < (int) rf_stage.size(); ++t)
+        for (int t = 0; t < (int) n_th; ++t)
             th.emplace_back([&, t] {
                 uint8_t* stage = rf_stage[(size_t) t];
                 std::vector<uint8_t> back;
@@ -13724,15 +13931,51 @@ struct Model::Impl {
                     if (i >= jobs.size()) break;
                     const Layer& l = L[(size_t) jobs[i].layer];
                     const int e = jobs[i].e;
-                    cudaSetDevice(devs[(size_t) l.dev].id);
-                    bad[i] = !(l.blob <= rf_bytes && read_mx_file(l, e, stage) &&
-                               cudaMemcpy(sat(l, l, l.slot[(size_t) e], l.blob), stage, l.blob, cudaMemcpyHostToDevice) ==
-                                   cudaSuccess);
+                    if (l.nm > 1) {   // (DS4_TP_BORROW) each member its part
+                        uint8_t* half = rf_half[(size_t) t];
+                        bool ok = l.blob <= rf_bytes && read_mx_file(l, e, stage), same = true;
+                        const bool read = ok;   // (a read that fails: the CPU lane takes it - the file has it)
+                        for (int m = 0; m < l.nm && ok; ++m) {
+                            const Layer& x = member(l, m);
+                            blob_to_half(l, stage, m, half);
+                            ok = cudaSetDevice(devs[(size_t) x.dev].id) == cudaSuccess &&
+                                 cudaMemcpy(sat(l, x, l.slot[(size_t) e], unit(x)), half, unit(x),
+                                            cudaMemcpyHostToDevice) == cudaSuccess;
+                            if (!ok) broken = true;   // (a runtime failure, not the file's: the slot's bytes unknown)
+                            if (ok) dev_bytes[(size_t) x.dev].fetch_add(unit(x));
+                            if (ok && check) {
+                                back.resize(unit(x));
+                                const bool got = cudaMemcpy(back.data(), sat(l, x, l.slot[(size_t) e], unit(x)),
+                                                            unit(x), cudaMemcpyDeviceToHost) == cudaSuccess;
+                                if (!got) broken = true;   // (the read back failed: a runtime failure)
+                                if (!got || std::memcmp(back.data(), half, unit(x)) != 0) {
+                                    differ.fetch_add(1);
+                                    same = false;
+                                }
+                            }
+                        }
+                        bad[i] = !read || !ok || !same;   // (a part that differs: to the CPU lane, as a failed read)
+                        if (ok && same)   // (one copy of it: in VRAM again)
+                            for (int r = 0; r < 3; ++r)
+                                os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r],
+                                           mx_part_bytes(l, r), false);
+                        continue;
+                    }
+                    const bool read = l.blob <= rf_bytes && read_mx_file(l, e, stage);
+                    const bool put = read && cudaSetDevice(devs[(size_t) l.dev].id) == cudaSuccess &&
+                                     cudaMemcpy(sat(l, l, l.slot[(size_t) e], l.blob), stage, l.blob,
+                                                cudaMemcpyHostToDevice) == cudaSuccess;
+                    if (read && !put) broken = true;   // (a runtime failure, not the file's)
+                    bad[i] = !put;
                     if (check && !bad[i]) {
                         back.resize(l.blob);
-                        if (cudaMemcpy(back.data(), sat(l, l, l.slot[(size_t) e], l.blob), l.blob, cudaMemcpyDeviceToHost) !=
-                                cudaSuccess || std::memcmp(back.data(), stage, l.blob) != 0)
+                        const bool got = cudaMemcpy(back.data(), sat(l, l, l.slot[(size_t) e], l.blob), l.blob,
+                                                    cudaMemcpyDeviceToHost) == cudaSuccess;
+                        if (!got) broken = true;   // (the read back failed: a runtime failure)
+                        if (!got || std::memcmp(back.data(), stage, l.blob) != 0) {
                             differ.fetch_add(1);
+                            bad[i] = 1;   // (to the CPU lane, as a failed read)
+                        }
                     }
                     if (!bad[i])   // (one copy of it: in VRAM again)
                         for (int r = 0; r < 3; ++r)
@@ -13746,22 +13989,54 @@ struct Model::Impl {
             Layer& l = L[(size_t) jobs[i].layer];
             const int e = jobs[i].e;
             bytes += l.blob;
-            if (!bad[i] && !rf_stage.empty()) continue;
+            if (!bad[i] && n_th > 0) continue;
             ++n_bad;   // (to the CPU lane: the file has it)
             l.slot[(size_t) e] = -1;
             l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
             --l.n_vram;
             const unsigned long long zero = 0;
-            cudaSetDevice(devs[(size_t) l.dev].id);
-            cudaMemcpy(l.vram_tab + e, &zero, 8, cudaMemcpyHostToDevice);
+            for (int m = 0; m < l.nm; ++m) {   // (a group's: every member's table - DS4_TP_BORROW)
+                const Layer& x = member(l, m);
+                if (cudaSetDevice(devs[(size_t) x.dev].id) != cudaSuccess ||
+                    cudaMemcpy(x.vram_tab + e, &zero, 8, cudaMemcpyHostToDevice) != cudaSuccess)
+                    broken = true;   // (the device's table may still name the slot)
+            }
         }
         lent_experts += (int64_t) jobs.size();
         lent_ms += now_ms() - t0;
-        if (o.verbose || n_bad > 0 || check)
+        if (tp) {   // (DS4_TP_BORROW: always - the decode after a prompt waits for it, so its cost is a reading)
+            std::string per;
+            for (size_t di = 0; di < devs.size(); ++di)
+                if (dev_bytes[di].load() > 0) {
+                    char b[64];
+                    std::snprintf(b, sizeof b, "%sCUDA%d %.2f GB", per.empty() ? "" : ", ", devs[di].id,
+                                  dev_bytes[di].load() / 1e9);
+                    per += b;
+                }
+            std::fprintf(stderr, "ds4: the prompt path's room handed back: %zu experts (%.2f GB from the files; %s of "
+                                 "their parts) read into VRAM again in %.0f ms (DS4_TP_BORROW)%s%s\n",
+                         jobs.size(), bytes / 1e9, per.empty() ? "none" : per.c_str(), now_ms() - t0,
+                         n_bad > 0 ? (", " + std::to_string(n_bad) + " of them not (to the CPU lane)").c_str() : "",
+                         check ? (differ.load() == 0 ? "; each part matches the model file"
+                                                     : ("; MISMATCH: " + std::to_string(differ.load()) +
+                                                        " parts differ - their experts to the CPU lane").c_str())
+                               : "");
+        } else if (o.verbose || n_bad > 0 || check) {
             std::fprintf(stderr, "ds4: the prompt path's room handed back: %zu experts (%.2f GB) read into VRAM again in %.0f ms%s%s\n",
                          jobs.size(), bytes / 1e9, now_ms() - t0,
                          n_bad > 0 ? (", " + std::to_string(n_bad) + " of them not (to the CPU lane)").c_str() : "",
-                         check ? (differ.load() == 0 ? "; each matches the model file" : "; MISMATCH") : "");
+                         check ? (differ.load() == 0 ? "; each matches the model file"
+                                                     : ("; MISMATCH: " + std::to_string(differ.load()) +
+                                                        " differ - to the CPU lane").c_str())
+                               : "");
+        }
+        if (broken) {
+            lend_broken = true;
+            std::fprintf(stderr, "ds4: the prompt path's room: a copy into a slot or a table write failed - the "
+                                 "device's state unknown; no further request runs\n");
+            return false;
+        }
+        return differ.load() == 0;
     }
 
     // after a prompt of n tokens on the prompt path (DS4_WARM_MIN, 512, or more): the experts its last rows picked
@@ -13856,6 +14131,19 @@ struct Model::Impl {
         return G.mem[0];
     }
     std::atomic<bool> eg_abort{false};   // (a device's run failed: the Engram waits end)
+    // DS4_YOCO_TP=1: the skip on the flow too for one tensor-parallel group that holds every trunk layer, the cut
+    // anywhere in a chunk as on one GPU.  Each member computes the yoco layer's compressed KV and index keys over the
+    // chunk's rows itself (its own copy: no member hands them to another within the group), every all-reduce is one
+    // (chunk, layer)'s and runs on every member alike, and the skip leaves out the same (chunk, layer)s and the same
+    // cut chunk's rows on each - so the members' all-reduces stay paired, and the flow plans nothing for a skipped
+    // (chunk, layer) (flow_next, fl_rows) as on one GPU.  Off: a group on the flow never skips, as before
+    static bool yoco_tp() {
+        static const bool on = [] {
+            const char* e = ds4_env("DS4_YOCO_TP");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        return on;
+    }
     // every trunk layer on one GPU: the cut anywhere in a chunk (Run::cut_r); else at a chunk's start (the sources'
     // rows and the hand-offs between groups go chunk by chunk)
     bool yoco_one_gpu() const {
@@ -13870,6 +14158,15 @@ struct Model::Impl {
             if (L[(size_t) il].nm != 1 || (il >= yl && L[(size_t) il].dev != L[(size_t) yl].dev)) return false;
         return true;
     }
+    // one tensor-parallel group that holds every trunk layer, under DS4_YOCO_TP (yoco_tp): the skip on the flow too
+    bool yoco_tp_group() const {
+        if (!yoco_tp() || L[0].nm < 2) return false;
+        for (int il = 0; il < g.nl; ++il) {
+            const Layer& l = L[(size_t) il];
+            if (l.nm != L[0].nm || l.grp != L[0].grp || l.dev != L[0].dev) return false;
+        }
+        return true;
+    }
     int yoco_layer() const {
         if (yoco_mode() == 0 || chunk <= 0 || g.nl < 2 || (int) g.ratios.size() < g.nl) return -1;
         int yl = -1;
@@ -13877,8 +14174,9 @@ struct Model::Impl {
             if (g.ratios[(size_t) il] == 1) yl = il;
         if (yl <= 0 || !L[(size_t) yl].kv_src) return -1;
         const bool one = yoco_one_gpu(), suffix = !one && yoco_suffix_gpu(yl);
+        const bool tp = !one && !suffix && yoco_tp_group();   // (DS4_YOCO_TP: the flow too)
         for (const auto& c : chunks)
-            if (!one && !suffix && c != nullptr && c->flow) return -1;
+            if (!one && !suffix && !tp && c != nullptr && c->flow) return -1;
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
             if (il > yl && (g.ratios[(size_t) il] != 1 || l.kv_src)) return -1;
@@ -13890,6 +14188,10 @@ struct Model::Impl {
     // n tokens at positions pos .. in chunks of equal size (at most `chunk`), pipelined over the groups; the logits of
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
+        if (lend_broken) {
+            err = kLendBroken;
+            return false;
+        }
         if (n < 1) return true;
         if (pos + n > o.max_context) {
             err = "the context is full";
@@ -13908,8 +14210,9 @@ struct Model::Impl {
         // kv_only, the cut's chunk through those over all its rows and through the rest from the cut on (Run::r0, a
         // view of its buffers), the chunks after it through every layer - each layer's experts read as without the
         // skip.  On several GPUs the rows before the cut and the rows from it on are chunked apart (the cut a chunk's
-        // start: chunk cut_k's rows go to the other groups whole); with the suffix on one GPU of a layer split, as on one
-        // GPU.  DS4_YOCO=1 (0: off); not with every row's logits (tests)
+        // start: chunk cut_k's rows go to the other groups whole); with the suffix on one GPU of a layer split, or one
+        // tensor-parallel group under DS4_YOCO_TP (yoco_tp_group), as on one GPU.  DS4_YOCO=1 (0: off); not with every
+        // row's logits (tests)
         const int yl = logits_rows > kWin ? -1 : yoco_layer();
         // (DS4_YOCO_KEEP=<rows>: fewer - DeepSeek's own serving replays the last 128 tokens through those layers
         //  (DeepInfer's "SWA bounded replay"), which shifts the answers a little; at least one window)
@@ -13918,7 +14221,15 @@ struct Model::Impl {
                          : keep_env > 0 ? std::max(keep_env, g.win)
                          : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
         const int a = yl > 0 && n - keep >= kYocoMin ? n - keep : 0;
-        const bool cut_rows = a > 0 && (yoco_one_gpu() || yoco_suffix_gpu(yl));
+        const bool cut_rows = a > 0 && (yoco_one_gpu() || yoco_suffix_gpu(yl) || yoco_tp_group());
+        if (a > 0 && yoco_tp_group()) {   // (DS4_YOCO_TP: once)
+            static bool said = false;
+            if (!said)
+                std::fprintf(stderr, "ds4: a long prompt's skip on the tensor-parallel group of %d (lead CUDA%d): "
+                                     "layers %d-%d (DS4_YOCO_TP)\n",
+                             L[0].nm, devs[(size_t) L[0].dev].id, yl, g.nl - 1);
+            said = true;
+        }
         Run run;
         int per = 0;   // (the widest chunk)
         auto part = [&](int a0, int a1) {   // rows [a0, a1) in equal chunks of at most `chunk`
@@ -13955,11 +14266,11 @@ struct Model::Impl {
             ctoks.push_back(ctok(pos + t, tk[t]));
         }
         warm_end();   // (the last prompt's warm-up: this one streams what it needs)
-        if (!borrow_begin(per, err)) return false;
-        struct Lent {   // (every way out: the room handed back once the devices are done with it)
+        struct Lent {   // (every way out, a failed borrow_begin's too: the room handed back once the devices are done)
             Impl* p;
-            ~Lent() { p->borrow_end(); }
+            ~Lent() { (void) p->borrow_end(); }   // (an early way out already fails the prompt)
         } lent_{this};
+        if (!borrow_begin(per, err)) return false;
         plan_streams();
         if (snap_slot >= 0) {   // feed_mark: the state before the run's last row, kept by its layers on the way
             run.snap_pos = pos + n - 1;
@@ -14150,7 +14461,13 @@ struct Model::Impl {
                 err = "stopped while reading the prompt";
                 return false;
             }
-        borrow_end();   // (before the cache looks at the slots again)
+        // (before the cache looks at the slots again; no decode after a mismatch or a failure)
+        if (!borrow_end()) {
+            err = lend_broken ? std::string(kLendBroken)
+                              : "DS4_CHECK_LEND: an expert part handed back to VRAM differs from the model file - the "
+                                "prompt is not answered (those experts went to the CPU lane)";
+            return false;
+        }
         st.layer_ms += now_ms() - tl;
         eg_stats();
         Dev& d = devs[(size_t) head_dev];
@@ -14390,6 +14707,10 @@ struct Model::Impl {
     }
 
     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+        if (lend_broken) {
+            err = kLendBroken;
+            return false;
+        }
         if (T < 1 || T > kWin) {
             err = "a window of " + std::to_string(T) + " tokens";
             return false;
