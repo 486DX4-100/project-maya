@@ -30,6 +30,11 @@ MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --k
 # files the setup's quant list (tools/maya_quants.py) does not name, by their config's installer key
 OTHER_QUANTS = {("deepseek", "abliterated"): "Mix-256G"}
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# variables that change which code the engine's process loads or runs (a library preloaded, the program search path):
+# never set or changed from the page - with remote access on, the page is a network client; a config's own are kept
+SECRET = re.compile(r"key|token|secret|password", re.I)   # (the server's report: the same names left out)
+MASK = "***"
+ENV_LOADER = re.compile(r"^(?:LD_\w*|DYLD_\w*|PYTHON\w*|PATH|PATHEXT|BASH_ENV|ENV|IFS|COMSPEC|SYSTEMROOT)$", re.I)
 GLM_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "expert_cache", "prefill",
             "kv_streaming", "kv_resident")
 DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "tp", "mmap", "prefill_chunk", "cpu_threads")
@@ -180,8 +185,19 @@ def settings_of(cfg: dict) -> dict:
     out.update(images=bool(cfg.get("vision")), reserve_mib=_int(flag(args, "--vram-reserve-mib")),
                parallel=_int(flag(args, "--parallel"), 1), draft="dflash2" if flag(args, "--dflash") else "mtp",
                expert_cache=None if ec == "auto" else _int(ec), prefill=None if pf == "auto" else _int(pf),
-               kv_streaming=flag(args, "--kv-streaming", "on") != "off", kv_resident=_int(flag(args, "--kv-resident")))
+               kv_streaming=glm_streams(cfg), kv_resident=_int(flag(args, "--kv-resident")))
     return out
+
+
+def glm_streams(cfg: dict) -> bool:
+    """GLM's KV streaming as the engine runs it: --kv-streaming on/off, else only a window given (--kv-resident or the
+    environment's GLM_KV_RESIDENT) streams - a config from before the flag keeps every cell in VRAM."""
+    args, env = cfg.get("args") or [], cfg.get("env") or {}
+    kvs = flag(args, "--kv-streaming")
+    if kvs is not None:
+        return kvs != "off"
+    return (_int(flag(args, "--kv-resident"), 0) or 0) > 0 or \
+        (_int(env.get("MAYA_GLM_KV_RESIDENT") or env.get("STRATA_GLM_KV_RESIDENT"), 0) or 0) > 0
 
 
 def _num(s: dict, key: str, lo: int, hi: int, what: str, none_ok: bool = True):
@@ -232,6 +248,11 @@ def apply(cfg: dict, settings: dict) -> dict:
             continue
         if not ENV_NAME.match(k):
             raise ValueError(f"Environment: {k!r} is not a variable name (letters, digits and _)")
+        if str(v) == MASK and SECRET.search(k) and k in (cfg.get("env") or {}):
+            v = (cfg.get("env") or {})[k]                # (the page's mask of a secret: its value as it was)
+        if ENV_LOADER.match(k) and str((cfg.get("env") or {}).get(k)) != str(v):
+            raise ValueError(f"Environment: {k} changes which programs or libraries the engine loads - not from the "
+                             "page (the setup's --env sets it)")
         clean[k] = str(v)
     if clean:
         out["env"] = clean
@@ -306,11 +327,16 @@ def apply(cfg: dict, settings: dict) -> dict:
             out["vision_off"] = out.pop("vision")       # (kept, so Images can be switched on again)
         args = set_flag(args, "--vram-reserve-mib", reserve) if reserve is not None else \
             drop_flag(args, "--vram-reserve-mib")
+        # (a flag the config does not have is written only when its value changes: a config from an older setup, run
+        #  by the engine it was built with, keeps its command - that engine may not know the newer flags)
         ec = _num(s, "expert_cache", 1, 1000000, "Expert cache")
-        args = set_flag(args, "--expert-cache", "auto" if ec is None else ec)
+        if ec is not None or "--expert-cache" in args:
+            args = set_flag(args, "--expert-cache", "auto" if ec is None else ec)
         pf = _num(s, "prefill", 64, 65536, "Prompt chunk")
-        args = set_flag(args, "--prefill", "auto" if pf is None else pf)
-        args = set_flag(args, "--kv-streaming", "on" if s.get("kv_streaming") else "off")
+        if pf is not None or "--prefill" in args:
+            args = set_flag(args, "--prefill", "auto" if pf is None else pf)
+        if "--kv-streaming" in args or bool(s.get("kv_streaming")) != glm_streams(cfg):
+            args = set_flag(args, "--kv-streaming", "on" if s.get("kv_streaming") else "off")
         kr = _num(s, "kv_resident", 1024, 1048576, "Positions kept in VRAM")
         args = set_flag(args, "--kv-resident", kr) if kr is not None and s.get("kv_streaming") else \
             drop_flag(args, "--kv-resident")
@@ -318,10 +344,20 @@ def apply(cfg: dict, settings: dict) -> dict:
     return out
 
 
+def shown_env(env: dict | None) -> dict:
+    """A config's environment as the page gets it: a secret's value (a name with key, token, secret or password in it,
+    as the server's report leaves them out) masked - a save that sends the mask back keeps the config's value."""
+    return {str(k): (MASK if SECRET.search(str(k)) and str(v) else str(v)) for k, v in (env or {}).items()}
+
+
+def shown_settings(cfg: dict) -> dict:
+    return {**settings_of(cfg), "env": shown_env(cfg.get("env"))}
+
+
 def command(cfg: dict) -> dict:
-    """What the config runs: the engine, its arguments and its environment (the page's preview)."""
+    """What the config runs: the engine, its arguments and its environment (the page's preview, secrets masked)."""
     return {"exe": Path(str(cfg.get("exe") or "maya")).name, "args": [str(a) for a in cfg.get("args") or []],
-            "env": {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}}
+            "env": shown_env(cfg.get("env"))}
 
 
 # ------------------------------------------------------------------ the list
@@ -395,13 +431,15 @@ def describe(path: Path, running: str | None) -> dict:
         used = path.stat().st_mtime
     except OSError:
         used = None
-    cur = settings_of(cfg)
+    cur = shown_settings(cfg)
+    setup = dict(inst.get("as_set_up") or cur)
+    setup["env"] = shown_env(setup.get("env"))
     return {"file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
             "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),
             "used": used, "running": running is not None and str(path.resolve()) == str(Path(running).resolve()),
             "port": cfg.get("port"), "script": script, "folder": str(pack.parent) if pack else None,
             "size": folder_size(pack), "ok": why is None, "missing": why,
-            "settings": cur, "setup": inst.get("as_set_up") or cur, "choices": choices(cfg), "command": command(cfg),
+            "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
             "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS}.get(family(cfg), CONTEXTS)}
 
 

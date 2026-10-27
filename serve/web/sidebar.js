@@ -12,7 +12,8 @@ export const openSettings = (section = "general") => { S.settings = section; S.d
 export const setSide = (open) => { S.sideOpen = open; store.set("side-open", open); emit(); };
 
 // ------------------------------------------------------------------ the model's status, in words and a tone
-export function status() {
+// plain: the state alone - on the Monitor, whose hero and Context card show the speed and the context (every figure once)
+export function status(plain = false) {
   const m = S.metrics, live = (m && m.live) || {};
   const ctx = S.health.max_context ? `${ctxfmt(S.health.max_context)} context` : "";
   if (S.conn === "down") return {tone: "danger", text: "Server not reachable"};
@@ -22,14 +23,14 @@ export function status() {
   if (!m) return {tone: "muted", text: "Connecting…"};
   if (live.queued > 0) return {tone: "warn", text: `${live.queued} queued`};
   if (live.state === "reading") {
-    const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
+    const pct = live.prompt_total && !plain ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
     return {tone: "info", text: pct != null ? `Reading · ${pct}%` : "Reading"};
   }
   if (live.state === "generating") {
-    const many = live.active > 1 ? ` · ${live.active} at once` : "";   // (--parallel: answers written together)
-    return {tone: "accent", text: (live.tok_s ? `Writing · ${fmt(live.tok_s, 1)} tok/s` : "Writing") + many};
+    const many = live.active > 1 && !plain ? ` · ${live.active} at once` : "";   // (--parallel: answers written together)
+    return {tone: "accent", text: (live.tok_s && !plain ? `Writing · ${fmt(live.tok_s, 1)} tok/s` : "Writing") + many};
   }
-  return {tone: "muted", text: ["Idle", ctx].filter(Boolean).join(" · ")};
+  return {tone: "muted", text: ["Idle", plain ? "" : ctx].filter(Boolean).join(" · ")};
 }
 
 // ------------------------------------------------------------------ a chat's ⋯ menu (in the sidebar and the header)
@@ -191,7 +192,7 @@ function SavedLine() {
 }
 
 function StatusCard() {
-  const st = status();
+  const st = status(S.view === "monitor");
   // the model with its files when the setup wrote the config ("MiniMax M3.1 · Maya-XS": the server's model_label)
   const name = S.health.model_label || modelName(S.health.model);
   return html`<div class="side__foot">

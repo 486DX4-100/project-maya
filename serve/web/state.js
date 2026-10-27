@@ -117,6 +117,18 @@ export function setTheme(c) {
   emit();
 }
 matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { if (themeChoice() === "system") applyTheme(); });
+// the colours, in either theme: "default" (neutral greys, violet the accent) or "violet" (violet-tinted surfaces and a soft
+// glow, the earlier dashboard's look) - saved as "maya.scheme" in this browser; <html data-scheme="violet"> (tokens.css)
+export function schemeChoice() { try { return localStorage.getItem("maya.scheme") === "violet" ? "violet" : "default"; } catch (e) { return "default"; } }
+export function applyScheme() {
+  if (schemeChoice() === "violet") document.documentElement.dataset.scheme = "violet";
+  else delete document.documentElement.dataset.scheme;
+}
+export function setScheme(c) {
+  try { if (c === "violet") localStorage.setItem("maya.scheme", c); else localStorage.removeItem("maya.scheme"); } catch (e) { /* ignore */ }
+  applyScheme();
+  emit();
+}
 
 // ------------------------------------------------------------------ the chat settings (each model keeps its own)
 // thinking: GLM's own levels - none (Off), low, high, max - and DeepSeek's by the same names; MiniMax-M3.1's: Off, Auto

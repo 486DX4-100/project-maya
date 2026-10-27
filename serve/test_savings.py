@@ -30,6 +30,10 @@ class Prices(unittest.TestCase):
     def test_references(self):
         self.assertEqual(SV.reference("deepseek-v4.1-flash")["api"], "DeepSeek")
         self.assertEqual(SV.reference("glm-5.3-flash")["output"], 0.50)
+        mm = SV.reference("minimax-m3.1-flash")                       # (MiniMax's: flat, no peak hours)
+        self.assertEqual((mm["api"], mm["input"], mm["cached"], mm["output"], mm.get("peak")),
+                         ("MiniMax", 0.15, 0.015, 0.60, None))
+        self.assertEqual(SV.reference("MiniMax-M3.1-Flash")["api"], "MiniMax")
         self.assertIsNone(SV.reference("qwen3.8-flash-next"))
 
     def test_peak_hours(self):

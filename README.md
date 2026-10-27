@@ -241,7 +241,7 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
   each GPU's memory), a context size and port you can change in Settings, and **Models**: every model set up on
   this machine, switching to another (Maya starts again with it) and each one's engine settings (context, GPUs,
   drafting, images, memory), saved into its `maya-<model>.json`. The sidebar's **Saved** line adds up what the model's
-  own API (DeepSeek's or Z.ai's) would have charged for the same tokens - the prompt Maya reuses from its cache at the
+  own API (DeepSeek's, Z.ai's or MiniMax's) would have charged for the same tokens - the prompt Maya reuses from its cache at the
   API's cached price, DeepSeek's peak hours at its peak price - kept per model in `token-savings.json`; its prices can
   be changed in **Settings › Savings**.
 - **Your apps and coding agents:** an OpenAI-compatible API at `http://127.0.0.1:8080/v1`, and Anthropic's at
@@ -388,7 +388,8 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
   ([GLM-5.3-Flash-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF) by Anbeeld) is CC BY-NC-ND
   4.0, non-commercial use only, and is downloaded only when you choose it.
 - The dashboard's font: Outfit (SIL Open Font License 1.1, `serve/web/fonts/OFL.txt`); its icons:
-  [Lucide](https://lucide.dev) (ISC License); its UI library: [Preact](https://preactjs.com) (MIT License) with
-  [htm](https://github.com/developit/htm) (Apache License 2.0), bundled in `serve/web/preact.js` with their notices.
+  [Lucide](https://lucide.dev) (ISC License, `serve/web/LICENSE.lucide.txt`); its UI library:
+  [Preact](https://preactjs.com) (MIT License) with [htm](https://github.com/developit/htm) (Apache License 2.0),
+  bundled in `serve/web/preact.js` with their notices.
 - Maya is open source under the [MIT License](LICENSE); the notices of Strata, ggml, exllamav3 and beellama.cpp stay
   with every copy.

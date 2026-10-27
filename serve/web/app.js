@@ -3,7 +3,7 @@
 // in chats.js.
 import {html, render, useEffect} from "./preact.js";
 import {isPhone} from "./lib.js";
-import {S, applyTheme, closeDialog, emit, useStore} from "./state.js";
+import {S, applyScheme, applyTheme, closeDialog, emit, useStore} from "./state.js";
 import {loadHealth, loadMcp, loadUpdate, poll, whenHealth} from "./server.js";
 import {cancelEdit, chatView, focusInput, loadChats, newChat, newChatObj, openChat, resumePending, send, stopAnswer,
         updateCtxMeter} from "./chats.js";
@@ -15,6 +15,7 @@ import {MonitorPage} from "./monitor.js";
 import {ModelsPage} from "./models.js";
 
 applyTheme();
+applyScheme();
 
 function App() {
   useStore();

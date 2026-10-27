@@ -2,9 +2,9 @@
 // (the API prices the sidebar's Saved counts with), Chat defaults (sampling, thinking, shared with other apps), Instructions, Tools (MCP), Connect your tools, Data, About and
 // updates.  A change applies at once; the two that restart the model ask first.
 import {html, useEffect, useRef, useState} from "./preact.js";
-import {MOD, api, ctxfmt, fmt, gb, modelName, store} from "./lib.js";
-import {DEFAULTS, LEVELS, P, PRESETS, S, confirmDialog, copyText, emit, presetOf, savePrefs, setTheme, themeChoice, thinkTitles,
-        toast} from "./state.js";
+import {MOD, api, ctxfmt, fmt, gb, isPhone, modelName, store} from "./lib.js";
+import {DEFAULTS, LEVELS, P, PRESETS, S, confirmDialog, copyText, emit, presetOf, savePrefs, schemeChoice, setScheme, setTheme,
+        themeChoice, thinkTitles, toast} from "./state.js";
 import {usd} from "./sidebar.js";
 import {confirmContext, confirmPort, ctxEstimate, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
         loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
@@ -40,10 +40,14 @@ function General() {
     <${Row} label="Theme" sub="System follows your computer's light or dark setting.">
       <${Seg} label="Theme" value=${themeChoice()} onChange=${setTheme}
         options=${[{id: "system", label: "System"}, {id: "dark", label: "Dark"}, {id: "light", label: "Light"}]}/><//>
+    <${Row} label="Colours" sub="Default: neutral greys with violet as the accent. Violet: violet-tinted surfaces and a soft glow.">
+      <${Seg} label="Colours" value=${schemeChoice()} onChange=${setScheme}
+        options=${[{id: "default", label: "Default"}, {id: "violet", label: "Violet"}]}/><//>
     <${Row} label="Show thinking as it's written" sub="It folds away into “Thought for …” once the answer starts.">
       <${Switch} label="Show thinking as it's written" on=${P.show} onChange=${(v) => savePrefs({show: v})}/><//>
-    <div class="set-block"><span class="set-row__label">Keyboard shortcuts</span>
-      <div class="keys">${keys.map(([w, k]) => html`<span class="keys__row"><span>${w}</span><${Kbd} k=${k}/></span>`)}</div></div>`;
+    ${isPhone() ? null   /* (a phone: Enter is a new line and there are no shortcuts to list) */
+      : html`<div class="set-block"><span class="set-row__label">Keyboard shortcuts</span>
+      <div class="keys">${keys.map(([w, k]) => html`<span class="keys__row"><span>${w}</span><${Kbd} k=${k}/></span>`)}</div></div>`}`;
 }
 
 // ------------------------------------------------------------------ Model: the context size and the port

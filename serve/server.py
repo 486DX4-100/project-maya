@@ -1751,7 +1751,7 @@ class Service:
         self.trained_context = None                      # what the model was trained for (its GGUF): the slider's top
         self.dspark = None                               # DeepSeek's: drafts with its DSpark blocks (its engine's INFO
         #                                                  does not say: the config's --dspark and the pack's drafter)
-        self.reload = None                              # a context change: {state, from, to, started, error}
+        self.reload = None                               # a context change: {state, from, to, started, error}
         # "idle_unload_s" / --idle-unload (as Strata's): after this long without a request the engine ends, giving back
         # its GPU memory and its pinned RAM tier, and the next request starts it again (0: never).  With
         # STRATA_GLM_SLOT_KEEP=1 the conversation in the model is kept on disk across it.
@@ -2134,7 +2134,7 @@ class Service:
             raise ValueError(f"{p.name}: not a config Maya can read")
         new = models.apply(cfg, settings)                 # (a ValueError: what is wrong, nothing saved)
         if dry_run:
-            return {"command": models.command(new), "settings": models.settings_of(new)}
+            return {"command": models.command(new), "settings": models.shown_settings(new)}
         running = self._is_running(p)
         if running:
             self._restart_busy()

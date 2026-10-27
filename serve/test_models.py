@@ -124,6 +124,31 @@ class Settings(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 M.apply(cfg, bad)
 
+    def test_an_older_glm_config_keeps_its_command(self):
+        """A config from before --kv-streaming (no flag: every cell in VRAM) reads as streaming off, and a save writes
+        only what changed - its engine, built with it, may not know the newer flags (a Maya-S v2 setup of 2026-10-10)."""
+        cfg = M.read(glm_cfg(self.d))
+        cfg["args"] = ["--glm-pack", "/m/pack", "--max-context", "32768"]
+        self.assertFalse(M.settings_of(cfg)["kv_streaming"])
+        self.assertTrue(M.settings_of(dict(cfg, env={"STRATA_GLM_KV_RESIDENT": "65536"}))["kv_streaming"])
+        new = M.apply(cfg, {"context": 65536})
+        self.assertEqual(new["args"], ["--glm-pack", "/m/pack", "--max-context", "65536"])
+        on = M.apply(cfg, {"kv_streaming": True})
+        self.assertEqual(M.flag(on["args"], "--kv-streaming"), "on")
+        self.assertNotIn("--expert-cache", on["args"])
+
+    def test_loader_variables_not_from_the_page(self):
+        """LD_PRELOAD, PATH and the like change what the engine's process loads: refused, a config's own kept."""
+        cfg = M.read(glm_cfg(self.d))
+        for k in ("LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "PATH", "Path", "PYTHONPATH", "BASH_ENV"):
+            with self.assertRaises(ValueError, msg=k):
+                M.apply(cfg, {"env": {k: "/tmp/x"}})
+        own = dict(cfg, env={"LD_LIBRARY_PATH": "/opt/rocm/lib"})
+        kept = M.apply(own, {"env": {"LD_LIBRARY_PATH": "/opt/rocm/lib", "MAYA_X": "1"}})
+        self.assertEqual(kept["env"], {"LD_LIBRARY_PATH": "/opt/rocm/lib", "MAYA_X": "1"})
+        with self.assertRaises(ValueError):
+            M.apply(own, {"env": {"LD_LIBRARY_PATH": "/tmp/evil"}})
+
     def test_deepseek_read_and_written(self):
         p = ds4_cfg(self.d)
         cfg = M.read(p)
@@ -248,6 +273,25 @@ class Page(unittest.TestCase):
         s, b = self.req("GET", "/api/models")
         self.assertEqual((s, b["running"], b["restarts"], len(b["models"])), (200, self.cfg.name, False, 2))
         self.assertTrue(next(m for m in b["models"] if m["file"] == self.cfg.name)["running"])
+
+    def test_secrets_in_the_environment_stay_on_this_pc(self):
+        """A config's HF_TOKEN / *_API_KEY reach the page masked (as the report leaves them out); a save that sends the
+        mask back keeps the value, a new value replaces it."""
+        cfg = json.loads(self.cfg.read_text())
+        cfg["env"] = {"HF_TOKEN": "hf_secret", "MAYA_GLM_RAM_HEADROOM_GB": "4"}
+        self.cfg.write_text(json.dumps(cfg))
+        s, b = self.req("GET", "/api/models")
+        self.assertNotIn("hf_secret", json.dumps(b))
+        mine = next(m for m in b["models"] if m["file"] == self.cfg.name)
+        self.assertEqual((mine["settings"]["env"]["HF_TOKEN"], mine["command"]["env"]["HF_TOKEN"]), (M.MASK, M.MASK))
+        s, b = self.req("POST", "/api/models/settings", {"file": self.cfg.name, "dry_run": True,
+                                                         "settings": {"env": mine["settings"]["env"]}})
+        self.assertNotIn("hf_secret", json.dumps(b))
+        s, _ = self.req("POST", "/api/models/settings", {"file": self.cfg.name,
+                                                         "settings": {"context": 65536, "env": mine["settings"]["env"]}})
+        self.assertEqual(json.loads(self.cfg.read_text())["env"]["HF_TOKEN"], "hf_secret")
+        self.req("POST", "/api/models/settings", {"file": self.cfg.name, "settings": {"env": {"HF_TOKEN": "hf_new"}}})
+        self.assertEqual(json.loads(self.cfg.read_text())["env"], {"HF_TOKEN": "hf_new"})
 
     def test_dry_run_saves_nothing(self):
         before = self.cfg.read_text()

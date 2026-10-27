@@ -490,7 +490,7 @@ export function ModelsPage() {
           ${" "}Maya finishes the answer it is writing, then loads the model (a few minutes). This page reloads when it is back.</span></div>` : null}
       ${MS.err && !D ? html`<div class="card mon__wait">${MS.err}</div>`
         : !D ? html`<div class="card mon__wait">Reading the models…</div>`
-        : !D.models.length ? html`<div class="card mon__wait">No model is set up in this folder yet. The setup writes one: <code>./maya.sh --setup</code>.</div>`
+        : !D.models.length ? html`<div class="card mon__wait">No model is set up in this folder yet. The setup writes one: <code>./maya.sh --setup</code> (Windows: <code>START-MAYA.bat --setup</code>)</div>`
         : D.models.map((m) => html`<${Card} m=${m} key=${m.file}/>`)}
       ${D && D.models.length ? html`<p class="mdl-foot"><${Icon} name="info" sm/><span>${D.restarts
         ? "Switching, or saving the running model's engine settings, starts Maya again through its start script, as a port change does. Each model keeps its own chat settings."

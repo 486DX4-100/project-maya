@@ -28,6 +28,9 @@ REFERENCES = [
     {"match": r"deepseek[-_.]?v?4\.1[-_.]?flash|deepseek[-_.]flash", "api": "DeepSeek",
      "input": 0.15, "cached": 0.003, "output": 0.60, "peak": 2.0},
     {"match": r"glm[-_.]?5\.3[-_.]?flash", "api": "Z.ai", "input": 0.15, "cached": 0.03, "output": 0.50},
+    # MiniMax's own, flat (no context tiers or peak hours for the Flash model):
+    # https://platform.minimax.io/docs/pricing/overview (read 2026-10-27)
+    {"match": r"minimax[-_.]?m3\.1[-_.]?flash", "api": "MiniMax", "input": 0.15, "cached": 0.015, "output": 0.60},
 ]
 BANDS = ("base", "peak")
 

@@ -148,7 +148,7 @@ function ContextCard({m}) {
     : "What the model holds at once: the chat, its files and tool results. A chat longer than this is refused: start a new one, or give the model a bigger context.";
   const aria = `${fmt(used)} of ${fmt(max)} tokens in use` + segs.map((s) => `, ${s.label.toLowerCase()} ${fmt(s.n)}`).join("");
   return html`<section class="card" aria-label="Context">
-    <div class="card__head"><span class="card__title">Context</span><span class="card__sub">${what ? `${what} · ` : ""}${ctxfmt(max)} context</span></div>
+    <div class="card__head"><span class="card__title">Context</span><span class="card__sub">${what || ""}</span></div>
     <div class="ctx__nums"><span class="ctx__big num">${fmt(used)}<small>/ ${fmt(max)} tokens</small></span>
       <span class="ctx__pct num"><b>${pct > 0 && pct < 0.1 ? "< 0.1" : fmt(pct, pct > 0 && pct < 10 ? 1 : 0)}%</b> used · ${fmt(free)} left</span></div>
     <div class=${`ctx__track${showWin ? " ctx__track--win" : ""}`}>
@@ -219,10 +219,16 @@ function Tiers({t, eng}) {
     <div class=${`tiles${set.length === 4 ? " tiles--4" : ""}`}>
       ${set.map((x) => {
         const v = n[x.key];
-        let sub = x.sub;
+        let sub = x.sub, tip = null;
         if (x.key === "engram_ms" && eng && eng.engram_lookups) sub = `${fmt(+eng.engram_lookups)} n-gram lookups a token`;
+        if (x.key === "engram_ms" && n.eg_lookup_rows > 0) {   // (its host cache, #522: the share found in RAM)
+          sub += ` · ${fmt((100 * (n.eg_lookup_hits || 0)) / n.eg_lookup_rows, 0)}% from its RAM cache`;
+          tip = `N-gram memory's RAM cache: ${fmt(n.eg_cache_rows || 0)} of ${fmt(n.eg_cache_cap || 0)} rows held; ` +
+                `${fmt(n.eg_lookup_rows)} lookups since the start, ${fmt(n.eg_lookup_hits || 0)} found in RAM, ` +
+                `${fmt(n.eg_lookup_reads || 0)} read from the SSD`;
+        }
         if ((x.key === "disk" || x.key === "ram_fetch") && v == null && ds4) sub = "not measured on this system";
-        return html`<div class="tile"><span class="stat__label">${x.label}</span>
+        return html`<div class="tile" title=${tip}><span class="stat__label">${x.label}</span>
           <${Num} v=${v == null ? null : fmt(v, x.digits)} unit=${x.unit}/>
           <span class="tile__sub">${stale ? "last answer: " : ""}${sub}</span>
           <${Spark} values=${(h[x.key] || []).map((y) => (y == null ? 0 : y))} tone=${x.tone || ""}/></div>`;
@@ -440,14 +446,18 @@ const API_NAMES = {web: "Chat", openai: "OpenAI", anthropic: "Anthropic"};
 const FINISH = {stop: ["ok", "Done"], length: ["ok", "Max tokens"], cancel: ["warn", "Stopped"], disconnect: ["warn", "Closed"], error: ["danger", "Error"]};
 function totalsLine(t, lg = {}) {
   if (!t || !t.requests) return "";
-  // the loop guard: how many loops it broke (the request rows say where and how), or that it is off
-  const loops = lg.detected ? ` · loop guard: ${fmt(lg.detected)} loop${lg.detected === 1 ? "" : "s"} broken`
+  // the loop guard: the loops it saw and what it did about them (/metrics' maya:loop_guard_* counters, here only; the
+  // request rows say where), or that it is off
+  const did = [[lg.penalised, "cut with a short penalty"], [lg.thinking_closed, "closed the thinking"],
+               [lg.stopped, "ended the answer"]].filter(([n]) => n > 0).map(([n, s]) => `${fmt(n)} ${s}`);
+  const loops = lg.detected ? ` · loop guard: ${fmt(lg.detected)} loop${lg.detected === 1 ? "" : "s"} seen${did.length ? ` (${did.join(", ")})` : ""}`
               : lg.on === false ? " · loop guard off" : "";
   const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
   const read = t.prompt_tokens - t.reused;
   const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
   const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
-  return `Since ${since}: ${fmt(t.requests)} request${t.requests === 1 ? "" : "s"} · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ${fmt(t.output_tokens)} written${oSpeed}${loops}`;
+  // (the requests' count is the hero's Requests served)
+  return `Since ${since}: ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ${fmt(t.output_tokens)} written${oSpeed}${loops}`;
 }
 function Requests({m}) {
   const requests = m.requests || [], kept = m.requests_kept == null ? requests.length : m.requests_kept;
@@ -481,7 +491,7 @@ function Requests({m}) {
 // ------------------------------------------------------------------ the page
 export function MonitorPage() {
   const m = S.metrics;
-  const st = status(), phone = isPhone();
+  const st = status(true), phone = isPhone();
   const copy = async () => {
     try { await copyText(await fetchReport(), true); toast("success", "Report copied", "Paste it into a GitHub issue - read it first."); }
     catch (e) { toast("error", "No report", e.message, 5000); }

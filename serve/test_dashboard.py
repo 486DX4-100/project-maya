@@ -462,5 +462,33 @@ class NvmlPids(unittest.TestCase):
             launcher.stdout.close()
 
 
+class Offline(unittest.TestCase):
+    """The page works without the internet: its scripts, styles, fonts and icons are all in serve/web (Preact, htm
+    and Lucide vendored with their notices) - nothing is loaded from another host."""
+    WEB = ROOT / "serve" / "web"
+
+    def test_nothing_loaded_from_the_network(self):
+        import re
+        remote = re.compile(r"""(?:\b(?:src|href|action)\s*=\s*|\burl\(\s*|\bfrom\s+|\bimport\s*\(\s*|"""
+                            r"""\bfetch\(\s*|@import\s+|new\s+(?:WebSocket|EventSource|Worker)\(\s*)["'`]?(?:https?:)?//""",
+                            re.I)
+        found = []
+        for p in sorted(self.WEB.rglob("*")):
+            if p.suffix not in (".js", ".css", ".html", ".svg", ".webmanifest"):
+                continue
+            for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+                if remote.search(line) and "w3.org/" not in line:
+                    found.append(f"{p.relative_to(ROOT)}:{n}: {line.strip()[:120]}")
+        self.assertEqual(found, [])
+
+    def test_the_vendored_code_keeps_its_notices(self):
+        self.assertIn("The MIT License", (self.WEB / "preact.js").read_text(encoding="utf-8")[:3000])
+        self.assertIn("Apache License, Version 2.0", (self.WEB / "preact.js").read_text(encoding="utf-8")[:3000])
+        self.assertIn("ISC License", (self.WEB / "LICENSE.lucide.txt").read_text(encoding="utf-8"))
+        self.assertTrue((self.WEB / "fonts" / "OFL.txt").is_file())
+        index = (self.WEB.parent / "web" / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn("fonts.googleapis", index)
+
+
 if __name__ == "__main__":
     unittest.main()

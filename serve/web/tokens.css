@@ -1,6 +1,6 @@
 /* Project Maya UI - design tokens, v2: neutral grays with Maya's violet as the one accent.
    Dark is the default (:root); light with <html data-theme="light">.  The page sets data-theme before its first paint
-   from the saved choice ("maya.ui-theme": dark, light or system).  Every name keeps the --st-* prefix. */
+   from the saved choice ("maya.theme": dark, light or system).  Every name keeps the --st-* prefix. */
 
 /* Outfit (SIL Open Font License 1.1, serve/web/fonts/OFL.txt): one variable font, weights 100-900 */
 @font-face{font-family:"Outfit";src:url("../fonts/outfit-latin-wght.woff2") format("woff2-variations");font-weight:100 900;font-display:swap;unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
@@ -117,3 +117,45 @@
   --st-glass-bar:rgba(255,255,255,.76); --st-bar-shadow:0 6px 18px rgba(24,24,29,.08);
   color-scheme:light;
 }
+
+/* the Violet colours (Settings > General > Colours, <html data-scheme="violet">): the earlier dashboard's violet-tinted
+   surfaces and the page's two glows (violet top left, sky bottom right), in the dark theme and the light one; the glass
+   sidebar takes its tint, so the glows show through it */
+:root[data-scheme="violet"]:not([data-theme="light"]){
+  --st-side:#0c0d20;
+  --st-side-glass:color-mix(in srgb,#0c0d20 80%,transparent);
+  --st-bg:#090a14;
+  --st-surface:#11132a;
+  --st-surface-2:#171a34;
+  --st-surface-3:#1e2240;
+  --st-line:#252a4a;
+  --st-line-strong:#323865;
+  --st-ink:#eceefe;
+  --st-ink-soft:#c3c7e6;
+  --st-ink-muted:#8a8fb4;
+  --st-code-bg:#07080f; --st-code-head:#0f1122;
+  --st-shadow-pop:0 0 0 1px #323865,0 22px 60px rgba(0,0,0,.6);
+  --st-glass-bg:rgba(30,34,64,.42); --st-glass-bar:rgba(9,10,20,.74);
+  --st-bg-glow-1:rgba(124,108,255,.16); --st-bg-glow-2:rgba(14,165,233,.10);
+}
+:root[data-scheme="violet"][data-theme="light"]{
+  --st-side:#eeeef8;
+  --st-side-glass:color-mix(in srgb,#eeeef8 80%,transparent);
+  --st-bg:#f4f4fa;
+  --st-surface:#ffffff;
+  --st-surface-2:#f0f0f8;
+  --st-surface-3:#e8e8f4;
+  --st-line:#e0e1ef;
+  --st-line-strong:#cfd1e6;
+  --st-ink:#14152b;
+  --st-ink-soft:#33365a;
+  --st-ink-muted:#62668a;
+  --st-glass-bar:rgba(244,244,250,.76);
+  --st-bg-glow-1:rgba(109,92,246,.10); --st-bg-glow-2:rgba(14,165,233,.08);
+}
+:root[data-scheme="violet"] body{
+  background:radial-gradient(900px 600px at 0% -10%,var(--st-bg-glow-1),transparent 60%),
+             radial-gradient(800px 600px at 110% 110%,var(--st-bg-glow-2),transparent 60%),var(--st-bg);
+  background-attachment:fixed;
+}
+:root[data-scheme="violet"] .shell > .chat, :root[data-scheme="violet"] .shell > .mon{ background:transparent; }

@@ -21,6 +21,8 @@
     let t = localStorage.getItem("maya.theme") || "dark";
     if (t === "system") t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
     document.documentElement.dataset.theme = t;
+    // (and the colours: "maya.scheme" violet, else the default)
+    if (localStorage.getItem("maya.scheme") === "violet") document.documentElement.dataset.scheme = "violet";
   } catch (e) {}
 </script>
 </head>

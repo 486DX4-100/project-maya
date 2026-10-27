@@ -618,7 +618,7 @@ export async function clearBrowser() {
   if (!ok) return;
   try { await db.clear(); } catch (e) { /* nothing stored there */ }
   try {
-    for (const k of Object.keys(localStorage)) if ((k.startsWith("maya.") || k.startsWith("strata.")) && k !== "maya.theme") localStorage.removeItem(k);
+    for (const k of Object.keys(localStorage)) if ((k.startsWith("maya.") || k.startsWith("strata.")) && k !== "maya.theme" && k !== "maya.scheme") localStorage.removeItem(k);
   } catch (e) { /* ignore */ }
   location.reload();
 }
