@@ -4,6 +4,13 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.32 - 2026-10-27
+
+A quick fix for the new web UI.
+
+- **Fix: the "Saved" popover is whole again** (#553, @needmorevram): the glass sidebar sits above the main column,
+  so the popover at the bottom of the sidebar is no longer cut off at its edge.
+
 ## v1.1.31 - 2026-10-27
 
 MiniMax answers faster, DeepSeek reads copied text faster and keeps its pictures off the GPU, orcarouter's
