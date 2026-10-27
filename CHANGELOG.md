@@ -4,6 +4,21 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.30 - (draft, not released)
+
+MiniMax-M3.1-Flash in Project Maya's own quants: the whole model in a 128 GB PC.
+
+- **MiniMax-M3.1-Flash-Maya-XS and -Maya-S on Maya:** `./setup.sh --model MiniMax-M3.1-Flash --mm3-quant gguf-xs`
+  (or `gguf-s`) runs our GGUF quants on `maya-mm3`: Maya-XS (~93 GB, the experts in about 1.6 bits) fits a 128 GB
+  PC's memory, Maya-S (~122 GB, about 2.1 bits) is closer to the original. On the reference prompts Maya-XS on Maya
+  scores within a hair of the quant's own measurement (top token the same on 81% of the answer tokens).
+- **NVIDIA from V100 on and AMD, Linux and Windows**, with the experts VRAM cannot hold computed on the CPU from RAM,
+  the INT8 K/V cache and the context fitted to the PC's memory, as for the EXL3 quant.
+- **Pictures and DSpark drafting with the GGUFs** (NVIDIA): the vision tower and the drafter come from the EXL3 repo's
+  own files (about 4 GB), downloaded once beside the model.
+- **The same files work in llama.cpp:** the three dense layers' indexers are kept in a small file of their own, which
+  Maya loads to run MiniMax's sparse attention in every layer.
+
 ## v1.1.29 - 2026-10-26
 
 MiniMax-M3.1-Flash joins GLM and DeepSeek as Maya's third model, on an engine of its own, with MiniMax's own

@@ -889,6 +889,21 @@ void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int
     kc::native_down_rows_split(native(f), down, hq, nt, out, r0, r1);
 }
 
+int iq_cpu_act_type(int type) {
+    kc::NativeFmt n;
+    std::string err;
+    return kc::native_fmt(type, type, 256, 256, n, err) ? n.gu_act : -1;
+}
+
+void iq_cpu_rows(int type, const uint8_t* w, size_t rb, int k, const void* const* act, int nt, float* const* out, int r0,
+                 int r1) {
+    IqCpu f;   // (a "down" of k inputs: its rows are what iq_cpu_down reads)
+    f.td = type;
+    f.n_ff = k;
+    f.d_row = rb;
+    iq_cpu_down(f, w, act, nt, out, r0, r1);
+}
+
 bool iq_cpu_own_rows(int type) { return own(type); }
 void iq_cpu_iq1s_rows(bool on) { g_iq1_on.store(on, std::memory_order_relaxed); }
 #else
@@ -900,6 +915,8 @@ void iq_cpu_quant(int, const float*, int, void*) {}
 void iq_cpu_gate_up(const IqCpu&, const uint8_t*, const uint8_t*, const void* const*, int, float* const*, int, int,
                     float) {}
 void iq_cpu_down(const IqCpu&, const uint8_t*, const void* const*, int, float* const*, int, int) {}
+int iq_cpu_act_type(int) { return -1; }
+void iq_cpu_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {}
 bool iq_cpu_own_rows(int) { return false; }
 void iq_cpu_iq1s_rows(bool) {}
 #endif

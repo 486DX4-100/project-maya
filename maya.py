@@ -491,6 +491,21 @@ MM3_SAMPLING = {"temperature": 1.0, "top_p": 0.95}
 MM3_EFFORT = "auto"
 MM3_MEMORY_GB = 250                                # VRAM + RAM: 179 GiB of weights, the experts not in VRAM pinned
 MM3_PROFILE = ROOT / "data" / "expert-profile-mm3.bin"
+# ... or Project Maya's own GGUF quants of it (tools/mm3/download_gguf.json, packed by tools/mm3/pack_gguf.py): the routed
+# experts in ~1.6 bits (Maya-XS, ~93 GB) or ~2.1 bits (Maya-S, ~122 GB) on maya-ds4's low-bit kernels - NVIDIA from V100
+# on and AMD (HIP), Linux and Windows; text only (the set has no vision tower), no DSpark draft.  Listed (and offered)
+# once published: until then --mm3-quant gguf-xs / gguf-s with --model-dir takes files already there.
+MM3_GGUF_MANIFEST = ROOT / "tools" / "mm3" / "download_gguf.json"
+MM3_QUANTS = {"exl3": "EXL3 3.5 bits", "gguf-xs": "MiniMax-M3.1-Flash-Maya-XS", "gguf-s": "MiniMax-M3.1-Flash-Maya-S"}
+MM3_GGUF_PACK_TOOLS = ("tools/mm3/pack_gguf.py", "tools/ds4/pack_gguf.py", "tools/mm3/pack.py", "tools/mm3/st.py",
+                       "tools/mm3/chat_template.jinja")
+# the GGUFs' pictures and drafting: the EXL3 repo's vision tower (model-vision-00001-of-00001.safetensors, 1.7 GB, with
+# config.json / preprocessor_config.json) and DSpark draft (dspark/, 2.3 GB) - download.json's own pinned files, the same
+# for any quant - in <models folder>/MiniMax-M3.1-Flash-companions (the repo's layout; a whole EXL3 download beside the
+# GGUF serves as well), indexed by pack_gguf.py.  NVIDIA: maya-mm3's vision tower and draft have no HIP port.
+MM3_COMPANIONS = "MiniMax-M3.1-Flash-companions"
+MM3_VISION_FILES = ("config.json", "preprocessor_config.json", "model-vision-00001-of-00001.safetensors")
+MM3_GGUF_MIN_CC = 70                               # (maya-ds4's GGUF kernels' reach: V100 on)
 FAMILIES = ("glm", "deepseek", "minimax")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
@@ -1043,9 +1058,9 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     step(1, "checking this PC")
     ds4 = family == "deepseek"
     mm3 = family == "minimax"
-    if mm3 and a.backend == "hip":   # (as DeepSeek's EXL3 quant: EXL3 has no AMD port)
+    if mm3 and a.backend == "hip" and not gguf:   # (as DeepSeek's EXL3 quant: EXL3 has no AMD port)
         fail(f"{MM3}'s EXL3 quant runs on NVIDIA GPUs only (EXL3's kernels have no HIP port)",
-             f"set it up on a PC with an NVIDIA GPU ({mm3_gpus()})")
+             f"set up Maya's GGUF quant of it instead: {ME} --setup --backend hip --model {MM3} --mm3-quant gguf-xs")
     if mm3 and WIN and not MM3_ALL_PLATFORMS:
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
@@ -1056,7 +1071,8 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         return check_hip_pc(a)
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows", "the engine needs an NVIDIA GPU and CUDA")
-    min_cc = (DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else mm3_min_cc() if mm3 else MIN_CC
+    min_cc = ((DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else (MM3_GGUF_MIN_CC if gguf else mm3_min_cc()) if mm3
+              else MIN_CC)
     if WIN:
         warn("Windows support is new (experimental): Maya is developed and measured on Linux - tell us how it runs")
     if S.is_wsl():
@@ -1318,7 +1334,9 @@ def choose_family(a, prev: dict) -> str:
              f"3.5 bits (197 GB); NVIDIA {mm3_gpus()}{' on Linux and Windows (Windows: new)' if MM3_ALL_PLATFORMS else ' on Linux'}; about "
              f"{MM3_MEMORY_GB} GB of VRAM and RAM together{here}; the layers split across the GPUs, the experts that "
              "do not fit computed on the CPU; tool calls, MiniMax's thinking levels, pictures, DSpark drafting and "
-             "up to a 1M context.")]
+             "up to a 1M context" + ("; or Maya's own GGUF quants (Maya-XS ~93 GB, Maya-S ~122 GB: NVIDIA from V100 "
+                                     "on and AMD, text only)" if any(map(mm3_gguf_published, ("gguf-xs", "gguf-s")))
+                                     else "") + ".")]
     pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
     return FAMILIES[pick]
 
@@ -4060,21 +4078,21 @@ def mm3_kv_gb(ctx: int, fmt: str) -> float:
     return ctx * (half(k) + half(v or k)) / 2**30
 
 
-def mm3_recommended_context(vram: float, ram: float, fmt: str) -> int:
+def mm3_recommended_context(vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB) -> int:
     """The context the setup recommends on this PC: the largest (up to MM3_TESTED_CONTEXT) whose KV cache fits in
-    what VRAM + RAM hold beyond the model (MM3_MEMORY_GB) - so the cache does not push experts out of RAM - else the
-    smallest; MM3_DEFAULT_CONTEXT when the RAM could not be read."""
+    what VRAM + RAM hold beyond the model (need: MM3_MEMORY_GB, a GGUF quant's own) - so the cache does not push experts
+    out of RAM - else the smallest; MM3_DEFAULT_CONTEXT when the RAM could not be read."""
     if ram <= 0:
         return MM3_DEFAULT_CONTEXT
-    spare = vram + ram - MM3_MEMORY_GB
+    spare = vram + ram - need
     fits = [c for c in MM3_CONTEXTS if c <= MM3_TESTED_CONTEXT and mm3_kv_gb(c, fmt) <= spare]
     return max(fits) if fits else MM3_CONTEXTS[0]
 
 
-def mm3_context_notes(ctx: int, vram: float, ram: float, fmt: str) -> None:
+def mm3_context_notes(ctx: int, vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB) -> None:
     """What a context costs here, and the warnings (as the dashboard's): past what was run end to end, a cache that
     takes RAM the experts need."""
-    kv, spare = mm3_kv_gb(ctx, fmt), vram + ram - MM3_MEMORY_GB
+    kv, spare = mm3_kv_gb(ctx, fmt), vram + ram - need
     ok(f"the context's KV cache: about {kv:.0f} GB of pinned RAM ({fmt.upper()}), its newest 32K positions in VRAM too")
     if ctx > MM3_TESTED_CONTEXT:
         warn(f"past {context_label(MM3_TESTED_CONTEXT)} the engine has not been run end to end yet, and a prompt that "
@@ -4082,7 +4100,7 @@ def mm3_context_notes(ctx: int, vram: float, ram: float, fmt: str) -> None:
     if kv > max(0.0, spare):
         warn(f"{vram:.0f} GB of VRAM and {ram:.0f} GB of RAM: with a {context_label(ctx)} context's cache, fewer "
              "experts stay in RAM (answers slower) and the engine may not start - "
-             f"{context_label(mm3_recommended_context(vram, ram, fmt))} fits this PC")
+             f"{context_label(mm3_recommended_context(vram, ram, fmt, need))} fits this PC")
 
 
 def mm3_models() -> tuple:
@@ -4101,15 +4119,102 @@ def mm3_models() -> tuple:
             entry(man["dspark"]["files"], man["dspark"]["folder"], f"{MM3}'s DSpark draft (speculative decoding)"))
 
 
-def mm3_dir(a, models: Path, prev: dict) -> Path:
-    """The model's folder: --model-dir, else the folder of the MiniMax setup before (its pack is inside it), else
-    <models folder>/MiniMax-M3.1-Flash-EXL3-3.5bpw."""
+def mm3_gguf_entry(quant: str) -> dict:
+    """Maya's GGUF quant of MiniMax (download_gguf.json) as a MODELS entry (offer_download's form): its shards and the
+    dense layers' indexers file, their sizes and sha256 (empty until published), the repo's folder, the VRAM + RAM that
+    hold it (memory_gb)."""
+    man = read_json(MM3_GGUF_MANIFEST)
+    q = (man.get("quants") or {}).get(MM3_QUANTS[quant]) or {}
+    if not q.get("files"):
+        fail(f"{MM3_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/mm3/download_gguf.json)")
+    files = {Path(k).name: v for k, v in q["files"].items()}
+    return {"about": f"{MM3_QUANTS[quant]}, Maya's quant ({q.get('about', 'GGUF')})", "format": "mm3-gguf",
+            "repo": man["repo"], "revision": man.get("revision") or "", "folder": MM3_QUANTS[quant],
+            "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
+            "download_gb": sum(v[0] for v in files.values()) / 1e9, "memory_gb": q.get("memory_gb", MM3_MEMORY_GB)}
+
+
+def mm3_gguf_published(quant: str) -> bool:
+    """Whether Maya's quant has been uploaded: download_gguf.json names the commit and every file's sha256."""
+    m = mm3_gguf_entry(quant)
+    return bool(m["revision"]) and all(m["sha256"].values())
+
+
+def mm3_memory_gb(quant: str) -> float:
+    """The VRAM + RAM that hold MiniMax in these files (the KV cache aside)."""
+    return MM3_MEMORY_GB if quant == "exl3" else float(mm3_gguf_entry(quant)["memory_gb"])
+
+
+def choose_mm3_quant(a, prev: dict) -> str:
+    """--mm3-quant, else the one set up before, else asked among those this PC runs: Maya's GGUF quants once published
+    (AMD: those alone), the EXL3 quant on NVIDIA - by this PC's memory the one recommended."""
+    if getattr(a, "mm3_quant", None):
+        return a.mm3_quant
+    hip = getattr(a, "backend", None) == "hip"
+    ggufs = [k for k in ("gguf-xs", "gguf-s") if mm3_gguf_published(k)]
+    keys = ([] if hip else ["exl3"]) + ggufs
+    if not keys:
+        fail(f"{MM3} on AMD runs Maya's GGUF quants, which are not published yet",
+             f"with their files in a folder: {ME} --setup --backend hip --model {MM3} --mm3-quant gguf-xs --model-dir "
+             "<folder>")
+    before = (prev.get("installer") or {}).get("mm3_quant")
+    total, _ = mem_gb()
+    try:
+        vram = 0.0 if hip else sum(g["vram_gb"] for g in S.gpus())
+    except Exception:  # noqa: BLE001 - no NVIDIA tools
+        vram = 0.0
+    have = vram + total
+    fit = [k for k in keys if have >= mm3_memory_gb(k)]
+    rec = "exl3" if "exl3" in fit else max(fit, key=mm3_memory_gb) if fit else min(keys, key=mm3_memory_gb)
+    if len(keys) == 1:
+        return keys[0]
+    label = {"exl3": (f"EXL3 3.5 bits ({mm3_models()[0]['download_gb']:.0f} GB)",
+                      f"Mia-AiLab's quant: pictures and DSpark drafting; ~{MM3_MEMORY_GB} GB of VRAM + RAM; NVIDIA"),
+             "gguf-xs": ("MiniMax-M3.1-Flash-Maya-XS (93 GB)",
+                         "Maya's quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory; text only"),
+             "gguf-s": ("MiniMax-M3.1-Flash-Maya-S (122 GB)", "Maya's quant: experts in ~2.1 bits; text only")}
+    order = sorted(keys, key=lambda k: k != rec)
+    default = before if before in order else rec
+    pick = choose(f"Which files of {MM3}?", ["Maya's GGUF quants run on NVIDIA from V100 on and on AMD; the EXL3 quant "
+                                             "on NVIDIA:"],
+                  [(label[k][0], "recommended" if k == rec else None, label[k][1]) for k in order],
+                  order.index(default), a.yes or a.check)
+    return order[pick]
+
+
+def mm3_dir(a, models: Path, prev: dict, quant: str = "exl3") -> Path:
+    """The model's folder: --model-dir, else the folder of the MiniMax setup before when it holds the same quant (its
+    pack is inside it), else <models folder>/MiniMax-M3.1-Flash-EXL3-3.5bpw (a GGUF: <models folder>/<its name>)."""
     if a.model_dir:
         return Path(a.model_dir).expanduser().resolve()
     args = prev.get("args") or []
-    if "--pack" in args[:-1] and (Path(args[args.index("--pack") + 1]).parent / "config.json").exists():
-        return Path(args[args.index("--pack") + 1]).parent
-    return models / MM3_DIR
+    if "--pack" in args[:-1] and (prev.get("installer") or {}).get("mm3_quant", "exl3") == quant:
+        d = Path(args[args.index("--pack") + 1]).parent
+        if (d / "config.json").exists() or (quant != "exl3" and any(d.glob("*.gguf"))):
+            return d
+    return models / (MM3_DIR if quant == "exl3" else MM3_QUANTS[quant])
+
+
+def mm3_gguf_model_step(a, d: Path, quant: str) -> list | None:
+    """Maya's GGUF quant's files in d (downloaded once published, when they are not there): the files, or None when
+    nothing was downloaded.  Before it is published: the files already in d (--model-dir), by their sizes."""
+    name = MM3_QUANTS[quant]
+    step(5, f"the model ({name})")
+    m = mm3_gguf_entry(quant)
+    files = [d / n for n in m["files"]]
+    missing = [f for f in files if file_incomplete(m, f)]
+    if missing and not mm3_gguf_published(quant):
+        fail(f"{name} is not published yet (and {missing[0]} is {file_incomplete(m, missing[0])})",
+             f"with its files in a folder: {ME} --setup --model {MM3} --mm3-quant {quant} --model-dir <folder>")
+    if missing and not offer_download(a, name, d, files, m):
+        return None
+    if not mm3_gguf_published(quant):
+        warn(f"{name} is not published yet: the files in {d} are taken by their sizes (no published sha256 to check)")
+    ok(f"{name}: {len(files)} files, {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
+    if rotational(d):
+        warn(f"{d} is on a spinning hard disk: loading reads all {m['download_gb']:.0f} GB from it - use an NVMe SSD "
+             "(--models-dir)")
+    return files
 
 
 def mm3_model_step(a, d: Path) -> list | None:
@@ -4136,22 +4241,59 @@ def mm3_model_step(a, d: Path) -> list | None:
     return files + dfiles
 
 
-def mm3_pack_step(a, d: Path, files: list) -> Path:
-    """tools/mm3/pack.py's pack in <model>/maya-mm3: the geometry, where every tensor sits in the safetensors (read in
-    place) and the tokenizer - built again when its tools or the model's files changed."""
+def mm3_companions_step(a, d: Path, hip: bool) -> Path | None:
+    """A GGUF quant's pictures and drafting: the EXL3 repo's vision tower (MM3_VISION_FILES; not with --no-vision) and
+    DSpark draft (dspark/) - download.json's pinned files - in <models folder>/MiniMax-M3.1-Flash-companions, downloaded
+    when they are not there (a whole EXL3 download beside the GGUF is used as it is).  The folder pack_gguf.py takes, or
+    None: text only, no draft (AMD; or the download declined)."""
+    if hip:
+        ok("pictures and DSpark drafting: NVIDIA only for now (maya-mm3's vision tower and draft have no AMD port) - "
+           "text only here")
+        return None
+    exl3 = d.parent / MM3_DIR
+    if all((exl3 / n).exists() for n in MM3_VISION_FILES) and (exl3 / "dspark" / "config.json").exists():
+        ok(f"pictures and drafting: from the EXL3 download beside it ({exl3})")
+        return exl3
+    m, dm = mm3_models()
+    names = ["config.json"] + ([] if a.no_vision else [n for n in MM3_VISION_FILES if n != "config.json"])
+    c = d.parent / MM3_COMPANIONS
+    vm = dict(m, about=f"{MM3}'s vision tower and its configs from Mia-AiLab's EXL3 repo (pictures with any quant)",
+              files={n: m["files"][n] for n in names}, sha256={n: m["sha256"][n] for n in names})
+    vm["download_gb"] = sum(vm["files"].values()) / 1e9
+    vf, dfiles = [c / n for n in names], [c / dm["folder"] / n for n in dm["files"]]
+    if any(file_incomplete(vm, f) for f in vf) and not offer_download(a, "the vision tower", c, vf, vm):
+        warn("pictures and drafting: not downloaded - the model reads text only, without the DSpark draft")
+        return None
+    if any(file_incomplete(dm, f) for f in dfiles) and not offer_download(a, MM3 + " DSpark", c / dm["folder"], dfiles,
+                                                                           dm):
+        warn("the DSpark draft: not downloaded - no drafting")
+    ok(f"pictures{' (off: --no-vision)' if a.no_vision else ''} and drafting: the EXL3 repo's files in {c}")
+    return c
+
+
+def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path | None = None) -> Path:
+    """tools/mm3/pack.py's pack in <model>/maya-mm3 (a GGUF's: pack_gguf.py's): the geometry, where every tensor sits in
+    the safetensors / the GGUF's shards (read in place) and the tokenizer - built again when its tools or the model's
+    files changed."""
     step(6, "the pack (the engine's index of the model files)")
     pack = d / "maya-mm3"
-    tools = S.source_hash(MM3_PACK_TOOLS)
+    tools = S.source_hash(MM3_GGUF_PACK_TOOLS if gguf else MM3_PACK_TOOLS)
     need = ("mm3.txt", "tensors.txt", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
-    shards = [f for f in files if f.suffix == ".safetensors"]
+    shards = [f for f in files if f.suffix == (".gguf" if gguf else ".safetensors")]
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
             all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
         ok(f"pack already built: {pack}")
         return pack
     if not os.access(d, os.W_OK):
         fail(f"{d} is not writable: the pack is written inside the model's folder")
-    say("  Indexing every tensor of the safetensors (the weights stay where they are) and the tokenizer ...")
-    run([sys.executable, str(ROOT / "tools" / "mm3" / "pack.py"), "--model", str(d), "--out", str(pack)])
+    say(f"  Indexing every tensor of the {'GGUF' if gguf else 'safetensors'} (the weights stay where they are) and the "
+        "tokenizer ...")
+    if gguf:
+        run([sys.executable, str(ROOT / "tools" / "mm3" / "pack_gguf.py"), "--model", str(d), "--out", str(pack)] +
+            (["--companions", str(companions)] if companions else ["--text-only"]) +
+            ["--shards"] + [f.name for f in shards])
+    else:
+        run([sys.executable, str(ROOT / "tools" / "mm3" / "pack.py"), "--model", str(d), "--out", str(pack)])
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
@@ -4163,20 +4305,33 @@ def mm3_pack_step(a, d: Path, files: list) -> Path:
     return pack
 
 
-def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path) -> Path:
+def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path,
+                     quant: str = "exl3") -> Path:
     """maya-mm3.json and run-maya-mm3.sh.  A setup again keeps what the config before says that this one does not
     ask: the engine settings below, the thinking level and sampling, where the server listens and its key."""
     step(8, "the configuration and the start script")
     port = a.port or 8080
-    cfg_path = ROOT / "maya-mm3.json"
+    hip = pc.get("backend") == "hip"   # (AMD: a GGUF quant - a config of its own, as DeepSeek's)
+    cfg_path = ROOT / ("maya-mm3-hip.json" if hip else "maya-mm3.json")
     old = read_json(cfg_path)
+    gguf = quant != "exl3"
     args = ["--pack", str(pack), "--max-context", str(ctx)]
     if MM3_PROFILE.exists():
         args += ["--profile", str(MM3_PROFILE)]
-    kept = keep_args(old.get("args") or [], args, ("--chunk", "--staging", "--cpu-threads", "--reserve-gb",
-                                                    "--resident-cap", "--dspark", "--dspark-conf", "--vision",
-                                                    "--vision-gpu", "--tp", "--cache-gb", "--kv-cache",
-                                                    "--kv-streaming", "--kv-resident"))
+    # (a GGUF: the layer split - the EXL3 config's tensor-parallel settings not kept; pictures / drafting as its pack
+    #  has them: a kept --vision on without a tower in the pack dropped)
+    keep = ("--chunk", "--staging", "--cpu-threads", "--reserve-gb", "--resident-cap", "--kv-cache", "--kv-streaming",
+            "--kv-resident", "--dspark", "--dspark-conf", "--vision", "--vision-gpu") + (() if gguf else ("--tp",
+                                                                                                           "--cache-gb"))
+    kept = keep_args(old.get("args") or [], args, keep)
+    if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "on" and not mm3_pack_has_vision(pack):
+        i = args.index("--vision")
+        del args[i:i + 2]
+    has_draft = "dspark.num_hidden_layers" in (pack / "mm3.txt").read_text(encoding="utf-8")
+    for k in ("--dspark", "--dspark-conf"):
+        if k in args[:-1] and not has_draft:
+            i = args.index(k)
+            del args[i:i + 2]
     # KV streaming (maya-mm3 --kv-streaming on), as the GLM engine's: 32768 positions of each layer's K / V in VRAM
     # (--kv-resident N sets another window), all of them in pinned RAM - a longer context leaves the VRAM to experts;
     # MM3_KV_BYTES of RAM a context token by the cache's format (BF16: 15 GB at 128K, 120 GB at 1M)
@@ -4186,7 +4341,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     # groups - each layer's work spread over a group's GPUs; on 3090 + 8 x 5060 Ti decode 27.7 -> 38 tok/s (code),
     # ~19 -> 32 (prose), prompts 35-70 -> ~100 tok/s
     n = len(pc["gpus"])
-    if "--tp" not in args[:-1]:
+    if "--tp" not in args[:-1] and not gguf:   # (a GGUF pack: the layer split - maya-mm3's tensor parallel is EXL3's)
         for tp in (4, 2):
             if n > tp and ((n - 1) % tp == 0 or n % tp == 0):
                 args += ["--tp", str(tp)]
@@ -4203,7 +4358,13 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         set_arg(args, "--vision", "off")
     elif "--vision" not in args[:-1] and mm3_pack_has_vision(pack):
         args += ["--vision", "on"]
+    if hip and "--reserve-gb" not in args[:-1]:   # (as DeepSeek's on AMD: the desktop's allocations beside the engine)
+        mib = hip_reserve_mib(pc["gpus"])
+        set_arg(args, "--reserve-gb", f"{mib / 1024:.1f}")
+        ok(f"VRAM kept free on each GPU: {mib / 1024:.1f} GB (the desktop and other programs on an AMD GPU allocate "
+           "beside the engine)")
     cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
+           **({"backend": "hip"} if hip else {}),
            "model_name": MM3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": old.get("sampling") or dict(MM3_SAMPLING), "reasoning_effort": MM3_EFFORT,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
@@ -4221,8 +4382,9 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     if kept:
         ok("kept from the config before: " + ", ".join(kept))
     cfg["log"] = str(cfg_path.with_suffix(".log"))
-    cfg["installer"] = {"family": "minimax", "models_dir": str(models), "quant": MM3, "model_dir": str(d),
-                        "written": time.strftime("%Y-%m-%d %H:%M")}
+    cfg["installer"] = {"family": "minimax", "models_dir": str(models),
+                        "quant": MM3 if quant == "exl3" else MM3_QUANTS[quant], "mm3_quant": quant,
+                        "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, port)}")
@@ -4240,33 +4402,40 @@ def mm3_pack_has_vision(pack: Path) -> bool:
 
 
 def set_up_mm3(a, prev: dict) -> Path | None:
-    """MiniMax-M3.1-Flash's steps 1-8: the PC (NVIDIA - mm3_gpus(); the memory), the context (recommended by this PC's
-    memory), its engine (build/maya-mm3), the files, the pack, pictures, the config."""
+    """MiniMax-M3.1-Flash's steps 1-8: the files (EXL3, or Maya's GGUF quants), the PC (NVIDIA - mm3_gpus(); a GGUF also
+    AMD; the memory), the context (recommended by this PC's memory), its engine (build/maya-mm3), the files, the pack,
+    pictures, the config."""
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    pc = check_pc(a, "minimax")                        # 1
+    quant = choose_mm3_quant(a, prev)
+    gguf = quant != "exl3"
+    need = mm3_memory_gb(quant)
+    pc = check_pc(a, "minimax", gguf=gguf)             # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
-    if vram + total < MM3_MEMORY_GB:
-        warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{MM3_MEMORY_GB} GB that hold all of {MM3} "
+    name = MM3 if not gguf else MM3_QUANTS[quant]
+    if vram + total < need:
+        warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{need:.0f} GB that hold all of {name} "
              "(the engine reads what does not fit from the SSD as the page cache allows - slower)")
     step(2, "your choices")                            # 2
+    ok(f"files: {name}" + (" (Maya's quant)" if gguf else " (Mia-AiLab's EXL3 quant)"))
     fmt = mm3_kv_format(prev_args)                     # (a setup again keeps the config's --kv-cache)
-    rec = mm3_recommended_context(vram, total, fmt)
+    rec = mm3_recommended_context(vram, total, fmt, need)
     ctx = choose_context(a, prev_ctx, MM3_CONTEXTS, rec)
     ok(f"context: {ctx} tokens" + (" (recommended for this PC's memory)" if ctx == rec else ""))
-    mm3_context_notes(ctx, vram, total, fmt)
+    mm3_context_notes(ctx, vram, total, fmt, need)
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
-    d = mm3_dir(a, models, prev)
+    d = mm3_dir(a, models, prev, quant)
     ok(f"model folder: {d}")
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama, "maya-mm3")        # 4
-    files = mm3_model_step(a, d)                       # 5
+    files = mm3_gguf_model_step(a, d, quant) if gguf else mm3_model_step(a, d)   # 5
     if files is None:
         return None
-    pack = mm3_pack_step(a, d, files)                  # 6
+    companions = mm3_companions_step(a, d, a.backend == "hip") if gguf else None  # (a GGUF's pictures and draft)
+    pack = mm3_pack_step(a, d, files, gguf, companions)  # 6
     step(7, "images (the vision tower)")
     if a.no_vision:
         ok("pictures: off (--no-vision): the model reads text only")
@@ -4274,9 +4443,11 @@ def set_up_mm3(a, prev: dict) -> Path | None:
         ok("pictures: ON - the model's own vision tower runs in the engine; it stays in RAM and comes to the GPU only "
            "while a picture is read (no VRAM kept for it); the server resizes the pictures, the Chat's picture button "
            "is shown")
+    elif gguf:
+        ok(f"pictures: none - no vision tower beside {name}: text only")
     else:
         ok("no vision tower in this pack: text only")
-    cfg_path = write_config_mm3(a, pc, meta, pack, ctx, models, d)   # 8
+    cfg_path = write_config_mm3(a, pc, meta, pack, ctx, models, d, quant)   # 8
     if CDS.has_drafter(read_json(cfg_path)):           # 9: the DSpark drafter, measured on this PC (or chosen)
         how = drafting_choice(a, "MiniMax's DSpark drafter", "10-30")
         if how != "measure":
@@ -4329,6 +4500,11 @@ def main() -> int:
                          "2-bit drafter: the whole model in a 128 GB PC's memory), gguf-q8 = unsloth's UD-Q8_K_XL GGUF, gguf-q4 = its UD-Q4_K_XL "
                          "(dense weights Q8_0: less VRAM), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
                          "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer)")
+    ap.add_argument("--mm3-quant", choices=list(MM3_QUANTS),
+                    help=f"{MM3}'s files: exl3 = Mia-AiLab's EXL3 quant at 3.5 bits (NVIDIA; pictures, DSpark), "
+                         "gguf-xs = Maya's MiniMax-M3.1-Flash-Maya-XS (experts ~1.6 bits, ~93 GB: a 128 GB PC), gguf-s = "
+                         "MiniMax-M3.1-Flash-Maya-S (~2.1 bits, ~122 GB) - the GGUFs on NVIDIA from V100 on and on AMD, "
+                         "text only; with --model-dir: the files you have")
     ap.add_argument("--draft", choices=list(DRAFTS),
                     help="how the model drafts: mtp = its MTP block (the default), dflash2 = a DFlash2 drafter "
                          f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA)")

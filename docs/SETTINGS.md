@@ -701,11 +701,23 @@ Engine options, in the config's `"args"`:
 | `--staging` | 48 | expert staging slots a GPU |
 | `--profile` | `data/expert-profile-mm3.bin` | the routing profile: the most-routed experts are placed in VRAM |
 
+**Maya's GGUF quants.** `./maya.sh --setup --model MiniMax-M3.1-Flash --mm3-quant gguf-xs` (or `gguf-s`) sets up
+Project Maya's own quants instead of the EXL3 one: MiniMax-M3.1-Flash-Maya-XS (the experts in about 1.6 bits, ~93 GB:
+the whole model in a 128 GB PC's memory) or MiniMax-M3.1-Flash-Maya-S (about 2.1 bits, ~122 GB). They run on NVIDIA
+from V100 on and on AMD, Linux and Windows. The files follow llama.cpp's MiniMax-M3 layout; the sparse-attention
+indexers of the first three layers sit in a small file of their own beside them (`...-maya-indexers.gguf`), which
+Maya loads so the model runs as MiniMax defines it - keep it with the other files. Pictures and the DSpark drafter
+come from the EXL3 repo's own files (its vision tower and its draft, about 4 GB, downloaded into
+`MiniMax-M3.1-Flash-companions` beside the model, or taken from an EXL3 download already there); on AMD the GGUFs
+read text only for now. The options above apply, but for `--tp` (the GGUFs run the layer split) and `--cache-gb`;
+`tools/mm3/pack_gguf.py --model <folder>` builds the pack by hand (`--text-only`: without the companions).
+
 Setup and debugging variables:
 
 | Variable | Default | What it does |
 |---|---|---|
 | `MAYA_MM3_MIN_CC` | - | testing only: `70` lets the setup take GPUs before RTX 30 / A100 (a V100), with a warning |
+| `MAYA_MM3_IQ_Q8K` | `1` | GGUF quants: the routed experts' inputs rounded as the CPU lane rounds them (a scale every 256 values), so an expert gives the same sums on the GPU and the CPU; `0`: a scale every 32 |
 | `MM3_TIMING`, `MM3_CONF`, `MM3_LANE_PROF`, `MM3_MISS_STATS`, `MM3_TP_PROF`, `MM3_TP_TRACE`, `MM3_NSYS` | off | debugging: the engine prints timings, the drafts' confidences, the CPU lane's and tensor parallel's profiles |
 | `MM3_PROMOTE` | - | debugging: the expert cache's promotion rule with `--tp` (`threshold,pending,decay`) |
 | `MM3_STRESS`, `MM3_STRESS_T` | off | debugging: a drafting stress run |

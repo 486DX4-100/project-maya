@@ -518,22 +518,52 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       message(STATUS "Maya: maya-mm3 not built - it needs sm_70 or newer, arch ${_strata_archs}")
     endif()
   endif()
-  if(STRATA_ENABLE_CUDA AND (_mm3_archs OR NOT _mm3_filter))
-    add_executable(maya-mm3 src/mm3/mm3_main.cpp src/mm3/mm3_model.cu src/mm3/mm3_kernels.cu src/mm3/mm3_exl3.cu
-                            src/mm3/mm3_cpu.cpp src/mm3/mm3_host.cpp src/mm3/mm3_dspark.cu
-                            src/mm3/mm3_vision.cu src/mm3/mm3_tp.cu)
-    target_include_directories(maya-mm3 PRIVATE ${_strata_gpu_include_directories} include src/mm3)
-    # (the CPU lane: the shared CPU EXL3 kernels, used as they are)
+  if((STRATA_ENABLE_CUDA AND (_mm3_archs OR NOT _mm3_filter)) OR STRATA_ENABLE_HIP)
+    # (a GGUF's weights - tools/mm3/pack_gguf.py, MiniMax's Maya quants: maya-ds4's ggml block-type kernels, src/ds4/ds4_iq,
+    #  on the device and its CPU rows on the CPU lane - mm3_gguf.cu, mm3_cpu_gg.cpp)
+    set(_mm3_gguf_sources src/mm3/mm3_gguf.cu src/ds4/ds4_iq.cu)
+    set(_mm3_gguf_cpu_sources src/mm3/mm3_cpu_gg.cpp src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
+    if(STRATA_ENABLE_HIP)
+      # AMD (HIP): a GGUF pack's engine.  The EXL3 kernels (never ported to HIP), tensor parallel, the DSpark draft and
+      # the vision tower (both from the EXL3 repo's files) stay NVIDIA's: mm3_hip_stubs.cu stands in for them
+      set(_mm3_nv_sources src/mm3/mm3_hip_stubs.cu)
+    else()
+      set(_mm3_nv_sources src/mm3/mm3_exl3.cu src/mm3/mm3_dspark.cu src/mm3/mm3_vision.cu src/mm3/mm3_tp.cu)
+    endif()
+    add_executable(maya-mm3 src/mm3/mm3_main.cpp src/mm3/mm3_model.cu src/mm3/mm3_kernels.cu src/mm3/mm3_cpu.cpp
+                            src/mm3/mm3_host.cpp ${_mm3_nv_sources} ${_mm3_gguf_sources} ${_mm3_gguf_cpu_sources})
+    target_include_directories(maya-mm3 PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
+    # (the CPU lane: the shared CPU EXL3 kernels, used as they are; ggml-cpu's dots for a GGUF's experts)
     target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
-    if(STRATA_BUILD_TESTS)
+    if(STRATA_BUILD_TESTS AND STRATA_ENABLE_HIP)
+      # (AMD: the GGUF kernels' test - the stubs' entry points hand its matrices on as maya-mm3's do)
+      add_executable(mm3_gguf_test tests/mm3_gguf_test.cu src/mm3/mm3_cpu.cpp ${_mm3_nv_sources}
+                                   ${_mm3_gguf_sources} ${_mm3_gguf_cpu_sources})
+      target_include_directories(mm3_gguf_test PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
+      target_link_libraries(mm3_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target}
+                            ${_strata_gpu_blas_target})
+      add_test(NAME mm3_gguf_test COMMAND mm3_gguf_test)
+      set_tests_properties(mm3_gguf_test PROPERTIES TIMEOUT 600)
+    endif()
+    if(STRATA_BUILD_TESTS AND NOT STRATA_ENABLE_HIP)
       # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with
       # swigluoai, the Volta / Turing tensor-core tiles and the FP16 GEMM path before sm_80
-      add_executable(mm3_exl3_test tests/mm3_exl3_test.cu src/mm3/mm3_exl3.cu)
-      target_include_directories(mm3_exl3_test PRIVATE ${_strata_gpu_include_directories} include src/mm3)
+      add_executable(mm3_exl3_test tests/mm3_exl3_test.cu src/mm3/mm3_exl3.cu ${_mm3_gguf_sources})
+      target_include_directories(mm3_exl3_test PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
       target_link_libraries(mm3_exl3_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target}
                             ${_strata_gpu_blas_target})
       add_test(NAME mm3_exl3_test COMMAND mm3_exl3_test)
       set_tests_properties(mm3_exl3_test PROPERTIES TIMEOUT 300)
+      # the GGUF weights (no model): the dense types' values, rows and GEMVs against ggml's dequantize_row_*, the GEMMs,
+      # the routed experts with swigluoai (gate and up of one type and of two) on the token / window / prompt paths
+      # against a double reference and each other, and the CPU lane's GGUF experts against the device's
+      add_executable(mm3_gguf_test tests/mm3_gguf_test.cu src/mm3/mm3_exl3.cu src/mm3/mm3_cpu.cpp
+                                   ${_mm3_gguf_sources} ${_mm3_gguf_cpu_sources})
+      target_include_directories(mm3_gguf_test PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
+      target_link_libraries(mm3_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target}
+                            ${_strata_gpu_blas_target})
+      add_test(NAME mm3_gguf_test COMMAND mm3_gguf_test)
+      set_tests_properties(mm3_gguf_test PROPERTIES TIMEOUT 600)
       # the K / V caches in every format (BF16, INT8, FP8, FP4, mixed; rows rotated or not) and the sparse attention
       # over them: exact over the decoded rows, KV streaming the same bits, each format's error (no model)
       add_executable(mm3_kv_test tests/mm3_kv_test.cu src/mm3/mm3_kernels.cu)
@@ -565,7 +595,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       endif()
     endif()
     if(_mm3_filter)
-      foreach(_t maya-mm3 mm3_exl3_test mm3_kv_test mm3_kernels_test)
+      foreach(_t maya-mm3 mm3_exl3_test mm3_gguf_test mm3_kv_test mm3_kernels_test)
         if(TARGET ${_t})
           set_target_properties(${_t} PROPERTIES CUDA_ARCHITECTURES "${_mm3_archs}")
         endif()

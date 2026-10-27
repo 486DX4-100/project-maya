@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <array>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,6 +32,8 @@
 #include "mm3_dspark.hpp"
 #include "mm3_exl3.hpp"
 #include "mm3_geo.hpp"
+#include "mm3_gguf.cuh"
+#include "mm3_gguf_host.hpp"
 #include "mm3_kernels.cuh"
 #include "mm3_os.hpp"
 #include "mm3_tp.hpp"
@@ -68,7 +71,8 @@ double now() {
 
 const std::string P = "language_model.model.";
 
-struct Src {   // an expert's nine pieces in the mapped files: (w1, w3, w2) x (trellis, suh, svh)
+struct Src {   // an expert's nine pieces in the mapped files: (w1, w3, w2) x (trellis, suh, svh) - a GGUF's: the three
+               // matrices' rows alone (pieces 0, 3, 6; the others empty)
     const uint8_t* p[9];
     size_t n[9];
 };
@@ -83,6 +87,7 @@ struct Layer {
     k::KvQ kvq;   // (--kv-cache: K's / V's quantized caches - a format other than BF16 instead of kc / vc)
     k::KvHost kvh;   // (--kv-streaming: the caches above a ring, every position in host memory too)
     x3::ExpertLayout lay;
+    GgFmt gf;   // (a GGUF's experts: their format on the CPU lane)
     size_t blob = 0;
     std::vector<Src> src;
     std::vector<int> res_slot;     // expert -> its slot in the resident region (-1: none)
@@ -141,8 +146,41 @@ struct Dev {
 
 size_t g_up = 0;   // (the load's upload_mat / upload_f32 bytes so far: the Monitor's dense weights)
 
+// a GGUF's matrix (pack_gguf.py: <pre>.weight, [n][k] in a ggml block type) onto the device as it is stored
+x3::Mat upload_gg(const Tensor& t, const Pack& pk, const std::string& pre, std::vector<void*>& owned, std::string& err) {
+    x3::Mat m;
+    const int ty = gg::type_of(t.dtype);
+    if (t.shape.size() != 2 || !gg::dense_type(ty)) {
+        err = pre + ": a " + t.dtype + " tensor the GGUF kernels do not take as a matrix";
+        return m;
+    }
+    m.fmt = gg::kFmtGG;
+    m.gg_type = ty;
+    m.n = (int) t.shape[0];
+    m.k = (int) t.shape[1];
+    const size_t rb = gg::row_bytes(ty, m.k);
+    if (rb == 0 || t.bytes != rb * (size_t) m.n || m.k % 256 != 0) {
+        err = pre + ": " + std::to_string(t.bytes) + " bytes for [" + std::to_string(m.n) + "][" + std::to_string(m.k) +
+              "] " + t.dtype;
+        return m;
+    }
+    m.ld = (int) rb;
+    void* d = nullptr;
+    if (cudaMalloc(&d, t.bytes) != cudaSuccess) {
+        err = pre + ": out of device memory";
+        return m;
+    }
+    owned.push_back(d);
+    g_up += t.bytes;
+    cudaMemcpy(d, pk.data(t), t.bytes, cudaMemcpyHostToDevice);
+    m.raw = d;
+    return m;
+}
+
 x3::Mat upload_mat(const Pack& pk, const std::string& pre, std::vector<void*>& owned, std::string& err) {
     x3::Mat m;
+    if (const Tensor* w = pk.get(pre + ".weight"); w != nullptr && gg::type_of(w->dtype) > 0)
+        return upload_gg(*w, pk, pre, owned, err);
     const Tensor* tr = pk.get(pre + ".trellis");
     const Tensor* su = pk.get(pre + ".suh");
     const Tensor* sv = pk.get(pre + ".svh");
@@ -172,7 +210,8 @@ x3::Mat upload_mat(const Pack& pk, const std::string& pre, std::vector<void*>& o
     return m;
 }
 
-// a float vector on the device: the stored F32 / F16 / BF16 tensor (+ add to every value)
+// a float vector on the device: the stored F32 / F16 / BF16 tensor (+ add to every value); a GGUF's Q8_0 (the
+// indexer's projections) dequantized exactly - ggml's value, an F16 scale times an int8
 float* upload_f32(const Pack& pk, const std::string& name, float add, std::vector<void*>& owned, size_t& n,
                   std::string& err) {
     const Tensor* t = pk.get(name);
@@ -180,13 +219,17 @@ float* upload_f32(const Pack& pk, const std::string& name, float add, std::vecto
         err = name + ": missing";
         return nullptr;
     }
+    const bool q8 = t->dtype == "Q8_0";
     const size_t es = t->dtype == "F32" ? 4 : 2;
-    n = t->bytes / es;
+    n = q8 ? t->bytes / 34 * 32 : t->bytes / es;
     std::vector<float> h(n);
     const uint8_t* d = pk.data(*t);
     for (size_t i = 0; i < n; ++i) {
         float v;
-        if (t->dtype == "F32") {
+        if (q8) {
+            const uint8_t* b = d + i / 32 * 34;
+            v = gg::host_f16((uint16_t) (b[0] | b[1] << 8)) * (float) (int8_t) b[2 + i % 32];
+        } else if (t->dtype == "F32") {
             std::memcpy(&v, d + 4 * i, 4);
         } else if (t->dtype == "BF16") {
             uint16_t b;
@@ -237,6 +280,10 @@ struct Model::Impl {
     Pack pk;
     Geo g;
     Stats st;
+    bool gguf = false;   // (the pack's format: a GGUF's - tools/mm3/pack_gguf.py - else EXL3)
+    // the RMSNorm weights' Gemma offset: the checkpoint stores w (the engine multiplies by 1 + w); llama.cpp's
+    // converter writes w + 1 into a GGUF already - added once either way
+    float norm_add() const { return gguf ? 0.0f : 1.0f; }
     std::vector<Layer> L;
     std::vector<Dev> D;
     std::vector<void*> owned;   // (cudaFree at exit, by device)
@@ -325,7 +372,58 @@ struct Model::Impl {
         (void) n0;
     }
 
+    // a GGUF's experts (pack_gguf.py: experts.E.w1 / w3 / w2.weight, each expert's slice of the GGUF's stacked tensor):
+    // the blob gate | up | down, each [rows][blocks] as stored, 256-byte aligned; gate, up and down of any types the
+    // kernels take (one each for the layer's 128 experts)
+    bool expert_layout_gg(Layer& l, int li, std::string& err) {
+        const std::string E = P + "layers." + std::to_string(li) + ".block_sparse_moe.experts.";
+        const char* parts[3] = {"w1", "w3", "w2"};
+        l.src.assign((size_t) g.n_exp, {});
+        size_t off = 0;
+        for (int r = 0; r < 3; ++r) {
+            const int n = r < 2 ? g.ff : g.dim, k = r < 2 ? g.dim : g.ff;
+            const Tensor* t0 = pk.get(E + "0." + parts[r] + ".weight");
+            const int ty = t0 ? gg::type_of(t0->dtype) : -1;
+            const size_t bytes = (size_t) n * gg::row_bytes(ty, k);
+            if (t0 == nullptr || !gg::expert_type(ty) || bytes == 0 || t0->bytes != bytes) {
+                err = E + "0." + parts[r] + ": not a [" + std::to_string(n) + "][" + std::to_string(k) +
+                      "] expert matrix the GGUF kernels take (" + (t0 ? t0->dtype : std::string("missing")) + ")";
+                return false;
+            }
+            for (int e = 0; e < g.n_exp; ++e) {
+                const Tensor* t = pk.get(E + std::to_string(e) + "." + parts[r] + ".weight");
+                if (t == nullptr || t->dtype != t0->dtype || t->bytes != bytes) {
+                    err = E + std::to_string(e) + "." + parts[r] + ": missing, or not expert 0's type and size";
+                    return false;
+                }
+                Src& s = l.src[(size_t) e];
+                s.p[r * 3] = pk.data(*t);
+                s.n[r * 3] = bytes;
+                for (int q = 1; q < 3; ++q) {
+                    s.p[r * 3 + q] = nullptr;
+                    s.n[r * 3 + q] = 0;
+                }
+            }
+            l.lay.trellis[r] = l.lay.suh[r] = l.lay.svh[r] = off;
+            l.lay.gg_type[r] = ty;
+            l.lay.k2[r] = 0;
+            off += up(bytes);
+        }
+        l.lay.fmt = gg::kFmtGG;
+        l.lay.cb = 0;
+        l.blob = off;
+        if (o.cpu_threads >= 0 && !gg_fmt(l.lay.gg_type[0], l.lay.gg_type[1], l.lay.gg_type[2], g.dim, g.ff, l.gf, err)) {
+            // (a build without ggml-cpu, or a type it has no dot for: the experts outside VRAM are staged instead)
+            info.push_back("NOTE: no CPU lane - layer " + std::to_string(li) + "'s experts: " + err);
+            std::fprintf(stderr, "maya-mm3: %s\n", info.back().c_str());
+            err.clear();
+            o.cpu_threads = -1;
+        }
+        return true;
+    }
+
     bool expert_layout(Layer& l, int li, std::string& err) {
+        if (gguf) return expert_layout_gg(l, li, err);
         const std::string E = P + "layers." + std::to_string(li) + ".block_sparse_moe.experts.";
         const char* parts[3] = {"w1", "w3", "w2"};   // gate, up, down
         const char* pieces[3] = {".trellis", ".suh", ".svh"};
@@ -378,8 +476,8 @@ struct Model::Impl {
         const Src& s = l.src[(size_t) e];
         for (int r = 0; r < 3; ++r) {
             std::memcpy(dst + l.lay.trellis[r], s.p[r * 3 + 0], s.n[r * 3 + 0]);
-            std::memcpy(dst + l.lay.suh[r], s.p[r * 3 + 1], s.n[r * 3 + 1]);
-            std::memcpy(dst + l.lay.svh[r], s.p[r * 3 + 2], s.n[r * 3 + 2]);
+            if (s.n[r * 3 + 1] > 0) std::memcpy(dst + l.lay.suh[r], s.p[r * 3 + 1], s.n[r * 3 + 1]);   // (a GGUF's: none)
+            if (s.n[r * 3 + 2] > 0) std::memcpy(dst + l.lay.svh[r], s.p[r * 3 + 2], s.n[r * 3 + 2]);
         }
     }
 
@@ -452,13 +550,13 @@ struct Model::Impl {
         for (int r = 0; r < 4; ++r) {
             const std::vector<CpuExpert> one{cpu_expert(*ex[(size_t) r].first, ex[(size_t) r].second, 1.0f)};
             const double t0 = now();
-            lane->run(one, x.data(), out.data());
+            lane_run(one, x.data(), out.data());
             t1.push_back(1e3 * (now() - t0));
         }
         std::vector<CpuExpert> four;
         for (int r = 4; r < 8; ++r) four.push_back(cpu_expert(*ex[(size_t) r].first, ex[(size_t) r].second, 0.25f));
         const double t0 = now();
-        lane->run(four, x.data(), out.data());
+        lane_run(four, x.data(), out.data());
         const double t4 = 1e3 * (now() - t0);
         lane_copy = med(tc);
         lane_cpu1 = med(t1);
@@ -484,9 +582,24 @@ struct Model::Impl {
         for (auto it = pk.t.lower_bound(pre); it != pk.t.end() && it->first.compare(0, pre.size(), pre) == 0; ++it) {
             if (it->first.find(".experts.") != std::string::npos) continue;
             const Tensor& x = it->second;
-            b += x.dtype == "BF16" || x.dtype == "F16" ? 2 * x.bytes : x.bytes;
+            // (a GGUF's Q8_0 indexer projections: F32 on the device; its other block types as stored)
+            const bool q8f = x.dtype == "Q8_0" && it->first.find(".index_") != std::string::npos;
+            b += x.dtype == "BF16" || x.dtype == "F16" ? 2 * x.bytes : q8f ? x.bytes / 34 * 128 : x.bytes;
         }
         return b;
+    }
+    // a layer's expert blob (the plan's estimate before expert_layout reads it): EXL3's three trellises with their
+    // scales, a GGUF's three matrices aligned
+    size_t blob_estimate(int li) const {
+        const std::string E = P + "layers." + std::to_string(li) + ".block_sparse_moe.experts.0.";
+        if (gguf) {
+            size_t b = 0;
+            for (const char* r : {"w1", "w3", "w2"})
+                if (const Tensor* t = pk.get(E + r + ".weight")) b += up(t->bytes);
+            return b;
+        }
+        const Tensor* t = pk.get(E + "w1.trellis");
+        return t ? (size_t) (3.0 * (double) t->bytes * 1.02) : 0;
     }
 
     // plan_memory: the context (o.max_ctx), KV streaming's ring and the staging slots that fit each GPU and the RAM.
@@ -501,11 +614,7 @@ struct Model::Impl {
         const double reserve = (o.reserve_gb < 0 ? 1.0 : o.reserve_gb) * GB + 1.0 * GB;
         size_t blob_max = 0;
         for (int li = 0; li < g.n_layers; ++li)
-            if (g.moe[(size_t) li]) {
-                // (an expert's blob: three matrices' trellis at the pack's bits, their scales)
-                const Tensor* t = pk.get(P + "layers." + std::to_string(li) + ".block_sparse_moe.experts.0.w1.trellis");
-                if (t) blob_max = std::max(blob_max, (size_t) (3.0 * (double) t->bytes * 1.02));
-            }
+            if (g.moe[(size_t) li]) blob_max = std::max(blob_max, blob_estimate(li));
         auto fixed_of = [&](size_t di, int slots) {
             double b = 0;
             for (int li : D[di].layers) b += (double) dense_bytes(li);
@@ -514,12 +623,13 @@ struct Model::Impl {
                  T * g.k_exp * (double) g.dim * 4 + T * g.k_exp * (double) g.ff * 2;   // (the chunk's scratch)
             b += (double) slots * (double) blob_max + 0.2 * GB;                    // (staging; the window's buffers)
             if (di + 1 == D.size()) {                                               // (the output head, its logits)
-                const Tensor* h = pk.get("language_model.lm_head.trellis");
+                const Tensor* h = pk.get(gguf ? "language_model.lm_head.weight" : "language_model.lm_head.trellis");
                 b += (h ? (double) h->bytes : 0.0) + 32.0 * g.vocab * 4;
                 if (o.dspark) b += 3.0 * GB;
             }
             // (the vision tower: no room - it stays in host memory, a picture's room lent by the staging slots)
-            if (x3::blas_wanted()) b += 0.2 * GB;
+            if (gguf) b += (double) gg::scratch_bytes();   // (the GGUF kernels' activations, FP16 bands, cuBLAS)
+            else if (x3::blas_wanted()) b += 0.2 * GB;
             return b;
         };
         auto kv_of = [&](size_t di, int ctx, int ring) {
@@ -591,6 +701,23 @@ struct Model::Impl {
         const double t0 = now();
         o = opt;
         if (!pk.load(o.pack, err) || !g.read(pk, err)) return false;
+        gguf = pk.str("format") == "gguf";
+        if (gguf) {
+            const Tensor* emb = pk.get(P + "embed_tokens.weight");
+            if (emb == nullptr || gg::host_row_bytes(emb->dtype, g.dim) * (size_t) g.vocab != emb->bytes) {
+                err = "the GGUF's token embedding: " + (emb ? emb->dtype + " of " + std::to_string(emb->bytes) + " bytes"
+                                                            : std::string("missing")) + ", not [vocab][dim] in a type read here";
+                return false;
+            }
+            info.push_back("weights: GGUF " + pk.str("quant_name", "?") + " (dense " + pk.str("gguf.dense", "?") +
+                           ", experts " + pk.str("gguf.experts", "?") + ")");
+            if (o.dspark && !pk.has("dspark.num_hidden_layers")) {
+                // (the DSpark draft is the EXL3 repo's dspark/: tools/mm3/pack_gguf.py indexes it from --companions)
+                info.push_back("NOTE: DSpark drafting: this GGUF pack has no draft (tools/mm3/pack_gguf.py --companions) "
+                               "- off");
+                o.dspark = false;
+            }
+        }
         int ndev = 0;
         CK(cudaGetDeviceCount(&ndev));
         if (o.gpus.empty())
@@ -679,7 +806,13 @@ struct Model::Impl {
             CK(cudaMemcpy(inv_dev[di], inv_freq.data(), inv_freq.size() * 4, cudaMemcpyHostToDevice));
             // before sm_80 (V100, T4, RTX 20): the prompt path's busy matrices as cuBLAS FP16 GEMMs over their decoded
             // weights - a handle and 160 MB of scratch for this GPU's stream (none: the tensor-core tiles take them)
-            if (x3::blas_wanted()) {
+            if (gguf) {   // (a GGUF's kernels: their activations' rows, FP16 weight bands and cuBLAS, before the weights)
+                if (!gg::prepare(d.s)) {
+                    err = "CUDA" + std::to_string(dv) + ": the GGUF kernels' scratch did not fit";
+                    return false;
+                }
+                acct[dv][kAAct] += gg::scratch_bytes();
+            } else if (x3::blas_wanted()) {
                 if (x3::blas_enable(d.s, 160)) acct[dv][kAAct] += x3::blas_bytes(d.s);
                 else info.push_back("CUDA" + std::to_string(dv) + ": no VRAM for the prompt path's FP16 GEMMs (tiles instead)");
             }
@@ -690,12 +823,12 @@ struct Model::Impl {
                 size_t n = 0;
                 std::vector<void*> ow;
                 l.moe = g.moe[(size_t) li] != 0;
-                l.in1 = upload_f32(pk, N + "input_layernorm.weight", 1.0f, ow, n, err);
-                l.post1 = upload_f32(pk, N + "post_attention_layernorm.weight", 1.0f, ow, n, err);
-                l.qn1 = upload_f32(pk, AT + "q_norm.weight", 1.0f, ow, n, err);
-                l.kn1 = upload_f32(pk, AT + "k_norm.weight", 1.0f, ow, n, err);
-                l.iqn1 = upload_f32(pk, AT + "index_q_norm.weight", 1.0f, ow, n, err);
-                l.ikn1 = upload_f32(pk, AT + "index_k_norm.weight", 1.0f, ow, n, err);
+                l.in1 = upload_f32(pk, N + "input_layernorm.weight", norm_add(), ow, n, err);
+                l.post1 = upload_f32(pk, N + "post_attention_layernorm.weight", norm_add(), ow, n, err);
+                l.qn1 = upload_f32(pk, AT + "q_norm.weight", norm_add(), ow, n, err);
+                l.kn1 = upload_f32(pk, AT + "k_norm.weight", norm_add(), ow, n, err);
+                l.iqn1 = upload_f32(pk, AT + "index_q_norm.weight", norm_add(), ow, n, err);
+                l.ikn1 = upload_f32(pk, AT + "index_k_norm.weight", norm_add(), ow, n, err);
                 l.wiq = upload_f32(pk, AT + "index_q_proj.weight", 0.0f, ow, n, err);
                 l.wik = upload_f32(pk, AT + "index_k_proj.weight", 0.0f, ow, n, err);
                 if (!err.empty()) return false;
@@ -743,7 +876,7 @@ struct Model::Impl {
                 if (!A(d.lg, (size_t) kHeadRows * g.vocab)) return false;
                 std::vector<void*> ow;
                 size_t n = 0;
-                norm1 = upload_f32(pk, P + "norm.weight", 1.0f, ow, n, err);
+                norm1 = upload_f32(pk, P + "norm.weight", norm_add(), ow, n, err);
                 if (!err.empty()) return false;
                 head = upload_mat(pk, "language_model.lm_head", ow, err);
                 if (!err.empty()) return false;
@@ -809,6 +942,16 @@ struct Model::Impl {
             CK(cudaSetDevice(hd.id));
             draftm = std::make_unique<Draft>();
             const Tensor* et = pk.get(P + "embed_tokens.weight");
+            if (gguf)   // (the GGUF's table in its block type: a row dequantized as ggml does, then BF16 - the draft's dtype)
+                draftm->set_emb_rows([this, et](int id, uint16_t* dst) {
+                    std::vector<float> r((size_t) g.dim);
+                    gg::host_row(et->dtype, pk.data(*et), g.dim, id, r.data());
+                    for (int i = 0; i < g.dim; ++i) {
+                        uint32_t u;
+                        std::memcpy(&u, &r[(size_t) i], 4);
+                        dst[i] = (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);   // (round to nearest even)
+                    }
+                });
             if (!draftm->load(pk, hd.id, hd.s, hd.blas, &head, (const uint16_t*) pk.data(*et), o.chunk, err))
                 return false;
             const auto& tl = draftm->geo().taps;
@@ -1134,6 +1277,13 @@ struct Model::Impl {
                           drafter, a[kAPool], vision, slots, o.max_ctx, d.layers.front(), d.layers.back());
             vram.push_back(b);
         }
+        // the load's work on the legacy stream (cudaMemset of the KV rings' tags, the copies) done before the first
+        // forward's on the non-blocking streams: nothing else orders the two (Windows + AMD submit queued work only when
+        // the host waits - a pending memset there read as done)
+        for (const Dev& d : D) {
+            CK(cudaSetDevice(d.id));
+            CK(cudaDeviceSynchronize());
+        }
         st.load_s = now() - t0;
         return true;
     }
@@ -1374,7 +1524,7 @@ struct Model::Impl {
         }
         if (with_cpu) {   // the CPU lane's parts while the device runs the others; then the word it waits on
             const double tl = now();
-            lane->run_multi(cpu, users, rx, T, cpu_rows, &order);
+            lane_run_multi(cpu, users, rx, T, cpu_rows, &order);
             for (int t = 0; t < T; ++t) cpu_flags[t] = 0;
             for (const auto& u : users)
                 for (const auto& tu : u) cpu_flags[tu.first] = 1;
@@ -1476,6 +1626,17 @@ struct Model::Impl {
         ++st.promoted;
     }
 
+    // the CPU lane's experts: the EXL3 lane's rows, or a GGUF's (mm3_cpu_gg.cpp) - one layer's experts a call
+    void lane_run(const std::vector<CpuExpert>& ex, const float* x, float* out) {
+        if (gguf) gg_run(*lane, g.dim, g.ff, g.limit, ex, x, out);
+        else lane->run(ex, x, out);
+    }
+    void lane_run_multi(const std::vector<CpuExpert>& ex, const std::vector<std::vector<std::pair<int, float>>>& users,
+                        const float* x, int T, float* out, const std::vector<std::pair<int, int>>* order) {
+        if (gguf) gg_run_multi(*lane, g.dim, g.ff, g.limit, ex, users, x, T, out, order);
+        else lane->run_multi(ex, users, x, T, out, order);
+    }
+
     // whether expert e of layer l has its blob in the pinned pool (a staging copy is then one DMA)
     bool pooled(const Layer& l, int e) const { return !l.host_blob.empty() && l.host_blob[(size_t) e] != nullptr; }
 
@@ -1493,6 +1654,11 @@ struct Model::Impl {
         CpuExpert c;
         c.w = w;
         const uint8_t* blob = l.host_blob.empty() ? nullptr : l.host_blob[(size_t) e];
+        if (gguf) {   // (the three matrices' rows: the pool's blob, or the GGUF's mapping)
+            c.gf = &l.gf;
+            for (int r = 0; r < 3; ++r) c.gg[r] = blob ? blob + l.lay.trellis[r] : l.src[(size_t) e].p[r * 3];
+            return c;
+        }
         for (int r = 0; r < 3; ++r) {
             strata::kernels::cpu::Exl3Part& m = c.p[r];
             if (blob) {
@@ -1630,7 +1796,7 @@ struct Model::Impl {
             int flag = 0;
             if (!cpu.empty()) {
                 const double tl = now();
-                lane->run(cpu, d.xh_h, part);
+                lane_run(cpu, d.xh_h, part);
                 st.t_lane += now() - tl;
                 flag = 1;
                 st.cpu_experts += (long) cpu.size();
@@ -1743,6 +1909,11 @@ struct Model::Impl {
             sa.n_ff = g.ff;
             sa.limit = g.limit;
             sa.hbounds = p.bounds.data();   // (before sm_80: the busy experts through the FP16 GEMM)
+            if (gguf) {   // (the rows also as FP16 - rms' xn16 - and the gate's sums of a layer whose gate and up differ
+                          //  in type in this pass's own y rows, which its down writes only after them)
+                sa.x16 = d.xn16;
+                sa.graw = d.y + (size_t) p.row0 * g.dim;
+            }
             x3::set_gate_up(sa, d.xn, g.dim, d.rowidx + p.row0, d.h16, g.ff, d.s);
             x3::set_down(sa, d.h16, g.ff, d.y + (size_t) p.row0 * g.dim, g.dim, d.s);
             // (the next pass rewrites the bounds and h16: let this one finish with them)
@@ -1835,7 +2006,8 @@ struct Model::Impl {
             err = "the context is full (" + std::to_string(o.max_ctx) + ")";
             return false;
         }
-        // the embeddings (BF16 rows from the file) -> F32 on the first layer's GPU
+        // the embeddings (rows from the file: BF16, or a GGUF's block type dequantized as ggml does) -> F32 on the first
+        // layer's GPU
         const Tensor* emb = pk.get(P + "embed_tokens.weight");
         std::vector<float> h((size_t) T * g.dim);
         const uint16_t* e16 = (const uint16_t*) pk.data(*emb);
@@ -1843,6 +2015,13 @@ struct Model::Impl {
             if (ids[t] < 0 || ids[t] >= g.vocab) {
                 err = "token id " + std::to_string(ids[t]) + " outside the vocabulary";
                 return false;
+            }
+            if (emb->dtype != "BF16") {
+                if (!gg::host_row(emb->dtype, pk.data(*emb), g.dim, ids[t], &h[(size_t) t * g.dim])) {
+                    err = "the token embedding's type " + emb->dtype + " is not read here";
+                    return false;
+                }
+                continue;
             }
             const uint16_t* r = e16 + (size_t) ids[t] * g.dim;
             for (int i = 0; i < g.dim; ++i) {
@@ -1993,6 +2172,22 @@ bool Model::load(const Options& o_in, std::string& err) {
         for (const auto& s : skipped)
             std::fprintf(stderr, "maya-mm3: NOTE: %s left out - compute capability below 7.0 (--gpus to choose)\n",
                          s.c_str());
+    }
+    if (o.tp > 0) {   // (a GGUF pack: the layer split - the tensor-parallel path splits EXL3 matrices only)
+        bool gg_pack = false;
+        std::ifstream f(o.pack + "/mm3.txt");
+        for (std::string line; std::getline(f, line);) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            gg_pack = gg_pack || line == "format gguf";
+        }
+        if (gg_pack) {
+            Options o2 = o;
+            o2.tp = 0;
+            const bool ok = p->load(o2, err);
+            p->info.insert(p->info.begin(), "NOTE: --tp " + std::to_string(o.tp) + ": not with a GGUF pack - the layer "
+                                            "split instead");
+            return ok;
+        }
     }
 #if defined(_WIN32)
     // Windows: the tensor-parallel path's host waits on the GPUs' counters depend on its launches being submitted as

@@ -165,6 +165,115 @@ class Config(unittest.TestCase):
         self.assertIn("tools/mm3/chat_template.jinja", maya.MM3_PACK_TOOLS)
         self.assertTrue((Path(maya.__file__).parent / "tools" / "mm3" / "chat_template.jinja").exists())
 
+    def test_gguf(self):
+        """A GGUF quant's config: no pictures, no DSpark, no tensor parallel - kept from an EXL3 config before neither -,
+        the quant in the installer record."""
+        (self.pack / "mm3.txt").write_text("hidden_size 6144\nmax_position_embeddings 1048576\nformat gguf\n")
+        old = {"args": ["--pack", "/old", "--max-context", "65536", "--vision", "on", "--tp", "2", "--dspark", "on",
+                        "--kv-cache", "int8"]}
+        (self.root / "maya-mm3.json").write_text(json.dumps(old))
+        pc = {"gpus": [{"index": i} for i in range(3)]}
+        p = maya.write_config_mm3(args(), pc, {"lib_dirs": []}, self.pack, 131072, Path("/models"), self.pack.parent,
+                                  "gguf-xs")
+        c = json.loads(p.read_text())
+        for k in ("--vision", "--tp", "--dspark"):
+            self.assertNotIn(k, c["args"])
+        self.assertEqual(c["args"][c["args"].index("--kv-cache") + 1], "int8")
+        self.assertEqual((c["installer"]["mm3_quant"], c["installer"]["quant"]), ("gguf-xs", "MiniMax-M3.1-Flash-Maya-XS"))
+        # a GGUF pack with the companions' vision tower and draft: pictures on, the draft off until measured
+        (self.pack / "mm3.txt").write_text("format gguf\nvision.hidden_size 1280\ndspark.num_hidden_layers 5\n")
+        (self.root / "maya-mm3.json").unlink()
+        p = maya.write_config_mm3(args(), pc, {"lib_dirs": []}, self.pack, 131072, Path("/models"), self.pack.parent,
+                                  "gguf-s")
+        a = json.loads(p.read_text())["args"]
+        self.assertEqual((a[a.index("--vision") + 1], a[a.index("--dspark") + 1]), ("on", "off"))
+        self.assertNotIn("--tp", a)
+
+
+class Gguf(unittest.TestCase):
+    """Maya's GGUF quants of MiniMax: the manifest (unpublished: no revision, no sha256), the choice, AMD allowed for
+    them, the folder and the pack's tool."""
+
+    def test_manifest(self):
+        for q, name in (("gguf-xs", "MiniMax-M3.1-Flash-Maya-XS"), ("gguf-s", "MiniMax-M3.1-Flash-Maya-S")):
+            m = maya.mm3_gguf_entry(q)
+            self.assertEqual(m["folder"], name)
+            self.assertTrue(any(n.endswith("-maya-indexers.gguf") for n in m["files"]))
+            self.assertTrue(all(n.startswith(name) for n in m["files"]))
+            self.assertGreater(m["memory_gb"], m["download_gb"])
+            self.assertFalse(maya.mm3_gguf_published(q))              # (until the upload fills in revision / sha256)
+        self.assertEqual(maya.mm3_memory_gb("exl3"), maya.MM3_MEMORY_GB)
+
+    def test_choice(self):
+        with patch.object(maya, "fail", fail):
+            self.assertEqual(maya.choose_mm3_quant(args(mm3_quant="gguf-s"), {}), "gguf-s")
+            self.assertEqual(maya.choose_mm3_quant(args(mm3_quant=None), {}), "exl3")   # (NVIDIA, none published)
+            with self.assertRaisesRegex(Failed, "not published yet"):
+                maya.choose_mm3_quant(args(mm3_quant=None, backend="hip"), {})
+
+    def test_amd_allowed_for_gguf(self):
+        with patch.object(maya, "fail", fail), patch.object(maya, "step", lambda *a: None), \
+                patch.object(maya, "check_hip_pc", return_value={"gpus": []}) as hip:
+            self.assertEqual(maya.check_pc(args(backend="hip"), "minimax", gguf=True), {"gpus": []})
+            hip.assert_called_once()
+            with self.assertRaisesRegex(Failed, "EXL3 quant runs on NVIDIA GPUs only"):
+                maya.check_pc(args(backend="hip"), "minimax")
+
+    def test_folder_and_tools(self):
+        self.assertEqual(maya.mm3_dir(args(), Path("/m"), {}, "gguf-xs"), Path("/m/MiniMax-M3.1-Flash-Maya-XS"))
+        self.assertEqual(maya.mm3_dir(args(), Path("/m"), {}), Path("/m") / maya.MM3_DIR)
+        for t in maya.MM3_GGUF_PACK_TOOLS:
+            self.assertTrue((Path(maya.__file__).parent / t).exists(), t)
+
+    def test_companions(self):
+        """Pictures and drafting for a GGUF: AMD none; a whole EXL3 download beside it as it is; else the EXL3 repo's
+        vision tower and draft in the companions folder (downloaded when not there - here already whole)."""
+        quiet = [patch.object(maya, k, lambda *a, **kw: None) for k in ("ok", "warn", "say", "step")]
+        for p in quiet:
+            p.start()
+        try:
+            with tempfile.TemporaryDirectory() as t:
+                models = Path(t)
+                d = models / "MiniMax-M3.1-Flash-Maya-XS"
+                self.assertIsNone(maya.mm3_companions_step(args(), d, True))
+                m, dm = maya.mm3_models()
+                small = dict(m, files={n: 10 for n in maya.MM3_VISION_FILES}, sha256={n: "" for n in maya.MM3_VISION_FILES})
+                small_d = dict(dm, files={n: 10 for n in dm["files"]}, sha256={n: "" for n in dm["files"]})
+                c = models / maya.MM3_COMPANIONS
+                (c / "dspark").mkdir(parents=True)
+                for n in maya.MM3_VISION_FILES:
+                    (c / n).write_bytes(b"x" * 10)
+                for n in dm["files"]:
+                    (c / "dspark" / n).write_bytes(b"x" * 10)
+                with patch.object(maya, "mm3_models", return_value=(small, small_d)), \
+                        patch.object(maya, "offer_download", side_effect=AssertionError("nothing to download")):
+                    self.assertEqual(maya.mm3_companions_step(args(), d, False), c)
+                exl3 = models / maya.MM3_DIR
+                (exl3 / "dspark").mkdir(parents=True)
+                for n in maya.MM3_VISION_FILES:
+                    (exl3 / n).write_text("x")
+                (exl3 / "dspark" / "config.json").write_text("{}")
+                self.assertEqual(maya.mm3_companions_step(args(), d, False), exl3)
+        finally:
+            for p in quiet:
+                p.stop()
+
+    def test_unpublished_needs_the_files(self):
+        """Before it is published, a GGUF quant is set up only from files already there (--model-dir), by their sizes."""
+        m = maya.mm3_gguf_entry("gguf-xs")
+        m["files"] = {n: 1000 + i for i, n in enumerate(m["files"])}   # (small stand-ins for the real sizes)
+        with tempfile.TemporaryDirectory() as d, patch.object(maya, "fail", fail), \
+                patch.object(maya, "step", lambda *a: None), patch.object(maya, "warn", lambda *a: None), \
+                patch.object(maya, "ok", lambda *a: None), patch.object(maya, "rotational", return_value=False), \
+                patch.object(maya, "mm3_gguf_entry", return_value=m):
+            d = Path(d)
+            with self.assertRaisesRegex(Failed, "not published yet"):
+                maya.mm3_gguf_model_step(args(), d, "gguf-xs")
+            for n, size in m["files"].items():
+                with (d / n).open("wb") as f:
+                    f.truncate(size)
+            self.assertEqual(len(maya.mm3_gguf_model_step(args(), d, "gguf-xs")), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

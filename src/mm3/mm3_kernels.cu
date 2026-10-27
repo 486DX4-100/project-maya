@@ -1,9 +1,12 @@
 // src/mm3/mm3_kernels.cu - maya-mm3's kernels around the EXL3 matrices (the interface: mm3_kernels.cuh).
 #include "mm3_kernels.cuh"
 
-#include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#if !defined(STRATA_USE_HIP)
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#endif
+#include "../ds4/ds4_numerics.cuh"   // (BF16 / FP8 on HIP: the same bits in plain arithmetic)
 
 #include <algorithm>
 #include <cmath>
@@ -14,7 +17,13 @@ namespace mm3::k {
 namespace {
 
 __device__ __forceinline__ float bf2f(uint16_t b) { return __uint_as_float((uint32_t) b << 16); }
-__device__ __forceinline__ uint16_t f2bf(float f) { return __bfloat16_as_ushort(__float2bfloat16_rn(f)); }
+__device__ __forceinline__ uint16_t f2bf(float f) {
+#if !defined(STRATA_USE_HIP)
+    return __bfloat16_as_ushort(__float2bfloat16_rn(f));
+#else
+    return strata::ds4::bf16_rn(f);
+#endif
+}
 __device__ __forceinline__ uint16_t f2h(float f) { return __half_as_ushort(__float2half_rn(f)); }
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -56,9 +65,13 @@ __device__ float block_absmax(float v, float* red) {
 __device__ unsigned g_wait_timeouts = 0;
 constexpr unsigned long long kWaitLimitNs = 120ull * 1000000000ull;
 __device__ __forceinline__ unsigned long long gtimer() {
+#if defined(STRATA_USE_HIP)
+    return wall_clock64() * 10ull;   // (RDNA's constant 100 MHz clock, in ns: a safety timeout, not a measurement)
+#else
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
+#endif
 }
 
 void check(const char* what) {
@@ -175,7 +188,17 @@ __device__ __forceinline__ float e2m1_val(uint32_t c) {
 }
 // E4M3 (FP8): the nearest of v (saturated at 448), and a code's value (exact; no NaN codes are written)
 __device__ __forceinline__ uint32_t e4m3_enc(float v) {
+#if !defined(STRATA_USE_HIP)
     return (uint32_t) __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+#else   // (the same code: ds4_numerics' rounding - ties to even, saturated - then that value's bits)
+    if (!(v == v)) return 0x7fu;
+    const float a = fabsf(strata::ds4::e4m3_round(v));
+    const uint32_t s = (__float_as_uint(v) >> 31) << 7, f = __float_as_uint(a);
+    const int E = (int) ((f >> 23) & 0xffu) - 127;
+    if (a == 0.0f) return s;
+    if (E < -6) return s | (uint32_t) (a * 512.0f);                     // (subnormal: m 2^-9)
+    return s | ((uint32_t) (E + 7) << 3) | ((f >> 20) & 7u);
+#endif
 }
 __device__ __forceinline__ float e4m3_dec(uint32_t b) {
     const uint32_t e = (b >> 3) & 15u, m = b & 7u;
@@ -786,9 +809,13 @@ __global__ void mxfp8_kernel(const uint8_t* w, const uint8_t* sc, int K, uint16_
     const size_t n = blockIdx.y;
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < K; k += gridDim.x * blockDim.x) {
         const uint8_t e = sc[n * (size_t) (K / 32) + (size_t) (k / 32)];
+#if !defined(STRATA_USE_HIP)
         __nv_fp8_e4m3 f;
         f.__x = w[n * (size_t) K + k];
         const float v = ldexpf((float) f, (int) e - 127);   // (exact: E4M3's 3 mantissa bits fit BF16's 7)
+#else
+        const float v = ldexpf(strata::ds4::e4m3_value(w[n * (size_t) K + k]), (int) e - 127);
+#endif
         out[n * (size_t) K + k] = f2bf(v);
     }
 }
@@ -804,9 +831,13 @@ __global__ void __launch_bounds__(256) mx_rows_kernel(const uint8_t* w, const ui
     __shared__ float tab[256];
     __shared__ __align__(16) float xs[R][512];
     {
+#if !defined(STRATA_USE_HIP)
         __nv_fp8_e4m3 f;
         f.__x = (uint8_t) threadIdx.x;
         tab[threadIdx.x] = (float) f;
+#else
+        tab[threadIdx.x] = strata::ds4::e4m3_value((uint8_t) threadIdx.x);
+#endif
     }
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int n0 = blockIdx.x * 32 + warp * 4;

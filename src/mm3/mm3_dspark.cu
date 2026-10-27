@@ -1,6 +1,8 @@
 // src/mm3/mm3_dspark.cu - maya-mm3's DSpark draft (mm3_dspark.hpp).
 #include "mm3_dspark.hpp"
 
+#include <functional>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -38,7 +40,13 @@ struct Draft::Impl {
     cublasHandle_t blas = nullptr;
     const x3::Mat* head = nullptr;
     const uint16_t* emb = nullptr;
+    std::function<void(int, uint16_t*)> emb_row;   // (set_emb_rows: a GGUF's table, dequantized a row at a time)
     std::vector<void*> owned;
+    // row id of the target's token table as BF16 into dst (D values)
+    void row(int id, uint16_t* dst) const {
+        if (emb_row) emb_row(id, dst);
+        else std::memcpy(dst, emb + (size_t) id * g.dim, (size_t) g.dim * 2);
+    }
     size_t bytes = 0;
     struct MX {   // an MXFP8 matrix [N][K] as stored: E4M3 weights, a UE8M0 scale every 32
         const uint8_t *w = nullptr, *s = nullptr;
@@ -253,7 +261,9 @@ struct Draft::Impl {
         DK(cudaHostAlloc((void**) &anc, (size_t) D * 2, cudaHostAllocMapped | cudaHostAllocPortable));
         {
             std::vector<float> mf((size_t) D);
-            const uint16_t* r = emb + (size_t) g.mask_id * D;
+            std::vector<uint16_t> mrow((size_t) D);
+            row(g.mask_id, mrow.data());
+            const uint16_t* r = mrow.data();
             for (int i = 0; i < D; ++i) {
                 const uint32_t u = (uint32_t) r[i] << 16;
                 std::memcpy(&mf[(size_t) i], &u, 4);
@@ -308,7 +318,7 @@ struct Draft::Impl {
         // the block's embeddings: the anchor, then the mask token (the target's table, BF16 -> F32), and the
         // positions - made on the device (the anchor's row read where the host put it)
         DK(cudaStreamSynchronize(s));   // (the last proposal done with anc)
-        std::memcpy(anc, emb + (size_t) anchor * D, (size_t) D * 2);
+        row(anchor, anc);
         k::draft_block(anc, maskf, D, B, P, g.window, h, pos, lo, s);
         const float scale = 1.0f / std::sqrt((float) g.hd);
         for (auto& l : L) {
@@ -379,6 +389,7 @@ bool Draft::load(const Pack& pk, int dev, cudaStream_t s, cublasHandle_t blas, c
                  const uint16_t* emb, int max_rows, std::string& err) {
     return p->load(pk, dev, s, blas, head, emb, max_rows, err);
 }
+void Draft::set_emb_rows(std::function<void(int, uint16_t*)> f) { p->emb_row = std::move(f); }
 const DraftGeo& Draft::geo() const { return p->g; }
 bool Draft::context(const float* taps, int T, int pos0, std::string& err, size_t stride) {
     return p->context(taps, T, pos0, stride, err);
