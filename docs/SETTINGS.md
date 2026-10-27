@@ -931,6 +931,16 @@ The engine's log says what happened (`ds4 slots: saved/took back/wrote ...`; the
 DSpark blocks are loaded, so a slot from another model, another pack or an engine that changed the state's layout is
 refused rather than read.
 
+## DeepSeek: tensor parallel groups of 3 with a GGUF pack (experimental)
+
+A GGUF pack's tensor parallel width must divide the attention heads (64) and the output groups (8), so `--tp 3`
+falls back to a narrower group (the log says `tensor parallel 3 -> ...`), although Maya-S's and Maya-XS's experts
+split in 3 (n_ff 2304: 768 rows a member, whole 256-value blocks) and not in 2.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_TP_UNEVEN_HEADS` | off | `1`: keep a width the heads do not split in evenly. The heads go over the most members they split among evenly (64 heads over 3: 2 members of 32), the remaining member computes only its FFN share, as a non-GGUF pack's group does; a BF16 / Q8_0 head whose vocabulary does not split evenly takes 128-column shares. The FFN must still split in whole blocks |
+
 ## MiniMax-M3.1-Flash
 
 `./maya.sh --setup --model MiniMax-M3.1-Flash` writes `maya-mm3.json` (Maya's GGUF quants: their own, below) with what fits this PC: the context (below), the
