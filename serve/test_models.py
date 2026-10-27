@@ -41,7 +41,7 @@ def glm_cfg(d: Path, name="maya-maya-m.json", **extra) -> Path:
     return p
 
 
-def ds4_cfg(d: Path, name="maya-gguf-q8.json", drafter=True, vision=False) -> Path:
+def ds4_cfg(d: Path, name="maya-gguf-q8.json", drafter=True, vision=False, quant="gguf-q8") -> Path:
     pack = d / "DeepSeek-V4.1-Flash" / "pack"
     pack.mkdir(parents=True, exist_ok=True)
     (pack / "tensors.txt").write_text("t blk.0.x\n" + ("t mtp.0.w\n" if drafter else ""))
@@ -50,7 +50,7 @@ def ds4_cfg(d: Path, name="maya-gguf-q8.json", drafter=True, vision=False) -> Pa
     if drafter:
         args += ["--dspark", "on"]
     cfg = {"exe": "/b/maya-ds4", "args": args, "model_name": "deepseek-v4.1-flash", "gpu": [0, 1],
-           "installer": {"family": "deepseek", "ds4_quant": "gguf-q8", "written": "2026-10-09 10:00"}}
+           "installer": {"family": "deepseek", "ds4_quant": quant, "written": "2026-10-09 10:00"}}
     p = d / name
     p.write_text(json.dumps(cfg, indent=1))
     return p
@@ -263,6 +263,32 @@ class Settings(unittest.TestCase):
         self.assertEqual([x["index"] for x in out["gpus"]], [0, 1])               # (GPU 1: named by a config only)
 
 
+    def test_installs_the_setup_no_longer_lists_are_still_listed(self):
+        """v1.1.34: unsloth's UD-Q4_K_XL (gguf-q4) and GLM's EXL3-sc_4.10bpw are out of the setup's pickers; a config of
+        either is listed, shown and settable on the Models page as before."""
+        g = glm_cfg(self.d, name="maya-exl3-sc_4.10bpw.json",
+                    installer={"models_dir": str(self.d), "quant": "EXL3-sc_4.10bpw", "written": "2026-10-20 09:00"})
+        ds = ds4_cfg(self.d, name="maya-gguf-q4.json", quant="gguf-q4")
+        with mock.patch.object(M, "machine_gpus", return_value=[]):
+            out = M.listing(self.d, None)
+        by = {m["file"]: m for m in out["models"]}
+        self.assertEqual(by[ds.name]["quant"], "UD-Q4_K_XL")
+        self.assertEqual(by[g.name]["quant"], "EXL3-sc_4.10bpw")
+        self.assertTrue(by[ds.name]["ok"] and by[g.name]["ok"])
+        cfg = M.read(ds)
+        self.assertEqual(M.settings_of(cfg)["context"], 65536)
+        self.assertEqual(M.apply(cfg, {"context": 131072})["args"][cfg["args"].index("--max-context") + 1], "131072")
+        self.assertEqual(M.maya_quants.config_label(cfg), "DeepSeek V4.1 · UD-Q4_K_XL")
+
+    def test_the_qwen_models_label(self):
+        """The CYBER-FROST config's quant shows as Q5_K_M beside the model's name the page writes from model_name; the
+        label the server reports is "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M"."""
+        cfg = {"exe": "/b/maya", "args": ["--pack", "/p", "--ple-gguf", "/g.gguf"], "model_name": "cyber-frost-3.8-ps",
+               "installer": {"family": "qwen", "quant": "CYBER-FROST-3.8-PS", "qwen_quant": "q5_k_m"}}
+        self.assertEqual(M.quant_label(cfg, Path("maya-cyber-frost.json")), "Q5_K_M")
+        self.assertEqual(M.maya_quants.config_label(cfg), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M")
+
+
 class Page(unittest.TestCase):
     """GET /api/models, POST /api/models/settings and /api/models/switch."""
 
@@ -382,6 +408,20 @@ class Page(unittest.TestCase):
         self.assertEqual(json.loads((self.d / M.SWITCH_FILE).read_text())["why"], "switch")
         s, b = self.req("POST", "/api/models/switch", {"file": self.other.name})
         self.assertEqual(s, 400)                                              # (already starting again)
+
+    def test_switch_writes_the_models_own_defaults(self):
+        """A switch to a config without its model's sampling and level (an older setup's), or with another model's,
+        writes the model's own into it (the setup's MODEL_DEFAULTS), the config before kept beside it."""
+        cfg = json.loads(self.other.read_text())                             # (DeepSeek's)
+        cfg.pop("reasoning_effort", None)
+        cfg["sampling"] = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}      # (not DeepSeek's)
+        self.other.write_text(json.dumps(cfg))
+        s, b = self.req("POST", "/api/models/switch", {"file": self.other.name})
+        self.assertEqual(s, 202, b)
+        got = json.loads(self.other.read_text())
+        self.assertEqual((got["sampling"], got["reasoning_effort"]), ({"temperature": 1.0, "top_p": 1.0}, "high"))
+        self.assertTrue((self.d / (self.other.name + ".prev")).exists())
+        self.assertFalse(M.own_defaults(self.other))                         # (its own already: nothing written)
 
     def test_refused(self):
         for f in (self.cfg.name, "../maya-x.json", "maya-none.json", "maya-maya-m.shared-settings.json", None):

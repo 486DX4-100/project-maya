@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Project Maya - set up and start GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017, MiniMax-M3.1-Flash or CYBER-FROST-3.8-PS on
-your own GPU(s).  CYBER-FROST-3.8-PS: CUDA from V100 on and HIP, Linux and Windows, text only.
+"""Project Maya - set up and start GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017, MiniMax-M3.1-Flash or Qwen-3.8-Flash-Next
+(CYBER-FROST) on your own GPU(s).  Qwen-3.8-Flash-Next (CYBER-FROST): CUDA from V100 on and HIP, Linux and Windows, text only.
 GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
 validated), Linux and Windows, text only.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
 and Windows; their GGUFs on HIP too (their EXL3 quants: experimental there).
@@ -115,8 +115,8 @@ DEFAULT_CONTEXT = 32768
 # args turns it off; a setup again keeps what the config says
 KV_STREAMING = "on"
 MODEL_NAME = "glm-5.3-flash"
-SAMPLING = {"temperature": 1.0, "top_p": 0.95}     # the dashboard's and the API's defaults for requests that set none
-EFFORT = "high"                                    # thinking level for requests that name none (GLM's High)
+SAMPLING, EFFORT = Q.MODEL_DEFAULTS["glm"]        # GLM's own sampling (its generation_config) and level (Max) -
+#                                                    the dashboard's and the API's defaults for requests that set none
 HF = "https://huggingface.co/{repo}/resolve/{revision}/{path}"
 # The models the installer can download: Project Maya's own quants, made from Z.ai's FP8 release (their model card
 # has the measurements against it).
@@ -513,6 +513,10 @@ MODELS = {
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
 }
+# Downloads the setup's model list no longer offers (the owner, v1.1.34): they stay in MODELS, so --model EXL3-sc_4.10bpw,
+# an install's update and a config that names them work as before; the list shows one only on a PC that has it set up
+# (its default there: a setup again, --yes included, keeps the model).
+MODELS_BY_HAND = ("EXL3-sc_4.10bpw",)
 # The DFlash2 drafter the setup offers instead of drafting with the model's MTP block (--dflash): a small block drafter
 # made for GLM-5.3-Flash (any of the quants above), pinned to the revision it was measured with and verified.
 DFLASH = {"repo": "Anbeeld/GLM-5.3-Flash-DFlash2-GGUF", "revision": "f3569acb7f9cee95e66d24442d75536eb00ab842",
@@ -545,6 +549,9 @@ DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-
               "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw", "abliterated-128g": "Mix-128G",
               "abliterated-256g": "Mix-256G"}
 DS4_MAYA = ("maya-s", "maya-m", "maya-xs")
+# unsloth's UD-Q4_K_XL is no longer in the setup's list (the owner, v1.1.34): --ds4-quant gguf-q4 and an install of it
+# work as before; the list shows it only on a PC that has it set up
+DS4_BY_HAND = ("gguf-q4",)
 # ... and orcarouter's abliterated model (its refusals removed from the weights) as GGUFs (download_gguf.json's
 # "abliterated": Mix-128G and Mix-256G, the experts in other low-bit types layer by layer; a gated repo, so its download
 # sends the user's Hugging Face token), in <models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/<version>, served under a
@@ -566,8 +573,8 @@ DS4_DEFAULT_CONTEXT = 65536
 DS4_RECOMMENDED_CONTEXT = 262144
 DS4_KV_BYTES = 1126                                 # a position's caches on each GPU (~1.1 KB: FP4 KV, index keys)
 DS4_MODEL_NAME = "deepseek-v4.1-flash"
-DS4_SAMPLING = {"temperature": 1.0, "top_p": 1.0}   # DeepSeek's own
-DS4_EFFORT = "high"                                 # (encoding.py's default: a reasoning effort of 75)
+DS4_SAMPLING, DS4_EFFORT = Q.MODEL_DEFAULTS["deepseek"]   # DeepSeek's own (its card; encoding.py's default: an
+#                                                           effort of 75)
 DS4_MEMORY_GB = 230                                 # VRAM + RAM that hold it all (211 GB of weights, the pinned
                                                     # tables); with less the engine reads experts from the SSD
 DS4_35 = DS4 + "-3.5bpw"                            # the same model in LibertAIDAI's EXL3 quant at 3.5 bits
@@ -611,10 +618,10 @@ MM3_KV_FORMAT = "int8"                             # the format the engine uses 
 MM3_PARALLEL_VRAM_SHARE = 1 / 3
 MM3_MODEL_NAME = "minimax-m3.1-flash"
 # MiniMax's model card and generation_config.json (54e4e69): temperature 1.0, top-p 0.95 - no top-k, no min-p
-MM3_SAMPLING = {"temperature": 1.0, "top_p": 0.95}
+MM3_SAMPLING = Q.MODEL_DEFAULTS["minimax"][0]
 # thinking level for requests that name none: "auto" - the card names no default effort, so none is set and the
 # template's own default applies (adaptive: the model decides whether to think); the card's five efforts low .. max
-MM3_EFFORT = "auto"
+MM3_EFFORT = Q.MODEL_DEFAULTS["minimax"][1]
 MM3_MEMORY_GB = 250                                # VRAM + RAM: 179 GiB of weights, the experts not in VRAM pinned
 MM3_PROFILE = ROOT / "data" / "expert-profile-mm3.bin"
 # ... or Project Maya's own GGUF quants of it (tools/mm3/download_gguf.json, packed by tools/mm3/pack_gguf.py): the routed
@@ -645,12 +652,12 @@ MM3_GGUF_MIN_CC = 70                               # (maya-ds4's GGUF kernels' r
 # template is the GGUF's (thinking always on, reasoning effort low / medium / xhigh; Qwen's XML tool calls); sampling
 # its card's (general.sampling: temperature 1.0, top-p 0.95, top-k 20).  The MTP drafter is built from the GGUF's
 # NextN block (tools/mtp_from_gguf.py) and kept where it measures faster on this PC.
-QWEN = "CYBER-FROST-3.8-PS"
+QWEN = "CYBER-FROST-3.8-PS"                        # (its id: the folder, the installer record, --model; never shown)
+QWEN_SHOWN = Q.SHOWN["qwen"]                       # (its name on screen: "Qwen-3.8-Flash-Next (CYBER-FROST)")
 QWEN_MANIFEST = ROOT / "tools" / "qwen" / "download.json"
 QWEN_PACK_TOOLS = ("tools/iq_pack.py", "tools/strata_tokenizer.py", "tools/mtp_from_gguf.py", "tools/mtp_rt.py")
 QWEN_MODEL_NAME = "cyber-frost-3.8-ps"
-QWEN_SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20}
-QWEN_EFFORT = "xhigh"                              # (its template's default: Qwen's "xhigh", the server's "max" level)
+QWEN_SAMPLING, QWEN_EFFORT = Q.MODEL_DEFAULTS["qwen"]   # (its card's; its template's default level: Qwen's "xhigh")
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]     # (the model's native reach: 256K)
 QWEN_DEFAULT_CONTEXT = 65536
 QWEN_MIN_CC = 70                                   # (V100 on: the Qwen path's kernels are validated from Volta)
@@ -1506,7 +1513,7 @@ PARALLEL_FAMILIES = ("glm", "deepseek", "minimax")
 
 def check_parallel(a, family: str) -> None:
     if getattr(a, "parallel", None) is not None and family not in PARALLEL_FAMILIES:
-        model = DS4 if family == "deepseek" else MM3 if family == "minimax" else QWEN
+        model = DS4 if family == "deepseek" else MM3 if family == "minimax" else QWEN_SHOWN
         fail(f"--parallel is supported by GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash; {model} serves "
              "one request at a time",
              "remove --parallel; saved conversations do not enable simultaneous decoding")
@@ -1532,8 +1539,8 @@ def choose_family(a, prev: dict) -> str:
              "turboderp's EXL3 quants: from one GPU up, the experts that do not fit in VRAM from RAM and the SSD; "
              "NVIDIA (AMD: experimental); pictures with its vision encoder."),
             (DS4, "experimental",
-             "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUFs (UD-Q8_K_XL 508 GB or "
-             "UD-Q4_K_XL 501 GB; NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-128G or "
+             "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUF (UD-Q8_K_XL, 508 GB; "
+             "NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-128G or "
              "Mix-256G, its refusals removed) or LibertAIDAI's EXL3 quants at 2.9 or "
              "3.5 bits with DeepSeek's two Engram tables (414 / 461 GB; NVIDIA V100 or newer, DSpark drafting, "
              "pictures from RTX 30 / A100 on); "
@@ -1548,7 +1555,7 @@ def choose_family(a, prev: dict) -> str:
                                      "GB: NVIDIA from V100 on and AMD)"
                                      if any(map(mm3_gguf_published, ("gguf-xs", "gguf-s"))) else "") + "."),
             (Q.shown("qwen", "q5_k_m", qwen_entry()["download_gb"]), "new",
-             f"{QWEN} (180B, 10 of 512 experts a token): Blackfrost-AI's cybersecurity fine-tune of Qwen3.8-Flash-Next "
+             f"{QWEN_SHOWN}: 180B, 10 of 512 experts a token; Blackfrost-AI's cybersecurity fine-tune of Qwen3.8-Flash-Next "
              "in peasantsmith's GGUF, on Maya's own Qwen path; NVIDIA from V100 on or AMD, Linux or Windows; all its "
              f"experts in about {qwen_entry()['memory_gb']:.0f} GB of VRAM and RAM together{here}, with less the others "
              "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only.")]
@@ -1569,7 +1576,7 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         return "local", first
     if a.model:
         return "download", a.model
-    opts = [q for q in MODELS]
+    opts = [q for q in MODELS if q not in MODELS_BY_HAND or q == inst.get("quant")]   # (a chosen-by-hand download: only where it is installed)
     # cards of 24 GB or less: Maya-S24 (its 4-bit attention leaves ~1.5 GB more of the card for experts - decode about
     # 14% faster there), else Maya-S
     try:
@@ -4394,9 +4401,10 @@ def choose_ds4_quant(a, prev: dict) -> str:
     except Exception:  # noqa: BLE001 - no NVIDIA tools
         ccs = []
     exl3_ok = hip or not ccs or max(ccs) >= DS4_MIN_CC
-    keys = maya + list(DS4_ABL) + [k for k in DS4_QUANTS if k not in DS4_MAYA + DS4_ABL and (exl3_ok or k not in DS4_EXL3)]
-    abl = ds4_abl_recommended(hip)
     before = (prev.get("installer") or {}).get("ds4_quant")
+    keys = maya + list(DS4_ABL) + [k for k in DS4_QUANTS if k not in DS4_MAYA + DS4_ABL and (exl3_ok or k not in DS4_EXL3)
+                                   and (k not in DS4_BY_HAND or k == before)]   # (a chosen-by-hand one: only where it is installed)
+    abl = ds4_abl_recommended(hip)
     default = before if before in keys else maya[0] if maya else DS4_DEFAULT_QUANT
     gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya + [k for k in DS4_ABL if k in keys]}
     for k in DS4_ABL:   # (as the other entries: the whole download, Maya's n-gram tables with it)
@@ -4774,8 +4782,7 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            **({"backend": "hip"} if hip else {}),
            "model_name": DS4_ABL_MODEL_NAME if quant in DS4_ABL else DS4_MODEL_NAME,
            "gpu": [g["index"] for g in pc["gpus"]],
-           "sampling": old.get("sampling") or dict(DS4_SAMPLING),
-           "reasoning_effort": old.get("reasoning_effort") or DS4_EFFORT,
+           "sampling": dict(DS4_SAMPLING), "reasoning_effort": DS4_EFFORT,   # (the model's own, every setup)
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
     for k in ("host", "api_key", "cors_origins", "mcp_servers"):
         if old.get(k) is not None:
@@ -5292,10 +5299,11 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
            "model_name": MM3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
-           "sampling": old.get("sampling") or (folder_sampling(d, MM3_SAMPLING) if own else dict(MM3_SAMPLING)),
+           # (the model's own, every setup - an EXL3 folder of the user's own: its generation_config.json's)
+           "sampling": folder_sampling(d, MM3_SAMPLING) if own else dict(MM3_SAMPLING),
            "reasoning_effort": MM3_EFFORT,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
-    for k in ("reasoning_effort", "host", "api_key", "cors_origins", "mcp_servers"):
+    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
         if old.get(k) is not None:
             cfg[k] = old[k]
             kept.append(k)
@@ -5413,7 +5421,7 @@ def qwen_entry() -> dict:
     man = read_json(QWEN_MANIFEST)
     if not man.get("files") or not man.get("revision"):
         fail(f"{QWEN_MANIFEST} is missing or damaged", "restore it (git checkout tools/qwen/download.json)")
-    return {"about": f"{QWEN} in peasantsmith's GGUF ({man.get('about', 'Q5_K_M')}); "
+    return {"about": f"{QWEN_SHOWN} in peasantsmith's GGUF ({man.get('about', 'Q5_K_M')}); "
                      f"{man.get('license', 'the Qwen Community License')}",
             "format": "qwen-gguf", "repo": man["repo"], "revision": man["revision"], "folder": "",
             "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
@@ -5449,7 +5457,7 @@ def qwen_dir(a, models: Path, prev: dict) -> Path:
 def qwen_model_step(a, d: Path) -> list | None:
     """The GGUF in d (downloaded when it is not there, then checked against its published sha256): [the file], or None
     when nothing was downloaded."""
-    step(5, f"the model ({QWEN})")
+    step(5, f"the model ({QWEN_SHOWN})")
     m = qwen_entry()
     files = [d / n for n in m["files"]]
     missing = [f for f in files if file_incomplete(m, f)]
@@ -5459,7 +5467,7 @@ def qwen_model_step(a, d: Path) -> list | None:
         if not sha256_checked(f, m["sha256"][f.name]):
             fail(f"{f.name}: the sha256 does not match the published one - still being downloaded, or damaged",
                  f"let the download finish, or delete the file and run {ME} --download-model")
-    ok(f"{QWEN}: {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
+    ok(f"{QWEN_SHOWN}: {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: the engine reads the n-gram table (52 GB) from it row by row on every "
              "token, and the experts RAM cannot hold - use an NVMe SSD (--models-dir)")
@@ -5529,9 +5537,9 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     cfg = {"exe": str(EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
            "model_name": QWEN_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
-           "sampling": old.get("sampling") or dict(QWEN_SAMPLING), "reasoning_effort": QWEN_EFFORT,
+           "sampling": dict(QWEN_SAMPLING), "reasoning_effort": QWEN_EFFORT,   # (the model's own, every setup)
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
-    for k in ("reasoning_effort", "host", "api_key", "cors_origins", "mcp_servers", "layer_split"):
+    for k in ("host", "api_key", "cors_origins", "mcp_servers", "layer_split"):
         if old.get(k) is not None:
             cfg[k] = old[k]
             kept.append(k)
@@ -5647,7 +5655,7 @@ def set_up_qwen(a, prev: dict) -> Path | None:
         warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{m['memory_gb']:.0f} GB that hold all of its "
              "experts - the engine reads the others from the SSD when they are routed (slower)")
     step(2, "your choices")                            # 2
-    ok(f"model: {Q.shown('qwen', 'q5_k_m', m['download_gb'])} - {QWEN}, a fine-tune of Qwen3.8-Flash-Next "
+    ok(f"model: {Q.shown('qwen', 'q5_k_m', m['download_gb'])} - a fine-tune of Qwen3.8-Flash-Next "
        "(Qwen Community License 1.0: LICENSE.qwen-community-1.0; a Model-as-a-Service business needs Qwen's own license)")
     rec = qwen_recommended_context(vram)
     ctx = choose_context(a, prev_ctx, QWEN_CONTEXTS, rec)
@@ -5705,7 +5713,7 @@ def model_option(a) -> str | None:
     hit = Q.resolve(a.model, list(MODELS))
     if hit is None:
         return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
-                f", {DS4}, {MM3}, cyber-frost ({QWEN}), or a GLM-5.3-Flash download: " + ", ".join(MODELS))
+                f", {DS4}, {MM3}, cyber-frost = {QWEN_SHOWN}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))
     family, key = hit
     if family == "glm":
         a.model = key
@@ -5740,19 +5748,20 @@ def main() -> int:
     ap.add_argument("--model", metavar="MODEL",
                     help="which model and files (default: asked): a Maya quant - "
                          + ", ".join(i for _, _, _, i in Q.QUANTS) +
-                         f" - or {DS4} / {MM3} (their files asked, or --ds4-quant / --mm3-quant), cyber-frost ({QWEN}),"
+                         f" - or {DS4} / {MM3} (their files asked, or --ds4-quant / --mm3-quant), cyber-frost = {QWEN_SHOWN},"
                          " or a GLM-5.3-Flash "
                          "download by its name (" + ", ".join(MODELS) + "; every name used before still works)")
-    ap.add_argument("--model-dir", help=f"use {DS4}'s (or MiniMax's, {QWEN}'s) files you already have: their folder "
-                                        "(a GGUF's shards, or the EXL3 quant's files and the Engram shards 47 / 48 of "
-                                        "DeepSeek's repo), or an EXL3 folder of GLM-5.3-Flash or MiniMax-M3.1-Flash at "
-                                        "any bit rate (whole by its own index; its own sampling and chat template are "
-                                        "used); it must be writable - the pack is written inside it")
+    ap.add_argument("--model-dir", help=f"use the files you already have of {DS4}, MiniMax or {QWEN_SHOWN}: their "
+                                        "folder (a GGUF's shards, or the EXL3 quant's files and the Engram shards 47 / "
+                                        "48 of DeepSeek's repo), or an EXL3 folder of GLM-5.3-Flash or "
+                                        "MiniMax-M3.1-Flash at any bit rate (whole by its own index; its own sampling "
+                                        "and chat template are used); it must be writable - the pack is written inside "
+                                        "it")
     ap.add_argument("--ds4-quant", choices=list(DS4_QUANTS) + [DS4_ABL_ALIAS],
                     help=f"{DS4}'s files: maya-s = Maya's quant (the experts in 2-3 bits; the default once "
                          "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, with its own "
                          "2-bit drafter: the whole model in a 128 GB PC's memory), gguf-q8 = unsloth's UD-Q8_K_XL GGUF, gguf-q4 = its UD-Q4_K_XL "
-                         "(dense weights Q8_0: less VRAM), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
+                         "(dense weights Q8_0: less VRAM; chosen by hand only, not in the setup's list), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
                          "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer, AMD experimental); "
                          "abliterated-128g / abliterated-256g = orcarouter's abliterated model (its refusals removed) "
                          "as its Mix-128G / Mix-256G GGUF (~114 / ~236 GB of VRAM + RAM, with Maya's Q6_K n-gram "

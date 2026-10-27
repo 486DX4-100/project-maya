@@ -133,9 +133,11 @@ export function modelLogo(name) {
   return m ? {src: `web/logo-${m[1]}.svg`, mono: !!m[2]} : null;
 }
 const NAME_WORDS = {glm: "GLM", deepseek: "DeepSeek", minimax: "MiniMax", qwen: "Qwen"};
-export function modelName(id) {
+// short: the form for a tight place (the chat header's button) - "Qwen-3.8-Flash-Next" for the CYBER-FROST fine-tune, whose full
+// name is "Qwen-3.8-Flash-Next (CYBER-FROST)" (its id, "cyber-frost-3.8-ps", is what the API reports and stays)
+export function modelName(id, short) {
   const cf = String(id || "").match(/^cyber-frost-([\d.]+)/i);
-  if (cf) return `CYBER-FROST ${cf[1]}`;
+  if (cf) return `Qwen-${cf[1]}-Flash-Next${short ? "" : " (CYBER-FROST)"}`;
   return String(id || "").split(/[-_\s]+/).filter(Boolean).map((w) => {
     const lw = w.toLowerCase(), m = lw.match(/^([a-z]+)(\d.*)$/);
     if (NAME_WORDS[lw]) return NAME_WORDS[lw];

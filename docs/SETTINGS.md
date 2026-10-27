@@ -1195,9 +1195,10 @@ The switch quantizes both the prompt activations and the FP16 SwiGLU intermediat
 This approximate prompt path can change answers; it is off by default. It uses a separate workspace for each
 host thread, device and stream, and keeps the existing path during graph capture.
 
-## CYBER-FROST-3.8-PS
+## Qwen-3.8-Flash-Next (CYBER-FROST)
 
-`./maya.sh --setup --model cyber-frost` sets up peasantsmith's GGUF of Blackfrost-AI's CYBER-FROST-3.8 (a fine-tune of
+`./maya.sh --setup --model cyber-frost` sets up Qwen-3.8-Flash-Next (CYBER-FROST): peasantsmith's GGUF of Blackfrost-AI's
+CYBER-FROST-3.8 (a fine-tune of
 Qwen3.8-Flash-Next: 512 experts, 10 a token, GatedDeltaNet and sparse-attention layers, an n-gram table, an MTP block;
 the Qwen Community License 1.0, `LICENSE.qwen-community-1.0`). One 112.5 GB file, downloaded from the commit
 `tools/qwen/download.json` pins and checked against its sha256. It runs on the `maya` engine's own Qwen path, from the

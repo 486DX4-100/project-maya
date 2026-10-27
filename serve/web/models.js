@@ -70,7 +70,8 @@ async function switchTo(m) {
     (restarts
       ? `<p>Maya stops <b>${esc(run ? titleOf(run) : "the model running now")}</b> and loads <b>${esc(titleOf(m))}</b> from ` +
         `<code>${esc(m.file)}</code>. That takes a few minutes.</p><ul>` +
-        "<li>Your chats stay here. Each model keeps its own chat settings.</li>" +
+        `<li>Your chats stay here. The chat settings start at ${esc(titleOf(m))}'s own standard parameters and thinking ` +
+        "level: a model's are not another's.</li>" +
         `<li>Apps using the API get a “try again” until it is back, then the model name <code>${esc(m.model)}</code>.</li>` +
         (S.busy ? "<li>The answer being written finishes first.</li>" : "") + "</ul>"
       : `<p><b>${esc(titleOf(m))}</b> becomes the model Maya starts next. This server was not started by maya.sh or ` +
@@ -143,6 +144,15 @@ function setDraft(patch) {
 
 async function saveSettings(m) {
   if (MS.saving) return;
+  // the running model's, where Maya starts again by itself: the reload is said and confirmed first, as a switch is
+  if (m.running && MS.data.restarts) {
+    const ok = await confirmDialog(`Restart ${titleOf(m)} with these engine settings?`,
+      `<p>Maya saves them into <code>${esc(m.file)}</code> and loads the model again with them. That takes a few minutes.</p>` +
+      "<ul><li>Your chats stay here; the next answer reads the chat again.</li>" +
+      "<li>Apps using the API get a “try again” until it is back.</li>" +
+      (S.busy ? "<li>The answer being written finishes first.</li>" : "") + "</ul>", "Save and restart");
+    if (!ok) return;
+  }
   MS.saving = true;
   emit();
   try {

@@ -452,7 +452,10 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             std::fflush(stdout);
             continue;
         }
-        std::mt19937_64 rng(r.seed ^ (0x9E3779B97F4A7C15ull * ++counter));
+        // (a request's own seed alone: the same seed, the same answer - mixed with the request count it was not
+        //  reproducible; without one each request still gets a stream of its own)
+        ++counter;
+        std::mt19937_64 rng(r.seed != 0 ? r.seed : 0x9E3779B97F4A7C15ull * counter);
         const auto s_dec = m.stats();
         long long produced = 0;
         const char* finish = "length";
@@ -1027,7 +1030,9 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
             in.forget(g.rid);
             return;
         }
-        g.rng.seed(g.r.seed ^ (0x9E3779B97F4A7C15ull * ++counter));
+        // (a request's own seed alone, as with one conversation: the same seed, the same answer)
+        ++counter;
+        g.rng.seed(g.r.seed != 0 ? g.r.seed : 0x9E3779B97F4A7C15ull * counter);
         g.in_think = g.r.think_budget > 0 && g.r.think_end >= 0;
         if (g.use_c) {
             mm3::host_cands(lg1.data(), V, g.cd.kc, g.cd.extra, top, ex);

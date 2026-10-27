@@ -1,5 +1,5 @@
-"""tools/test_setup_qwen.py - CYBER-FROST-3.8-PS in the setup and the dashboard: its name everywhere ("CYBER-FROST 3.8 ·
-Q5_K_M"), the setup ids, its configs recognised (not taken for DeepSeek's --pack), the pinned download manifest, the
+"""tools/test_setup_qwen.py - CYBER-FROST-3.8-PS in the setup and the dashboard: its name everywhere
+("Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M"; its ids stay), the setup ids, its configs recognised (not taken for DeepSeek's --pack), the pinned download manifest, the
 context recommended by the VRAM, the drafting choice written into the config, the Models page's settings, and its
 template's thinking (always on; thinking off closes the block as its Qwen base writes it).  No GPU, no network.
 
@@ -7,6 +7,8 @@ template's thinking (always on; thinking off closes the block as its Qwen base w
 """
 from pathlib import Path
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -39,12 +41,41 @@ def qwen_cfg(d: Path, mtp: bool = True) -> dict:
 
 class Names(unittest.TestCase):
     def test_shown(self):
-        self.assertEqual(Q.shown("qwen", "q5_k_m", 112.53), "CYBER-FROST 3.8 · Q5_K_M (113 GB)")
+        self.assertEqual(Q.shown("qwen", "q5_k_m", 112.53), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M (113 GB)")
         self.assertEqual(Q.config_stem("qwen", "q5_k_m"), "maya-cyber-frost")
 
     def test_ids(self):
-        for name in ("cyber-frost", "CYBER-FROST-3.8-PS", "cyber-frost-3.8-ps-q5_k_m"):
+        for name in ("cyber-frost", "CYBER-FROST-3.8-PS", "cyber-frost-3.8-ps-q5_k_m", "cyber-frost-3.8",
+                     "cyber-frost-q5_k_m"):   # (every id before the rename is still taken)
             self.assertEqual(Q.resolve(name), ("qwen", "q5_k_m"), name)
+
+    def test_the_ids_stay_the_name_on_screen_changes(self):
+        """The rename is the display name only: the folder, the installer record, the model_name the API reports, the
+        HF repo, the config's file name and --model keep their ids."""
+        self.assertEqual(Q.SHOWN["qwen"], "Qwen-3.8-Flash-Next (CYBER-FROST)")
+        self.assertEqual((maya.QWEN, maya.QWEN_MODEL_NAME, Q.MODEL["qwen"]),
+                         ("CYBER-FROST-3.8-PS", "cyber-frost-3.8-ps", "CYBER-FROST-3.8-PS"))
+        self.assertEqual(maya.QWEN_SHOWN, Q.SHOWN["qwen"])
+        self.assertEqual(maya.qwen_entry()["repo"], "peasantsmith/CYBER-FROST-3.8-PS-GUFF")
+        self.assertEqual(Q.config_stem("qwen", "q5_k_m"), "maya-cyber-frost")
+
+    def test_the_setups_pickers(self):
+        """The model picker's row, and the step lines of its setup, name it as the screen does; DeepSeek's row no
+        longer offers UD-Q4_K_XL."""
+        rows = []
+
+        def pick(title, intro, opts, default, yes, *x):
+            rows.extend(opts)
+            return default
+        a = type("A", (), {"model": None, "gguf_dir": None, "draft": None, "model_dir": None, "yes": True})()
+        with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
+            maya.choose_family(a, {})
+        (label, note, about) = rows[3]
+        self.assertEqual(label, "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M (113 GB)")
+        self.assertTrue(about.startswith("Qwen-3.8-Flash-Next (CYBER-FROST): 180B"), about)
+        self.assertNotIn("CYBER-FROST-3.8-PS", about)
+        self.assertIn("UD-Q8_K_XL", rows[1][2])
+        self.assertNotIn("UD-Q4_K_XL", rows[1][2])
 
     def test_family(self):
         with tempfile.TemporaryDirectory() as t:
@@ -52,7 +83,7 @@ class Names(unittest.TestCase):
             self.assertEqual(Q.family_of(cfg), "qwen")
             cfg.pop("installer")                       # (by its arguments too: --pack with --ple-gguf is not DeepSeek's)
             self.assertEqual(Q.family_of(cfg), "qwen")
-            self.assertEqual(Q.config_label(qwen_cfg(Path(t) / "b")), "CYBER-FROST 3.8 · Q5_K_M")
+            self.assertEqual(Q.config_label(qwen_cfg(Path(t) / "b")), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M")
 
     def test_model_option(self):
         a = type("A", (), {"model": "cyber-frost", "mm3_quant": None})()
@@ -95,6 +126,24 @@ class Setup(unittest.TestCase):
 
 
 class Dashboard(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_web_apps_names(self):
+        """serve/web/lib.js's modelName: the full name "Qwen-3.8-Flash-Next (CYBER-FROST)" wherever there is room, the
+        short "Qwen-3.8-Flash-Next" in the chat header's button; the other models' names as before."""
+        js = ("import {modelName} from './serve/web/lib.js';"
+              "const ids = ['cyber-frost-3.8-ps', 'glm-5.3-flash', 'deepseek-v4.1-flash', 'minimax-m3.1-flash'];"
+              "console.log(JSON.stringify(ids.map((i) => [modelName(i), modelName(i, true)])));")
+        out = subprocess.run(["node", "--input-type=module", "-e", js], cwd=str(ROOT), capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), [
+            ["Qwen-3.8-Flash-Next (CYBER-FROST)", "Qwen-3.8-Flash-Next"], ["GLM 5.3 Flash", "GLM 5.3 Flash"],
+            ["DeepSeek V4.1 Flash", "DeepSeek V4.1 Flash"], ["MiniMax M3.1 Flash", "MiniMax M3.1 Flash"]])
+        head = (ROOT / "serve/web/chat-view.js").read_text(encoding="utf-8")
+        self.assertIn("const name = modelName(S.health.model, true);", head)   # (the header's button: the short form)
+        # (the model menu's card: the short form above the line that has the full label "... (CYBER-FROST) · Q5_K_M")
+        self.assertIn("<b>${modelName(h.model, !!h.model_label)}</b>", head)
+
     def test_models_page(self):
         from serve import models as M
         with tempfile.TemporaryDirectory() as t:

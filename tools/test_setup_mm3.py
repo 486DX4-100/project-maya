@@ -241,7 +241,9 @@ class Config(unittest.TestCase):
         a = c["args"]
         self.assertEqual(a[a.index("--kv-cache") + 1], "int8")
         self.assertEqual(a[a.index("--vision") + 1], "off")
-        self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"]), ("high", {"temperature": 0.7}, "0.0.0.0"))
+        # (the model's own sampling and level every setup - the owner, 2026-10-27: no exceptions)
+        self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"]), ("auto", {"temperature": 1.0, "top_p": 0.95},
+                                                                              "0.0.0.0"))
 
     def test_tp_follows_the_gpus_chosen_now(self):
         """#436 (DeepSeek's, the same rule here): the config before's --tp only for the same GPUs"""

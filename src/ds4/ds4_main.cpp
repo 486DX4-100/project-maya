@@ -1288,6 +1288,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             continue;
         }
         m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
+        // a request's own seed: its draws from the start of its stream, so the same seed gives the same answer (the
+        // counter ran on across requests: a seed was not reproducible); without one the stream runs on as before
+        if (r.seed != 0) counter = 0;
         Prompt P;
         if (!prompt_in(r, geni, "", [&in] { return in.stop.load(); }, P)) continue;
         const double t0 = P.t0;

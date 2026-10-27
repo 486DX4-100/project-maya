@@ -542,6 +542,24 @@ def listing(root: Path, running: str | None) -> dict:
     return {"models": models, "gpus": sorted(gpus, key=lambda g: g["index"]), "contexts": CONTEXTS}
 
 
+def own_defaults(path: Path) -> bool:
+    """A switch to the config at `path` (the Models page): its model's own sampling and thinking level
+    (maya_quants.MODEL_DEFAULTS, as the setup writes them) written into it where they differ - a config from an older
+    setup, or with another model's values - the one before kept beside it (<config>.prev).  True when it changed."""
+    cfg = read(path)
+    if not cfg:
+        return False
+    sampling, effort = maya_quants.model_defaults(cfg)
+    if cfg.get("sampling") == sampling and cfg.get("reasoning_effort") == effort:
+        return False
+    p = Path(path)
+    p.with_name(p.name + ".prev").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    st = p.stat()
+    write(p, {**cfg, "sampling": sampling, "reasoning_effort": effort})
+    os.utime(p, (st.st_atime, st.st_mtime))
+    return True
+
+
 def save(path: Path, settings: dict) -> dict:
     """The settings written into the config at `path` (its settings before kept beside it, <config>.prev, and the
     first time the page changes it, what the setup wrote: installer.as_set_up, the page's Reset)."""
