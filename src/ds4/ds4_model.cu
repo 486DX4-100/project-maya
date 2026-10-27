@@ -5888,6 +5888,16 @@ struct Model::Impl {
         if (!ln_zc || l.ram.empty() || l.ram[(size_t) e] < 0) return false;
         return zc_slot[(size_t) l.ram[(size_t) e]] != 0;
     }
+    bool zc_layer_full(const Layer& l) const {
+        // The device decides before the service thread returns this route's mask, so route-local coverage is not enough.
+        // Every possible non-VRAM pick must have a pinned source and no other producer/skip rule may be involved.
+        if (!ln_zc_all_live || !ln_zc_nowait || tok_ab_off.load() || l.nm != 1 || l.mtp ||
+            l.helper_tab != nullptr || disk_skip_w > 0.0f || ram_skip_w > 0.0f)
+            return false;
+        for (int e = 0; e < l.n_exp; ++e)
+            if (l.slot[(size_t) e] < 0 && !zc_ok(l, e)) return false;
+        return true;
+    }
     const uint8_t* zc_mat(const Layer& l, int e, int r) const {   // (zc_ok) its matrix r as the devices address it
         const int sl = l.ram[(size_t) e];
         return ram_part[(size_t) sl][0] + cp_lay[(size_t) l.il][(size_t) r] + zc_delta[(size_t) sl];
@@ -9210,7 +9220,7 @@ struct Model::Impl {
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
                 // the PCIe lane (a decoded token on a layer that streams): the picks it takes leave the CPU lane's, their
                 // copies start now (lane_take)
-                const int lc = T == 1 || (ln_win && T <= kWin) ? lane_class(li) : -1;
+                const int lc = T == 1 ? lane_class(li) : (ln_win && T <= kWin) ? lane_win_class(li) : -1;
                 LaneTake lt;
                 if (lc >= 0) {
                     if (T == 1) lane_take(l, ln_cls[(size_t) lc], picks, lt, next, r.ids);
@@ -9342,6 +9352,7 @@ struct Model::Impl {
         std::string fmt;           // "IQ2_XXS/IQ2_XXS/IQ3_XXS 10633216 B"
         int dev = 0, il = -1;      // its device; the layer of it with the most CPU-lane experts (the calibration's)
         bool stream = false;       // its split streams for some request
+        bool win = false;          // the unforced split's original verify-window eligibility
         pcie::Costs cost, start;   // the split's costs (decode may time them again); the start-up timing
         std::string key;           // its line in the times file
         LaneRetime rc, rs;         // decode's own timing of its CPU lane, of its stream lane (lane_note)
@@ -9351,6 +9362,7 @@ struct Model::Impl {
     std::vector<LaneDev> ln_dev;
     std::vector<LaneCls> ln_cls;
     std::vector<int> ln_layer;               // layer -> its LaneCls (-1: the CPU lane alone)
+    std::vector<int> ln_win_layer;           // verify windows keep the original, unforced class eligibility
     uint8_t* ln_host = nullptr;              // pinned, mapped: pcie::kSlots slots of ln_stride (where the reads land)
     size_t ln_stride = 0;
     pcie::Pull* ln_pull = nullptr;           // host-mapped [kRing]: a decode request's pull (by its seq)
@@ -9360,6 +9372,10 @@ struct Model::Impl {
     int ln_readers = 0;
     std::string ln_file;                     // the times file ("": none)
     std::string ln_force;                    // DS4_STREAM_FORCE
+    bool ln_zc_all = false;                  // DS4_STREAM_ZC_ALL requested
+    bool ln_zc_all_live = false;             // the baseline lane exists and a real pinned copy makes ZC-all usable
+    bool ln_zc_nowait = false;               // DS4_STREAM_ZC_NOWAIT: a fully covered layer has no CPU response to wait for
+    std::atomic<bool> zc_nowait_seen{false}; // log the first actual no-wait layer, not only the setting
     // a request's reads (one batch at a time: the service thread's, or the calibration's)
     struct LaneJob {
         int di = 0, n = 0;
@@ -9399,6 +9415,9 @@ struct Model::Impl {
         return v != nullptr && std::atoi(v) == 0;
     }
     int lane_class(int li) const { return li >= 0 && li < (int) ln_layer.size() ? ln_layer[(size_t) li] : -1; }
+    int lane_win_class(int li) const {
+        return li >= 0 && li < (int) ln_win_layer.size() ? ln_win_layer[(size_t) li] : -1;
+    }
     // a layer the PCIe lane can serve: a trunk layer of one GPU, a GGUF's experts, whose decode picks fit the slots
     static bool lane_layer_ok(const Layer& l) {
         return !l.mtp && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4 && l.k_exp > 0 && l.k_exp <= kPicks && l.blob > 0;
@@ -9432,6 +9451,8 @@ struct Model::Impl {
         if (!pk.gguf || lane_env_off() || !moe_token_path || sync_decode) return true;
         ln_file = lane_file();
         if (const char* v = std::getenv("DS4_STREAM_FORCE")) ln_force = v;
+        ln_zc_all = std::getenv("DS4_STREAM_ZC_ALL") != nullptr && std::atoi(std::getenv("DS4_STREAM_ZC_ALL")) != 0;
+        ln_zc_nowait = std::getenv("DS4_STREAM_ZC_NOWAIT") != nullptr && std::atoi(std::getenv("DS4_STREAM_ZC_NOWAIT")) != 0;
         ln_dev.assign(devs.size(), LaneDev{});
         for (size_t di = 0; di < devs.size(); ++di) {
             Dev& d = devs[di];
@@ -9450,7 +9471,8 @@ struct Model::Impl {
             CK(mem_info(&fr, &tot));
             const double room = std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
             if (exp_b <= room) continue;   // (every expert of its layers fits)
-            if (ln_force.empty() && pcie::cal_get(ln_file, lane_dev_key((int) di) + " | lane") == "off") continue;
+            if (ln_force.empty() &&
+                pcie::baseline_lane_off(ln_force, pcie::cal_get(ln_file, lane_dev_key((int) di) + " | lane"))) continue;
             void* v = nullptr;
             if (cudaMalloc(&v, (size_t) D.slots * stride) != cudaSuccess) {   // (none: this GPU's CPU lane alone)
                 cudaGetLastError();
@@ -9622,14 +9644,22 @@ struct Model::Impl {
                 const int s = n < (int) ln_force.size() ? std::max(0, std::min(n, ln_force[(size_t) n] - '0')) : 0;
                 m = (1u << std::min(s, D.slots)) - 1u;
             } else {
-                m = pcie::split(C.cost, n, cold, D.slots);
-                LaneAB& A = C.ab[cold != 0 ? 1 : 0];
-                if (m != 0 && (A.verdict < 0 || tok_ab_off))   // (tok_ab_off: the whole-step check's turn, or its verdict)
-                    m = 0;
-                else if (m != 0 && A.verdict == 0 && !ln_no_done.load()) {   // (the check: turn by turn)
-                    lt.ab = cold != 0 ? 1 : 0;
-                    lt.ab_split = (A.flip ^= 1) != 0;
-                    if (!lt.ab_split) m = 0;
+                bool full_zc = ln_zc_all_live;
+                if (full_zc)
+                    for (int j = 0; j < n; ++j) full_zc = full_zc && zc_ok(l, picks[(size_t) j].first);
+                if (full_zc && !tok_ab_off) {
+                    // Full coverage replaces only the streaming arm. The whole-step check's CPU arm and fallback stay intact.
+                    m = (1u << n) - 1u;
+                } else {
+                    m = pcie::split(C.cost, n, cold, D.slots);
+                    LaneAB& A = C.ab[cold != 0 ? 1 : 0];
+                    if (m != 0 && (A.verdict < 0 || tok_ab_off))   // (tok_ab_off: the whole-step check's turn, or its verdict)
+                        m = 0;
+                    else if (m != 0 && A.verdict == 0 && !ln_no_done.load()) {   // (the check: turn by turn)
+                        lt.ab = cold != 0 ? 1 : 0;
+                        lt.ab_split = (A.flip ^= 1) != 0;
+                        if (!lt.ab_split) m = 0;
+                    }
                 }
             }
         }
@@ -9819,7 +9849,7 @@ struct Model::Impl {
         bool off = true;   // (every class of its GPU off: the next start takes no slots there)
         for (const LaneCls& K : ln_cls)
             if (K.dev == C.dev && K.stream && (K.ab[0].verdict >= 0 || K.ab[1].verdict >= 0)) off = false;
-        if (off) lane_put(lane_dev_key(C.dev) + " | lane", "off");
+        if (off && !ln_zc_all_live) lane_put(lane_dev_key(C.dev) + " | lane", "off");
     }
 
     // decode's check over whole decode steps (#329): lane_ab times one layer's lanes, where the split wins - and the
@@ -9891,7 +9921,7 @@ struct Model::Impl {
             for (const LaneCls& C : ln_cls)
                 if (C.stream && std::find(seen.begin(), seen.end(), C.dev) == seen.end()) {
                     seen.push_back(C.dev);
-                    lane_put(lane_dev_key(C.dev) + " | lane", "off");
+                    if (!ln_zc_all_live) lane_put(lane_dev_key(C.dev) + " | lane", "off");
                 }
         }
     }
@@ -10106,7 +10136,12 @@ struct Model::Impl {
     // keeps the CPU lane alone: no slots, nothing streams)
     void lane_setup_gpus() {
         const double t0 = now_ms();
+        const bool hold = lane_env() != nullptr && std::atoi(lane_env()) == 2;
+        // Allocation and expert placement have already followed the baseline lane decision. Only real pinned copies may
+        // widen ordinary streaming now; without one, every experimental setting and calibration write stays inert.
+        ln_zc_all_live = pcie::zc_all_usable(ln_zc_all, !ln_force.empty(), hold, ln_zc, zc_slot);
         ln_layer.assign(L.size(), -1);
+        ln_win_layer.assign(L.size(), -1);
         std::vector<int> cls_of(L.size(), -1);
         for (const Layer& l : L) {
             if (!lane_layer_ok(l) || ln_dev[(size_t) l.dev].vram == nullptr || l.n_vram >= l.n_exp) continue;
@@ -10262,8 +10297,10 @@ struct Model::Impl {
             }
             if (C.cost.ok()) {
                 if (cpu == nullptr) cpu_done.push_back({C.fmt, C.start});
-                C.stream = !ln_force.empty() || (pcie::streams_any(C.cost, D.slots, l.k_exp) &&
-                                                 (C.ab[0].verdict >= 0 || C.ab[1].verdict >= 0));
+                const bool measured = pcie::streams_any(C.cost, D.slots, l.k_exp) &&
+                                      (C.ab[0].verdict >= 0 || C.ab[1].verdict >= 0);
+                C.win = !ln_force.empty() || measured;   // the baseline's class decision, shared with verify windows
+                C.stream = C.win || ln_zc_all_live;
                 if (std::getenv("DS4_LANE_CHECK") != nullptr) lane_check(C, ex, b);
             }
             for (void* p : {(void*) b.plan, (void*) b.plan2, (void*) b.w, (void*) b.x, (void*) b.h, (void*) b.sh,
@@ -10287,19 +10324,21 @@ struct Model::Impl {
         // the layers that stream; the GPUs none of whose layers do give their slots back (and the times file says so).
         // (DS4_STREAM=2, tests: the slots kept, nothing streams - the CPU lane alone with the experts' placement of a
         // start that streams, the baseline a streaming run's answers compare with bit for bit)
-        const bool hold = lane_env() != nullptr && std::atoi(lane_env()) == 2;
         for (const Layer& l : L) {
             const int ci = cls_of[(size_t) l.il];
-            if (ci >= 0 && ln_cls[(size_t) ci].stream && ln_cls[(size_t) ci].cost.ok() && !hold) {
+            if (ci < 0 || !ln_cls[(size_t) ci].cost.ok() || hold) continue;
+            const LaneCls& C = ln_cls[(size_t) ci];
+            if (C.stream) {
                 ln_layer[(size_t) l.il] = ci;
                 ln_dev[(size_t) l.dev].on = true;
             }
+            if (C.win) ln_win_layer[(size_t) l.il] = ci;
         }
         int n_on = 0;
         for (size_t di = 0; di < ln_dev.size(); ++di) {
             LaneDev& D = ln_dev[di];
             if (D.vram == nullptr || hold) continue;
-            if (ln_force.empty()) lane_put(lane_dev_key((int) di) + " | lane", D.on ? "on" : "off");
+            if (ln_force.empty() && !ln_zc_all_live) lane_put(lane_dev_key((int) di) + " | lane", D.on ? "on" : "off");
             if (!D.on || D.direct) lane_free((int) di);
             n_on += D.on;
         }
@@ -10311,6 +10350,10 @@ struct Model::Impl {
                      hold                ? " - DS4_STREAM=2: the slots kept, nothing streams"
                      : ln_force.empty() ? ""
                                         : " - DS4_STREAM_FORCE");
+        if (ln_zc_all_live)
+            std::fprintf(stderr, "ds4: PCIe lane: DS4_STREAM_ZC_ALL=1: ordinary routes with every pick pinned stream whole\n");
+        if (ln_zc_all_live && ln_zc_nowait)
+            std::fprintf(stderr, "ds4: PCIe lane: DS4_STREAM_ZC_NOWAIT=1: fully covered layers skip the empty CPU response\n");
     }
 
     // DS4_LANE_CHECK: one expert of the class through both lanes on one normalised input - the CPU lane's output and the
@@ -13487,11 +13530,16 @@ struct Model::Impl {
             prof_mark(d, 2);
             const x3::ExpertLayout& lay = nm > 1 ? l.hlay : l.lay;
             if (T == 1 && moe_token_path) {
+                const int lc = lead && nm == 1 && lay.fmt == gg::kFmtMXFP4 ? lane_class(l.il) : -1;
+                const bool zc_nowait = lc >= 0 && ln_zc_nowait && zc_layer_full(l);
+                if (zc_nowait && !zc_nowait_seen.exchange(true))
+                    std::fprintf(stderr, "ds4: PCIe lane: layer %d has every non-VRAM expert pinned - no CPU response wait\n",
+                                 l.il);
                 x3::MoeArgs ma;
                 ma.plan_ptr = d.plan_ptr;
                 ma.plan_w = d.rw;
-                ma.cpu_part = lead ? resps[slot].part[0] : nullptr;
-                ma.cpu_flag = lead ? &resps[slot].cpu[0] : nullptr;
+                ma.cpu_part = lead && !zc_nowait ? resps[slot].part[0] : nullptr;
+                ma.cpu_flag = lead && !zc_nowait ? &resps[slot].cpu[0] : nullptr;
                 ma.lay = lay;
                 if (l.n_cls > 1) ma.mix = l.mix;   // (a mixed layer: each expert's class's layout)
                 ma.k = l.k_exp;
@@ -13505,7 +13553,6 @@ struct Model::Impl {
                 // the PCIe lane (a layer that streams): the experts the host reads for it pulled into this GPU's slots as
                 // they land, into the plan, their gate / up - all while the CPU lane computes - their down with the VRAM
                 // ones' below
-                const int lc = lead && nm == 1 && mx ? lane_class(l.il) : -1;
                 if (lc >= 0) {
                     const LaneDev& LD = ln_dev[(size_t) l.dev];
                     pcie::stream_fetch(ln_pull + slot, sq, LD.dflag, LD.vram, LD.stride, lane_mats(l), !LD.direct,
@@ -13514,14 +13561,14 @@ struct Model::Impl {
                     m2.plan_ptr = LD.plan2;
                     gg::moe_gate_up(m2, d.x, d.xg, s);
                 }
-                if (lead) wait_seq(&resps[slot].seq, sq, s);
+                if (lead && !zc_nowait) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
             } else {   // each distinct expert read once for the window's tokens
                 // the PCIe lane (a layer that streams, ln_win): the window's experts the host streams pulled into this
                 // GPU's slots, their entries into the plan - the grouping below takes them as VRAM ones
-                const int lc = ln_win && T <= kWin && lead && nm == 1 && lay.fmt == gg::kFmtMXFP4 ? lane_class(l.il) : -1;
+                const int lc = ln_win && T <= kWin && lead && nm == 1 && lay.fmt == gg::kFmtMXFP4 ? lane_win_class(l.il) : -1;
                 if (lc >= 0) {
                     const LaneDev& LD = ln_dev[(size_t) l.dev];
                     pcie::stream_fetch_win(ln_pull + slot, sq, LD.dflag, LD.vram, LD.stride, lane_mats(l), !LD.direct,
