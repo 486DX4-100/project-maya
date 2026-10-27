@@ -65,6 +65,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -1494,8 +1495,8 @@ def choose_family(a, prev: dict) -> str:
         return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "glm"
     if a.gguf_dir or a.draft:
         return "glm"
-    if a.model_dir:
-        return "deepseek"
+    if a.model_dir:                                    # (an EXL3 folder of GLM or MiniMax; else DeepSeek's files)
+        return exl3_folder_family(a.model_dir) or "deepseek"
     default = config_family(prev) if prev else "glm"
     try:
         have = sum(g["vram_gb"] for g in S.gpus() if g.get("vram_gb")) + mem_gb()[0]
@@ -1528,7 +1529,10 @@ def choose_family(a, prev: dict) -> str:
 
 def choose_model(a, models: Path, inst: dict) -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
-    the downloads - the earlier download is the default."""
+    the downloads - the earlier download is the default.  ("exl3", the folder): --model-dir naming an EXL3 folder of
+    GLM-5.3-Flash."""
+    if getattr(a, "model_dir", None) and exl3_folder_family(a.model_dir) == "glm":
+        return "exl3", Path(a.model_dir).expanduser().resolve()
     if a.gguf_dir:
         first, why = local_first(Path(a.gguf_dir))
         if first is None:
@@ -2263,7 +2267,11 @@ def model_step(a, models: Path, choice: tuple):
     """(model folder, shards, quant name), or None when the files are not there and were not downloaded."""
     step(5, "the model (GLM-5.3-Flash)")
     kind, what = choice
-    if kind == "local":
+    if kind == "exl3":                                 # an EXL3 folder of your own (--model-dir): complete by its own index
+        d, quant = what, what.name
+        shards = exl3_folder_files(d, ("config.json", "tokenizer.json", "tokenizer_config.json"))
+        warn(f"{quant}: experimental - only {', '.join(MODELS)} has been measured with Maya (README.md)")
+    elif kind == "local":
         shards, quant, d = shard_set(what), quant_of(what), what.parent
         for s in shards:
             why = incomplete(s)
@@ -2278,7 +2286,7 @@ def model_step(a, models: Path, choice: tuple):
         shards = local_shards(m, d)
         if any(file_incomplete(m, s) for s in shards) and not offer_download(a, quant, d, shards):
             return None
-    if is_exl3(quant) and kind != "local":
+    if kind == "exl3" or (is_exl3(quant) and kind != "local"):
         conf = read_json(d / "config.json")
         method = (conf.get("quantization_config") or {}).get("quant_method")
         if conf.get("model_type") != "glm5_next" or method != "exl3":
@@ -2362,6 +2370,12 @@ def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -
     step(6, "the pack (the engine's index of the model files)")
     if quant is not None and is_exl3(quant):
         return exl3_pack_step(a, d)
+    if shards and shards[0].suffix == ".safetensors":  # an EXL3 folder of your own (--model-dir)
+        pack = exl3_pack_step(a, d)
+        body, label = own_template(d, ROOT / "serve" / "glm5_chat_template.jinja")
+        put_template(pack, body)
+        ok(f"chat template: {label.replace('the base model', 'GLM-5')}")
+        return pack
     # the engine finds the GGUF files at <pack>/.. (src/core/glm_model.cu, load_pack): the pack lives in their folder,
     # in pack/ - or pack-<model>/ when pack/ indexes another model of the same folder
     pack = d / "pack"
@@ -2373,6 +2387,7 @@ def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -
             if not (pack / PACK_SOURCES).exists():
                 stamp_pack(pack, shards)
             ok(f"pack already built: {pack}")
+            base_template(pack)
             return pack
         warn(f"the pack is built again: {why}")
     # the files a pack is built from: a Maya download's against its published sha256 (once a file - a download is
@@ -2401,10 +2416,93 @@ def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
     stamp_pack(pack, shards)
     ok(f"pack: {pack}")
+    base_template(pack)
     return pack
 
 
+def base_template(pack: Path) -> None:
+    """A GLM pack whose GGUF carried no chat template gets GLM-5's: the server would take its generic one otherwise (a
+    GGUF with a template of its own keeps it)."""
+    base = ROOT / "serve" / "glm5_chat_template.jinja"
+    if not (pack / "tokenizer" / "chat_template.jinja").is_file() and base.is_file():
+        put_template(pack, base.read_bytes())
+        ok("chat template: GLM-5's (the GGUF carries none)")
+
+
 EXL3_GGUF = "maya-exl3.gguf"                       # what tools/exl3_pack.py writes beside an EXL3 model's files
+
+
+# ---- an EXL3 folder of the user's own (--model-dir): GLM-5.3-Flash's or MiniMax-M3.1-Flash's, any bits, checked from its
+# own index and config, never from the pinned download lists
+def exl3_folder_family(path) -> str | None:
+    """"glm" or "minimax" for a folder holding an EXL3 quant of GLM-5.3-Flash or MiniMax-M3.1-Flash (its config.json:
+    model_type and quantization_config), else None."""
+    try:
+        conf = json.loads((Path(path).expanduser() / "config.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(conf, dict) or (conf.get("quantization_config") or {}).get("quant_method") != "exl3":
+        return None
+    return {"glm5_next": "glm", "minimax_m3_vl": "minimax"}.get(conf.get("model_type"))
+
+
+def safetensors_short(path: Path) -> str | None:
+    """Why a .safetensors file is not whole, or None: the last tensor its header names must end inside the file."""
+    if not path.is_file():
+        return "missing"
+    try:
+        with path.open("rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            head = json.loads(f.read(n)) if n < 1 << 30 else None
+        have = path.stat().st_size
+    except (OSError, struct.error, ValueError):
+        head = None
+    if not isinstance(head, dict):
+        return "not a whole .safetensors file"
+    need = 8 + n + max((v["data_offsets"][1] for k, v in head.items() if k != "__metadata__"), default=0)
+    return None if have >= need else f"short: {have:,} of {need:,} bytes"
+
+
+def exl3_folder_files(d: Path, needs: tuple = ("config.json",)) -> list:
+    """The .safetensors files of an EXL3 folder of the user's own - the ones its model.safetensors.index.json names and any
+    other beside them - each checked whole by its own header, and the small files the pack needs; the setup stops with
+    what is missing."""
+    index = d / "model.safetensors.index.json"
+    try:
+        names = sorted(set(json.loads(index.read_text(encoding="utf-8-sig"))["weight_map"].values()))
+    except (OSError, ValueError, KeyError, AttributeError, TypeError):
+        fail(f"{index} is missing or is no safetensors index", f"{d} is no whole EXL3 download: fetch the repo's files "
+                                                               "into it again")
+    files = [d / n for n in names] + [p for p in sorted(d.glob("*.safetensors")) if p.name not in names]
+    for f in files:
+        if (why := safetensors_short(f)):
+            fail(f"{f}: {why}", f"finish copying or downloading it, then run {ME} again")
+    for n in needs:
+        if not (d / n).is_file():
+            fail(f"{d / n} is missing", f"fetch the repo's {n} into {d}, then run {ME} again")
+    return files
+
+
+def put_template(pack: Path, text: bytes | None) -> bool:
+    """`text` as the chat template the server reads from the pack's tokenizer folder (nothing to put: None).  True when
+    the file changed."""
+    dst = pack / "tokenizer" / "chat_template.jinja"
+    if text is None or (dst.is_file() and dst.read_bytes() == text):
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(text)
+    return True
+
+
+def own_template(d: Path, base: Path | None = None) -> tuple:
+    """(the chat template, what it is) of a model folder of the user's own: its chat_template.jinja, or the chat_template
+    its tokenizer_config.json carries, when it ships one; else the base model's `base` (None: the pack's own copy of it)."""
+    if (d / "chat_template.jinja").is_file():
+        return (d / "chat_template.jinja").read_bytes(), "the folder's own (chat_template.jinja)"
+    tpl = read_json(d / "tokenizer_config.json").get("chat_template") if (d / "tokenizer_config.json").is_file() else None
+    if isinstance(tpl, str) and tpl.strip():
+        return tpl.encode("utf-8"), "the folder's own (tokenizer_config.json)"
+    return (base.read_bytes() if base is not None and base.is_file() else None), "the base model's (the folder ships none)"
 
 
 def exl3_pack_step(a, d: Path) -> Path:
@@ -2552,6 +2650,70 @@ def write_run_script(cfg_path: Path, port: int) -> Path:
     return script
 
 
+def _number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+# the config's `sampling` keys and the values the server takes (serve/server.py, sampling_defaults_from_config: a value
+# outside these refuses to start the server, so a model's own value outside them is left out)
+SAMPLING_OK = {
+    "temperature": lambda v: _number(v) and v >= 0,
+    "top_p": lambda v: _number(v) and 0 < v <= 1,
+    "min_p": lambda v: _number(v) and 0 <= v <= 1,
+    "top_k": lambda v: _number(v) and v == int(v) and 1 <= v <= 64,
+    "presence_penalty": lambda v: _number(v) and v >= 0,
+    "frequency_penalty": lambda v: _number(v) and v >= 0,
+    "repetition_penalty": lambda v: _number(v) and v > 0,
+    "penalty_last_n": lambda v: _number(v) and v == int(v) and v >= -1,
+}
+# llama.cpp's general.sampling.<key> of a GGUF -> the config's key
+GGUF_SAMPLING = {"temp": "temperature", "top_p": "top_p", "top_k": "top_k", "min_p": "min_p",
+                 "penalty_repeat": "repetition_penalty", "penalty_last_n": "penalty_last_n"}
+
+
+def own_sampling(found: dict, base: dict) -> dict:
+    """The sampling defaults of a model of the user's own: the ones the model ships (`found`, each in the range the
+    server takes; a float32's 0.949999988 as 0.95), else the base model's `base` - never another model's."""
+    mine = {}
+    for key, v in (found or {}).items():
+        if key in SAMPLING_OK and SAMPLING_OK[key](v):
+            mine[key] = int(v) if key in ("top_k", "penalty_last_n") else round(float(v), 6)
+    return mine or dict(base)
+
+
+def folder_sampling(folder, base: dict) -> dict:
+    """An EXL3 folder's own sampling: its generation_config.json (HF's keys; `do_sample: false` names none), else
+    `base`."""
+    try:
+        gen = json.loads((Path(folder) / "generation_config.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        gen = {}
+    if not isinstance(gen, dict) or gen.get("do_sample") is False:
+        gen = {}
+    return own_sampling(gen, base)
+
+
+def gguf_sampling(first, base: dict) -> dict:
+    """A GGUF's own sampling: the general.sampling.* keys it carries, else `base`."""
+    try:
+        from gguf_reader import GGUFFile
+        meta = GGUFFile(Path(first)).metadata
+    except Exception:  # noqa: BLE001 - a header that does not read: the base model's
+        meta = {}
+    return own_sampling({v: meta["general.sampling." + k] for k, v in GGUF_SAMPLING.items()
+                         if "general.sampling." + k in meta}, base)
+
+
+def glm_sampling(choice: tuple | None, quant: str) -> dict:
+    """The `sampling` of a GLM config: GLM's for Maya's own and listed downloads (as before); for a GGUF Maya does not
+    list (--gguf-dir) or an EXL3 folder (--model-dir) the model's own, else GLM's."""
+    if choice and choice[0] == "exl3":
+        return folder_sampling(choice[1], SAMPLING)
+    if choice and choice[0] == "local" and quant not in MODELS:
+        return gguf_sampling(choice[1], SAMPLING)
+    return dict(SAMPLING)
+
+
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
                  choice: tuple | None = None, dflash: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
@@ -2564,8 +2726,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                                      "--prefill", "auto", "--kv-streaming", KV_STREAMING],
            "cwd": str(ROOT),
            "tokenizer": str(pack / "tokenizer"), "model_name": MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
-           "sampling": dict(SAMPLING), "reasoning_effort": EFFORT, "lib_dirs": meta.get("lib_dirs") or [],
-           "port": port}
+           "sampling": glm_sampling(choice, quant), "reasoning_effort": EFFORT,
+           "lib_dirs": meta.get("lib_dirs") or [], "port": port}
     if dflash is not None:                         # DFlash2 drafts instead of the MTP block (the engine loads no MTP)
         cfg["args"] += ["--dflash", str(dflash)]
     env = parse_env(a.env)
@@ -2611,7 +2773,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
-    if PROFILE.exists():
+    if PROFILE.exists() and profile_fits(pack):
         cfg["args"] += ["--expert-profile", str(PROFILE)]
     if cfg_path.exists():
         old = read_json(cfg_path).get("args") or []
@@ -2632,6 +2794,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     gguf_dir = local.parent if local else Path(a.gguf_dir).expanduser().resolve() if a.gguf_dir else None
     cfg["installer"] = {"models_dir": str(models), "quant": quant, "gguf": str(local) if local else None,
                         "gguf_dir": str(gguf_dir) if gguf_dir else None, "draft": "dflash2" if dflash else "mtp",
+                        **({"model_dir": str(choice[1])} if choice and choice[0] == "exl3" else {}),
                         "written": time.strftime("%Y-%m-%d %H:%M")}
     cal = saved_calibration(cfg, any_context=True)     # tuned on this PC for this model (and context) before
     if cal is not None:
@@ -2712,11 +2875,44 @@ def tp_keepable(old: dict, pc: dict) -> bool:
     return bool(now) and before == now and 1 <= tp <= len(now)
 
 
+def pack_expert_count(pack) -> int | None:
+    """The routed experts a layer of a GLM pack's model has: the `n_expert N` in the header of its native_experts.txt
+    (both packers write it; the engine reads the same line), or None when the pack does not say."""
+    try:
+        with open(Path(pack) / "native_experts.txt", encoding="utf-8") as f:
+            head = f.readline()
+    except OSError:
+        return None
+    m = re.search(r"\(n_expert (\d+)", head)
+    return int(m.group(1)) if m else None
+
+
+def profile_experts(path) -> int | None:
+    """The experts a layer an expert profile file ranks (its header: STRP, version, layers, experts), or None."""
+    try:
+        with open(path, "rb") as f:
+            magic, _, _, experts = struct.unpack("<4sIII", f.read(16))
+    except (OSError, struct.error):
+        return None
+    return experts if magic == b"STRP" else None
+
+
+def profile_fits(pack) -> bool:
+    """Whether the shipped expert profile is for this pack's model: it ranks the full model's experts (288 a layer), and
+    the engine refuses one of another size ("a profile for a different artifact") - a pruned model (RCO-152E keeps
+    152) starts without a profile and learns this PC's routing.  True where either size is unknown."""
+    have, ranked = pack_expert_count(pack), profile_experts(PROFILE)
+    return have is None or ranked is None or have == ranked
+
+
 def add_profile(cfg: dict) -> bool:
     """A GLM config with no --expert-profile (written before setup passed one) gets the shipped profile, as a setup
-    would write it: an update restarts the installed config without setting up again.  True when `cfg` changed."""
+    would write it: an update restarts the installed config without setting up again.  Not a pruned model's (its
+    experts are not the profile's).  True when `cfg` changed."""
     args = cfg.get("args")
     if not isinstance(args, list) or "--glm-pack" not in args[:-1] or "--expert-profile" in args or not PROFILE.exists():
+        return False
+    if not profile_fits(flag_value(args, "--glm-pack")):
         return False
     args += ["--expert-profile", str(PROFILE)]
     return True
@@ -4747,8 +4943,12 @@ def mm3_gguf_published(quant: str) -> bool:
     return bool(m["revision"]) and all(m["sha256"].values())
 
 
-def mm3_memory_gb(quant: str) -> float:
-    """The VRAM + RAM that hold MiniMax in these files (the KV cache aside)."""
+def mm3_memory_gb(quant: str, own: Path | None = None) -> float:
+    """The VRAM + RAM that hold MiniMax in these files (the KV cache aside).  A folder of your own (mm3_own_dir): the
+    pinned quant's headroom (MM3_MEMORY_GB less its download) on top of the folder's size."""
+    if own is not None:
+        size = sum(f.stat().st_size for f in own.rglob("*.safetensors")) / 1e9
+        return size + max(MM3_MEMORY_GB - mm3_models()[0]["download_gb"], 0.0)
     return MM3_MEMORY_GB if quant == "exl3" else float(mm3_gguf_entry(quant)["memory_gb"])
 
 
@@ -4757,6 +4957,8 @@ def choose_mm3_quant(a, prev: dict) -> str:
     and the EXL3 quant (on AMD: experimental) - by this PC's memory the one recommended."""
     if getattr(a, "mm3_quant", None):
         return a.mm3_quant
+    if mm3_own_dir(a, "exl3") is not None:            # --model-dir names an EXL3 folder of your own: its files are the quant
+        return "exl3"
     hip = getattr(a, "backend", None) == "hip"
     ggufs = [k for k in ("gguf-xs", "gguf-s") if mm3_gguf_published(k)]
     keys = ["exl3"] + ggufs
@@ -4792,7 +4994,8 @@ def mm3_dir(a, models: Path, prev: dict, quant: str = "exl3") -> Path:
     if a.model_dir:
         return Path(a.model_dir).expanduser().resolve()
     args = prev.get("args") or []
-    if "--pack" in args[:-1] and (prev.get("installer") or {}).get("mm3_quant", "exl3") == quant:
+    inst = prev.get("installer") or {}
+    if "--pack" in args[:-1] and inst.get("mm3_quant", "exl3") == quant and not inst.get("own"):   # (not a folder of your own)
         d = Path(args[args.index("--pack") + 1]).parent
         if (d / "config.json").exists() or (quant != "exl3" and any(d.glob("*.gguf"))):
             return d
@@ -4831,6 +5034,43 @@ def mm3_gguf_model_step(a, d: Path, quant: str) -> list | None:
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: loading reads all {m['download_gb']:.0f} GB from it - use an NVMe SSD "
              "(--models-dir)")
+    return files
+
+
+def mm3_own_dir(a, quant: str) -> Path | None:
+    """The folder --model-dir names when it holds an EXL3 quant of MiniMax that is not the pinned one (Mia-AiLab's 3.5
+    bits: the shards and index download.json lists) - another bit rate, another maker: the user's own, which the setup
+    takes as it is, whole by its own index.  None: the pinned download (a folder of it half downloaded included: the
+    setup carries on with it)."""
+    model_dir = getattr(a, "model_dir", None)
+    if quant != "exl3" or not model_dir or exl3_folder_family(model_dir) != "minimax":
+        return None
+    d = Path(model_dir).expanduser().resolve()
+    index = d / "model.safetensors.index.json"
+    try:
+        names = set(json.loads(index.read_text(encoding="utf-8-sig"))["weight_map"].values())
+        size = index.stat().st_size
+    except (OSError, ValueError, KeyError, AttributeError, TypeError):
+        return None                                    # (no index of its own: nothing to go by)
+    pinned = mm3_models()[0]["files"]
+    shards = {n for n in pinned if n.startswith("model-0") and n.endswith(".safetensors")}
+    return d if names != shards or size != pinned.get("model.safetensors.index.json") else None
+
+
+def mm3_own_step(d: Path) -> list:
+    """The files of a MiniMax EXL3 folder of the user's own (mm3_own_dir): its shards and its draft's (dspark/) whole by
+    their own headers, the small files the pack reads there - never the pinned list, nothing is downloaded."""
+    step(5, f"the model ({MM3}, the EXL3 files in your folder)")
+    files = exl3_folder_files(d, ("config.json", "tokenizer.json", "special_tokens_map.json", "generation_config.json"))
+    if (d / "dspark" / "model.safetensors.index.json").is_file():
+        files += exl3_folder_files(d / "dspark", ("config.json",))
+    else:
+        warn("no dspark/ folder (MiniMax's draft) beside the model: it decodes without drafting")
+    if read_json(d / "config.json").get("vision_config") and not list(d.glob("model-vision-*.safetensors")):
+        warn("no model-vision-*.safetensors beside the model: it reads text only")
+    ok(f"{MM3}: {len(files)} files, {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
+    if rotational(d):
+        warn(f"{d} is on a spinning hard disk: loading reads all of it from there - use an NVMe SSD")
     return files
 
 
@@ -4919,7 +5159,7 @@ def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path 
 
 
 def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path,
-                     quant: str = "exl3") -> Path:
+                     quant: str = "exl3", own: bool = False) -> Path:
     """maya-mm3.json and run-maya-mm3.sh (a Maya GGUF quant: maya-minimax-maya-xs.json - maya_quants.config_stem).  A
     setup again keeps what the config before says that this one does not ask: the engine settings below, the thinking
     level and sampling, where the server listens and its key - a GGUF quant's first config takes them from the EXL3
@@ -4930,8 +5170,11 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     suffix = "-hip" if hip else ""
     legacy = ROOT / f"maya-mm3{suffix}.json"
     cfg_path = ROOT / f"{Q.config_stem('minimax', quant) or 'maya-mm3'}{suffix}.json"
-    old = read_json(cfg_path) if cfg_path.exists() else read_json(legacy)
-    moved = cfg_path != legacy and (old.get("installer") or {}).get("mm3_quant") == quant and not cfg_path.exists()
+    if own:   # (a folder of your own: a config of its own, named after the folder - the pinned quant's stays as it is)
+        cfg_path = ROOT / f"maya-{re.sub(r'[^a-z0-9._-]+', '-', d.name.lower()).strip('-') or 'mm3-own'}{suffix}.json"
+    old = read_json(cfg_path) if cfg_path.exists() else {} if own else read_json(legacy)
+    moved = not own and cfg_path != legacy and (old.get("installer") or {}).get("mm3_quant") == quant and \
+        not cfg_path.exists()
     gguf = quant != "exl3"
     args = ["--pack", str(pack), "--max-context", str(ctx)]
     if MM3_PROFILE.exists():
@@ -4991,7 +5234,8 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
            "model_name": MM3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
-           "sampling": old.get("sampling") or dict(MM3_SAMPLING), "reasoning_effort": MM3_EFFORT,
+           "sampling": old.get("sampling") or (folder_sampling(d, MM3_SAMPLING) if own else dict(MM3_SAMPLING)),
+           "reasoning_effort": MM3_EFFORT,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
     for k in ("reasoning_effort", "host", "api_key", "cors_origins", "mcp_servers"):
         if old.get(k) is not None:
@@ -5009,7 +5253,8 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     cfg["installer"] = {"family": "minimax", "models_dir": str(models),
                         "quant": MM3 if quant == "exl3" else MM3_QUANTS[quant], "mm3_quant": quant,
-                        "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
+                        "model_dir": str(d), **({"own": True} if own else {}),
+                        "written": time.strftime("%Y-%m-%d %H:%M")}
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, port)}")
@@ -5042,7 +5287,8 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     quant = choose_mm3_quant(a, prev)
     gguf = quant != "exl3"
-    need = mm3_memory_gb(quant)
+    own = mm3_own_dir(a, quant)                        # --model-dir: an EXL3 folder of your own, not the pinned download
+    need = mm3_memory_gb(quant, own)
     pc = check_pc(a, "minimax", gguf=gguf)             # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
@@ -5051,7 +5297,7 @@ def set_up_mm3(a, prev: dict) -> Path | None:
         warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{need:.0f} GB that hold all of {name} "
              "(the engine reads what does not fit from the SSD as the page cache allows - slower)")
     step(2, "your choices")                            # 2
-    ok(f"files: {name}" + (" (Maya's quant)" if gguf else " (Mia-AiLab's EXL3 quant)"))
+    ok(f"files: {name}" + (" (Maya's quant)" if gguf else " (your EXL3 folder)" if own else " (Mia-AiLab's EXL3 quant)"))
     fmt = mm3_kv_format(prev_args)                     # (a setup again keeps the config's --kv-cache)
     par = getattr(a, "parallel", None) or int(flag_value(prev_args, "--parallel") or 1)   # (--parallel: kept)
     rec = mm3_recommended_context(vram, total, fmt, need, par)
@@ -5065,11 +5311,15 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     ok(f"model folder: {d}")
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama, "maya-mm3")        # 4
-    files = mm3_gguf_model_step(a, d, quant) if gguf else mm3_model_step(a, d)   # 5
+    files = mm3_gguf_model_step(a, d, quant) if gguf else mm3_own_step(d) if own else mm3_model_step(a, d)   # 5
     if files is None:
         return None
     companions = mm3_companions_step(a, d, a.backend == "hip") if gguf else None  # (a GGUF's pictures and draft)
     pack = mm3_pack_step(a, d, files, gguf, companions)  # 6
+    if own:                                            # the folder's own chat template, else MiniMax's (the pack's copy)
+        body, label = own_template(d)
+        put_template(pack, body)
+        ok(f"chat template: {label.replace('the base model', 'MiniMax')}")
     step(7, "images (the vision tower)")
     if a.no_vision:
         ok("pictures: off (--no-vision): the model reads text only")
@@ -5081,7 +5331,7 @@ def set_up_mm3(a, prev: dict) -> Path | None:
         ok(f"pictures: none - no vision tower beside {name}: text only")
     else:
         ok("no vision tower in this pack: text only")
-    cfg_path = write_config_mm3(a, pc, meta, pack, ctx, models, d, quant)   # 8
+    cfg_path = write_config_mm3(a, pc, meta, pack, ctx, models, d, quant, bool(own))   # 8
     if S.UI is not None:                               # 9: how this PC reads prompts fastest, measured
         S.UI.step(9, "prefill calibration")
     prefill_calibration(cfg_path, "once, for this setup")
@@ -5162,8 +5412,10 @@ def main() -> int:
                          f" - or {DS4} / {MM3} (their files asked, or --ds4-quant / --mm3-quant), or a GLM-5.3-Flash "
                          "download by its name (" + ", ".join(MODELS) + "; every name used before still works)")
     ap.add_argument("--model-dir", help=f"use {DS4}'s files you already have: their folder (a GGUF's shards, or the "
-                                        "EXL3 quant's files and the Engram shards 47 / 48 of DeepSeek's repo); it "
-                                        "must be writable - the pack is written inside it")
+                                        "EXL3 quant's files and the Engram shards 47 / 48 of DeepSeek's repo), or an "
+                                        "EXL3 folder of GLM-5.3-Flash or MiniMax-M3.1-Flash at any bit rate (whole by "
+                                        "its own index; its own sampling and chat template are used); it must be "
+                                        "writable - the pack is written inside it")
     ap.add_argument("--ds4-quant", choices=list(DS4_QUANTS) + [DS4_ABL_ALIAS],
                     help=f"{DS4}'s files: maya-s = Maya's quant (the experts in 2-3 bits; the default once "
                          "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, with its own "
@@ -5320,7 +5572,7 @@ def main() -> int:
         say("Nothing is set up yet: the setup runs first, then the tuning.")
     prev = read_json(have[0]) if have else {}
     if a.check:
-        ds4 = a.model == DS4 or bool(a.model_dir)
+        ds4 = a.model == DS4 or bool(a.model_dir) and exl3_folder_family(a.model_dir) is None
         quant = choose_ds4_quant(a, prev) if ds4 else None
         pc = check_pc(a, "deepseek" if ds4 else "glm", gguf=ds4 and quant != "exl3")
         say()
