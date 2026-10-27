@@ -1109,7 +1109,7 @@ MiniMax M3.1 · Maya-S (about 2.1 bits, ~122 GB), from
 (`Maya-XS/MiniMax-M3.1-Flash-Maya-XS-IQ1_S-0000N-of-00002.gguf`, `Maya-S/MiniMax-M3.1-Flash-Maya-S-IQ2_XXS-...`); each
 gets a config of its own, `maya-minimax-maya-xs.json` / `maya-minimax-maya-s.json`. They run on NVIDIA
 from V100 on and on AMD, Linux and Windows. The files follow llama.cpp's MiniMax-M3 layout; the sparse-attention
-indexers of the first three layers sit in a small file of their own beside them (`...-maya-indexers.gguf`), which
+indexers of the first three layers sit in a small file of their own beside them (`...-maya-indexers.bin`, a GGUF; `.gguf` up to v1.1.30, renamed by the setup), which
 Maya loads so the model runs as MiniMax defines it - keep it with the other files. Pictures and the DSpark drafter
 come from the EXL3 repo's own files (its vision tower and its draft, about 4 GB, downloaded into
 `MiniMax-M3.1-Flash-companions` beside the model, or taken from an EXL3 download already there), on NVIDIA and on

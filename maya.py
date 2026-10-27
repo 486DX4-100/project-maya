@@ -4690,10 +4690,16 @@ def mm3_gguf_model_step(a, d: Path, quant: str) -> list | None:
     files = [d / n for n in m["files"]]
     missing = [f for f in files if file_incomplete(m, f)]
     old = [d / n for n in m["earlier_names"]]
-    if missing and len(old) == len(files) and all(o.is_file() and o.stat().st_size == m["files"][f.name]
-                                                  for o, f in zip(old, files)):
+    if missing and len(old) == len(files) and all(o.is_file() and o.stat().st_size == size
+                                                  for o, size in zip(old, m["files"].values())):
         ok(f"{name}: its files under their earlier names ({old[0].name}, ...) - used as they are")
         files, missing = old, []
+    for f in list(missing):                 # (the indexers' file as v1.1.30 named it: .gguf, the same bytes - renamed)
+        o = f.with_suffix(".gguf")
+        if f.suffix == ".bin" and not f.exists() and o.is_file() and o.stat().st_size == m["files"][f.name]:
+            o.rename(f)
+            ok(f"{o.name} renamed {f.name} (its name from v1.1.31 on)")
+            missing.remove(f)
     if missing and not mm3_gguf_published(quant):
         fail(f"{name} is not published yet (and {missing[0]} is {file_incomplete(m, missing[0])})",
              f"with its files in a folder: {ME} --setup --model {Q.setup_id('minimax', quant)} --model-dir <folder>")
