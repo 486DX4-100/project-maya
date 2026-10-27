@@ -2221,6 +2221,10 @@ class Service:
                  "eg_lookup_rows": "Consumer Engram row lookups since engine start",
                  "eg_lookup_hits": "Consumer Engram row lookups served without a file read since engine start",
                  "eg_lookup_reads": "Consumer Engram on-demand file reads since engine start (prefetch reads are separate)",
+                 "slot_ram": "Parked DeepSeek conversations held in RAM",
+                 "slot_disk": "Parked DeepSeek conversations held in the slot folder",
+                 "slot_ram_bytes": "Parked DeepSeek conversation payload bytes in RAM",
+                 "slot_ram_cap": "Parked DeepSeek conversation RAM budget, bytes; 0 means count-limited only",
                  "vram_used": "Expert slots in use in VRAM", "vram_slots": "Expert slots in VRAM",
                  "ram_used": "Expert slots in use in RAM", "ram_slots": "Expert slots in RAM"}
     PROM_STAT_COUNTERS = {"eg_lookup_rows", "eg_lookup_hits", "eg_lookup_reads"}

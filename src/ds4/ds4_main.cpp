@@ -390,9 +390,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // not match its file, or unused for MAYA_DS4_SLOT_DAYS (7) days, is removed at start.  MAYA_DS4_SLOT_CAP (4) is
     // the conversations kept in RAM; past it the least recently used is written to the folder and read back from there
     // (RAM first, the folder past the cap), and the engine's end writes the ones in RAM to the folder, so the next run
-    // reads on from them.  MAYA_DS4_SLOT_GB (16) caps the folder's .bin files: at start, and after every write, the
-    // folder's least recently used conversation is removed while they are over it (never the one just written, so a
-    // conversation bigger than the cap stays).  MAYA_DS4_SLOT_MIN (1024) is the shortest conversation set aside (a
+    // reads on from them.  MAYA_DS4_SLOT_RAM_GB (0, off) additionally caps their bytes in RAM after each save: the
+    // incoming state is serialized first (the peak can exceed the cap), then the least recently used spills to the
+    // folder, with one RAM conversation kept even when it alone is over the cap.  MAYA_DS4_SLOT_GB
+    // (16) caps the folder's .bin files: at start, and after every write, the folder's least recently used conversation
+    // is removed while they are over it (never the one just written, so a conversation bigger than the cap stays).
+    // MAYA_DS4_SLOT_MIN (1024) is the shortest conversation set aside (a
     // shorter one is read again in about the time its slot would take).  Text only: a conversation that holds pictures
     // is not set aside, and a prompt with pictures takes none back.
     const auto env_num = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
@@ -402,6 +405,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
     const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
     const uint64_t slot_budget = (uint64_t) (env_num("STRATA_DS4_SLOT_GB", 16) * 1073741824.0);
+    const uint64_t slot_ram_budget = [] {
+        const char* k = "STRATA_DS4_SLOT_RAM_GB", *v = std::getenv(k);
+        if (v == nullptr) return (uint64_t) 0;
+        char* end = nullptr;
+        const double gb = std::strtod(v, &end);
+        while (end != nullptr && (*end == ' ' || *end == '\t')) ++end;
+        const double max_gb = (double) (~(uint64_t) 0) / 1073741824.0;
+        if (end == nullptr || end == v || *end != '\0' || !std::isfinite(gb) || gb < 0 || gb >= max_gb) {
+            std::fprintf(stderr, "ds4 slots: invalid %s=%s, using 0 (count-limited only)\n", k, v);
+            return (uint64_t) 0;
+        }
+        return (uint64_t) (gb * 1073741824.0);
+    }();
     namespace fs = std::filesystem;
     std::filesystem::path slot_dir;
     struct Slot {
@@ -490,6 +506,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const auto slot_count = [&](int& ram, int& disk) {
         ram = disk = 0;
         for (const Slot& s : slots) (s.data ? ram : disk) += 1;
+    };
+    const auto slot_ram_bytes = [&]() {
+        uint64_t total = 0;
+        for (const Slot& s : slots)
+            if (s.data) total += s.data->size();
+        return total;
     };
     // the folder's conversations (their .bin; a .meta beside each is a few KB: identity and tokens)
     const auto slot_folder_bytes = [&]() {
@@ -582,10 +604,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 slot_drop(i);
         slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions()});
         slots.back().data = buf;
-        while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
+        while (true) {   // past either cap: the least recently used conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
             slot_count(ram, disk);
-            if (ram <= slot_max) break;
+            const bool over_bytes = slot_ram_budget > 0 && ram > 1 && slot_ram_bytes() > slot_ram_budget;
+            if (ram <= slot_max && !over_bytes) break;
             size_t lru = SIZE_MAX;
             for (size_t i = 0; i < slots.size(); ++i)
                 if (slots[i].data && (lru == SIZE_MAX || slots[i].used < slots[lru].used)) lru = i;
@@ -600,6 +623,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), ram, disk,
                       slot_dir.string().c_str());
         note(msg);
+        if (slot_ram_budget > 0) {
+            std::snprintf(msg, sizeof msg, "RAM conversations: %s / %s; %d in RAM, %d in the folder",
+                          gb(slot_ram_bytes()).c_str(), gb(slot_ram_budget).c_str(), ram, disk);
+            note(msg);
+        }
     };
     // the kept conversation this prompt shares the most of - past `floor` tokens, what the model itself can go back
     // to - back in the model: the tokens it covers (0: none).  A conversation the prompt continues whole comes back
@@ -731,6 +759,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             note(msg);
             slot_trim("");   // (the folder over MAYA_DS4_SLOT_GB: the least recently used conversation goes first)
         }
+    }
+    if (slot_max > 0 && slot_ram_budget > 0) {
+        char msg[256];
+        std::snprintf(msg, sizeof msg, "RAM conversation budget: %s (LRU states spill to the folder; one RAM slot is always kept)",
+                      gb(slot_ram_budget).c_str());
+        note(msg);
     }
     if (slot_max > 0) {
 #if !defined(_WIN32)
@@ -989,6 +1023,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::snprintf(b, sizeof b, " eg_lookup_hits=%lld eg_lookup_reads=%lld", (long long) s.eg_hits,
                           (long long) s.eg_reads);
             out += b;
+            if (slot_max > 0) {
+                int slot_ram = 0, slot_disk = 0;
+                slot_count(slot_ram, slot_disk);
+                std::snprintf(b, sizeof b, " slot_ram=%d slot_disk=%d slot_ram_bytes=%llu slot_ram_cap=%llu", slot_ram,
+                              slot_disk, (unsigned long long) slot_ram_bytes(), (unsigned long long) slot_ram_budget);
+                out += b;
+            }
             if (io >= 0 && io_dec >= 0) {
                 const double disk = tr.cpu_blob > 0 ? std::min(cx / fed, (double) (io - io_dec) / tr.cpu_blob / fed) : 0.0;
                 std::snprintf(b, sizeof b, " disk_mb=%.3f disk=%.3f ram_fetch=%.3f", (double) (io - io_dec) / 1e6 / fed,
