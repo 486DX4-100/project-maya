@@ -26,7 +26,8 @@ class ModelChoice(unittest.TestCase):
     def test_new_setup_offers_the_maya_quants(self):
         kind, quant, text = self.choose({})
         self.assertEqual((kind, quant), ("download", "Maya-S-v2-IQ2_XXS"))
-        for q in ("Maya-S-v2-IQ2_XXS:", "Maya-S24:", "Maya-M:", "Maya-M-Derisked:", "Maya-L:"):
+        for q in ("GLM-5.3 · Maya-S:", "GLM-5.3 · Maya-S24:", "GLM-5.3 · Maya-M:", "GLM-5.3 · Maya-M-Derisked:",
+                  "GLM-5.3 · Maya-L:"):   # (the model first, the tier: maya_quants)
             self.assertIn(q, text)
 
     def test_maya_m_derisked_downloads_from_its_own_repo_with_mayas_vision_files(self):

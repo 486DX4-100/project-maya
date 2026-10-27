@@ -255,12 +255,16 @@ function modelDisplayName(id) {
     return lw.charAt(0).toUpperCase() + lw.slice(1);
   }).join(" ");
 }
+// the model with its files when the setup wrote the config ("MiniMax M3.1 · Maya-XS": the model first, never a bare
+// tier - the server's model_label), else its id as people write it; the API's model id on hover
 function renderModelLine() {
   const ctx = health.max_context ? `${ctxfmt(health.max_context)} context` : "";
   const ver = health.version ? `v${health.version}` : "";
+  const name = health.model_label || modelDisplayName(health.model);
   $("side-model").innerHTML = `${modelLogo(health.model)}<span class="side__model-text" title="${esc(health.model)}">` +
-                              `<b>${esc(modelDisplayName(health.model))}</b>${esc([ctx, ver].filter(Boolean).join(" · "))}</span>`;
-  $("chat-empty-model").textContent = [health.model, ctx, ver ? `Project Maya ${ver}` : ""].filter(Boolean).join(" · ");
+                              `<b>${esc(name)}</b>${esc([ctx, ver].filter(Boolean).join(" · "))}</span>`;
+  $("chat-empty-model").textContent = [health.model_label || health.model, ctx, ver ? `Project Maya ${ver}` : ""]
+    .filter(Boolean).join(" · ");
 }
 
 // ------------------------------------------------------------------ Monitor

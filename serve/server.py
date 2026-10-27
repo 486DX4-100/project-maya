@@ -66,6 +66,7 @@ from serve.response_jobs import BackgroundJobs, JobError  # noqa: E402
 from serve.response_store import StoreBusy  # noqa: E402
 from serve.update import RESTART_EXIT, Updater  # noqa: E402
 import maya_names  # noqa: E402  (tools/) the settings' names users see (MAYA_*) and the older ones the code reads
+import maya_quants  # noqa: E402  (tools/) the quants' names users see (the model first: "GLM-5.3 · Maya-S")
 
 try:                        # Project Maya's release (the dashboard's About; the engine's INFO carries none)
     MAYA_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip() or None
@@ -1705,6 +1706,7 @@ class Service:
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.config_path = None                          # the run config (a context change is saved into it)
         self.model_dir = None                            # the model's folder (free disk on the dashboard)
+        self.model_label = None                          # what runs, as users see it: "MiniMax M3.1 · Maya-XS"
         self.trained_context = None                      # what the model was trained for (its GGUF): the slider's top
         self.reload = None                               # a context change: {state, from, to, started, error}
         # "idle_unload_s" / --idle-unload (as Strata's): after this long without a request the engine ends, giving back
@@ -2064,7 +2066,8 @@ class Service:
                f"System: {platform.platform()}, Python {platform.python_version()}",
                f"GPU: {st.get('gpu_name') or 'not readable'} ({gib(hw.get('gpu_mem_total'))} VRAM)",
                f"CPU: {st.get('cpu_name') or '?'}, {st.get('threads') or '?'} threads; RAM {gib(hw.get('ram_total'))}",
-               f"Model: {self.model}, context {self.engine.max_context}"]
+               f"Model: {self.model}" + (f" ({self.model_label})" if self.model_label else "") +
+               f", context {self.engine.max_context}"]
         info = dict(getattr(self.engine, "info", {}) or {})
         if info:
             out.append("Engine: " + " ".join(f"{k}={v}" for k, v in sorted(info.items())))
@@ -2196,7 +2199,8 @@ class Service:
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress[0], progress[1]
-        engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
+        engine = {"model": self.model, "model_label": self.model_label, "max_context": self.engine.max_context,
+                  "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
                   "trained_context": self.trained_context}
         with self.status_lock:
@@ -3731,6 +3735,7 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
+                                 "model_label": svc.model_label,   # (the model first: "GLM-5.3 · Maya-S24")
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec,
                                  "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp), "unloaded": svc.unloaded})
             elif path == "/api/context":
@@ -4681,6 +4686,7 @@ def main() -> int:
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     svc.backend = cfg.get("backend")                    # the Monitor's GPU reader: sysfs on AMD/HIP, NVML otherwise
+    svc.model_label = maya_quants.config_label(cfg)     # (configs of every release: by their installer record)
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
     args = [str(x) for x in cfg.get("args") or []]

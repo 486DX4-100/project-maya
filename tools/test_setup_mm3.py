@@ -192,6 +192,7 @@ class Config(unittest.TestCase):
             self.assertNotIn(k, c["args"])
         self.assertEqual(c["args"][c["args"].index("--kv-cache") + 1], "int8")
         self.assertEqual((c["installer"]["mm3_quant"], c["installer"]["quant"]), ("gguf-xs", "MiniMax-M3.1-Flash-Maya-XS"))
+        self.assertEqual(p.name, "maya-minimax-maya-xs.json")                # (the naming scheme's config)
         # a GGUF pack with the companions' vision tower and draft: pictures on, the draft off until measured
         (self.pack / "mm3.txt").write_text("format gguf\nvision.hidden_size 1280\ndspark.num_hidden_layers 5\n")
         (self.root / "maya-mm3.json").unlink()
@@ -209,7 +210,7 @@ class Gguf(unittest.TestCase):
     def test_manifest(self):
         for q, name in (("gguf-xs", "MiniMax-M3.1-Flash-Maya-XS"), ("gguf-s", "MiniMax-M3.1-Flash-Maya-S")):
             m = maya.mm3_gguf_entry(q)
-            self.assertEqual(m["folder"], name)
+            self.assertEqual(m["folder"], name[len("MiniMax-M3.1-Flash-"):])     # (the repo's Maya-XS/, Maya-S/)
             self.assertTrue(any(n.endswith("-maya-indexers.gguf") for n in m["files"]))
             self.assertTrue(all(n.startswith(name) for n in m["files"]))
             self.assertGreater(m["memory_gb"], m["download_gb"])

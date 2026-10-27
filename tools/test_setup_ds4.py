@@ -128,12 +128,12 @@ class Quant35(unittest.TestCase):
             with patch.object(maya.S, "gpus", return_value=gpus), patch.object(maya, "choose", pick), \
                     patch.object(maya.S, "UI", None):
                 maya.choose_ds4_quant(args(backend=backend), {})
-            return [r for r in rows if r.startswith("EXL3")]
+            return [r for r in rows if r.startswith("DeepSeek V4.1 · EXL3")]   # (the model first: maya_quants)
         self.assertEqual(len(offered([{"arch": 86}, {"arch": 70}])), 2)
         self.assertEqual(len(offered([{"arch": 70}, {"arch": 70}])), 2)       # (Volta: since v1.1.20)
         self.assertEqual(offered([{"arch": 61}, {"arch": 61}]), [])            # (Pascal: the GGUFs only)
         self.assertEqual(offered([], backend="hip"), [])
-        self.assertRegex(offered([{"arch": 89}])[1], r"^EXL3 3\.5 bits \(461 GB\)$")
+        self.assertRegex(offered([{"arch": 89}])[1], r"^DeepSeek V4\.1 · EXL3 3\.5 bpw \(461 GB\)$")
         self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="exl3-3.5"), {}), "exl3-3.5")
 
     def test_own_folder_and_config(self):

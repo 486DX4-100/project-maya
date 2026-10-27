@@ -8,8 +8,8 @@ only what changed and starts; the model is not downloaded again.
 
 MiniMax-M3.1-Flash in Project Maya's own quants: the whole model in a 128 GB PC.
 
-- **MiniMax-M3.1-Flash-Maya-XS and -Maya-S on Maya:** `./setup.sh --model MiniMax-M3.1-Flash --mm3-quant gguf-xs`
-  (or `gguf-s`) runs our GGUF quants on `maya-mm3`: Maya-XS (~93 GB, the experts in about 1.6 bits) fits a 128 GB
+- **MiniMax-M3.1-Flash-Maya-XS and -Maya-S on Maya:** `./setup.sh --model minimax-maya-xs` (or `minimax-maya-s`)
+  runs our GGUF quants on `maya-mm3`: Maya-XS (~93 GB, the experts in about 1.6 bits) fits a 128 GB
   PC's memory, Maya-S (~122 GB, about 2.1 bits) is closer to the original. On the reference prompts Maya-XS on Maya
   scores within a hair of the quant's own measurement (top token the same on 81% of the answer tokens).
 - **NVIDIA from V100 on and AMD, Linux and Windows**, with the experts VRAM cannot hold computed on the CPU from RAM,
@@ -18,6 +18,13 @@ MiniMax-M3.1-Flash in Project Maya's own quants: the whole model in a 128 GB PC.
   own files (about 4 GB), downloaded once beside the model.
 - **The same files work in llama.cpp:** the three dense layers' indexers are kept in a small file of their own, which
   Maya loads to run MiniMax's sparse attention in every layer.
+- **One naming scheme for every model's quants:** the model first, then the tier by the experts' bits - XS (~1.6),
+  S (~2-2.5), M (~3-3.5), L (4+). The setup and the dashboard show "GLM-5.3 · Maya-S24", "DeepSeek V4.1 · Maya-XS",
+  "MiniMax M3.1 · Maya-XS (93 GB)", and `--model` takes setup ids: `glm-maya-s`, `deepseek-maya-xs`,
+  `minimax-maya-xs` and so on. Every name used before (`--model Maya-S24`, `--ds4-quant maya-xs`, ...) still works,
+  and installed models and their configs carry on as they are.
+- **DeepSeek: a 256K context by default** wherever the PC's VRAM and RAM hold the model; PCs with less keep 64K. A
+  setup again keeps the context you chose before.
 
 ## v1.1.29 - 2026-10-26
 

@@ -1462,6 +1462,22 @@ class WebApp(unittest.TestCase):
                 self.assertEqual(code, 200)
                 self.assertIn(want, ctype)
 
+    def test_the_model_shown_model_first(self):
+        """/health's model_label - "MiniMax M3.1 · Maya-XS", from the config's installer record (maya_quants), configs
+        of earlier releases too - is what the sidebar shows; the API's model id stays as it was."""
+        import maya_quants
+        old = {"exe": "/m/build/maya-mm3", "args": ["--pack", "/m/X/maya-mm3"], "model_name": "minimax-m3.1-flash",
+               "installer": {"family": "minimax", "quant": "MiniMax-M3.1-Flash-Maya-XS", "mm3_quant": "gguf-xs"}}
+        self.svc.model_label = maya_quants.config_label(old)
+        try:
+            health = json.loads(self.get("/health")[2])
+        finally:
+            self.svc.model_label = None
+        self.assertEqual((health["model_label"], health["model"]), ("MiniMax M3.1 · Maya-XS", self.svc.model))
+        self.assertIsNone(json.loads(self.get("/health")[2])["model_label"])   # (a hand-written config: the id)
+        app = (ROOT / "serve/web/app.js").read_text(encoding="utf-8")
+        self.assertIn("health.model_label || modelDisplayName(health.model)", app)
+
     def test_only_the_app_files_are_served(self):
         for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
                      "/fonts/missing.woff2", "/fonts/x.ttf"):

@@ -693,7 +693,7 @@ refused rather than read.
 
 ## MiniMax-M3.1-Flash
 
-`./maya.sh --setup --model MiniMax-M3.1-Flash` writes `maya-mm3.json` with what fits this PC: the context (below), the
+`./maya.sh --setup --model MiniMax-M3.1-Flash` writes `maya-mm3.json` (Maya's GGUF quants: their own, below) with what fits this PC: the context (below), the
 model's pictures on, the tensor-parallel groups from the GPU count, and the DSpark drafter only where this PC's speed
 calibration (or your answer at the setup) says drafting is faster. A setup again keeps every engine option listed
 here that the config already has.
@@ -742,9 +742,13 @@ Engine options, in the config's `"args"`:
 | `--staging` | 48 | expert staging slots a GPU |
 | `--profile` | `data/expert-profile-mm3.bin` | the routing profile: the most-routed experts are placed in VRAM |
 
-**Maya's GGUF quants.** `./maya.sh --setup --model MiniMax-M3.1-Flash --mm3-quant gguf-xs` (or `gguf-s`) sets up
-Project Maya's own quants instead of the EXL3 one: MiniMax-M3.1-Flash-Maya-XS (the experts in about 1.6 bits, ~93 GB:
-the whole model in a 128 GB PC's memory) or MiniMax-M3.1-Flash-Maya-S (about 2.1 bits, ~122 GB). They run on NVIDIA
+**Maya's GGUF quants.** `./maya.sh --setup --model minimax-maya-xs` (or `minimax-maya-s`; before:
+`--model MiniMax-M3.1-Flash --mm3-quant gguf-xs`, which still works) sets up Project Maya's own quants instead of the
+EXL3 one: MiniMax M3.1 · Maya-XS (the experts in about 1.6 bits, ~93 GB: the whole model in a 128 GB PC's memory) or
+MiniMax M3.1 · Maya-S (about 2.1 bits, ~122 GB), from
+[peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF)
+(`Maya-XS/MiniMax-M3.1-Flash-Maya-XS-IQ1_S-0000N-of-00002.gguf`, `Maya-S/MiniMax-M3.1-Flash-Maya-S-IQ2_XXS-...`); each
+gets a config of its own, `maya-minimax-maya-xs.json` / `maya-minimax-maya-s.json`. They run on NVIDIA
 from V100 on and on AMD, Linux and Windows. The files follow llama.cpp's MiniMax-M3 layout; the sparse-attention
 indexers of the first three layers sit in a small file of their own beside them (`...-maya-indexers.gguf`), which
 Maya loads so the model runs as MiniMax defines it - keep it with the other files. Pictures and the DSpark drafter
