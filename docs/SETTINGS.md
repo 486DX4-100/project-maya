@@ -329,14 +329,14 @@ with `"loop_guard": false` (or `true`) beside its sampling fields (Chat Completi
 
 ## Several requests at once
 
-This is a **GLM-5.3-Flash** setting. DeepSeek and MiniMax currently serve one request at a time; the launcher rejects
-`--parallel` for them before changing a config or starting setup/calibration. DeepSeek's saved conversation slots
-reuse earlier state, but do not decode multiple requests at once.
+This is a **GLM-5.3-Flash** and **DeepSeek-V4.1-Flash** setting ([DeepSeek's below](#deepseek-v41-flash-several-requests-at-once)).
+MiniMax currently serves one request at a time; the launcher rejects `--parallel` for it before changing a config or
+starting setup/calibration.
 
 `--parallel N` (1-8, default 1). `./maya.sh --parallel 4` (Windows:
-`START-MAYA.bat --parallel 4`) keeps it in the config's `"args"`. Maya then answers up to N requests at the same time,
-and the ones after them wait their turn. The dashboard shows how many answers are being written, and `/v1/status`
-reports N as its concurrency.
+`START-MAYA.bat --parallel 4`) keeps it in the config's `"args"` (the dashboard's Models page: Answers at once). Maya
+then answers up to N requests at the same time, and the ones after them wait their turn. The dashboard shows how many
+answers are being written, and `/v1/status` reports N as its concurrency.
 - **One GPU:** a token of each request goes through the model together. Every dense weight (the attention
   projections, the shared experts, the dense FFN layers and the output head) is read once for all of them, while the
   attention and the routed experts run per request. Each request gets exactly the tokens it would get alone (greedy,
@@ -353,6 +353,35 @@ At four requests on the same host, `k=1` was within run-to-run noise of legacy, 
 Each extra request keeps its own context state in VRAM (the attention caches, the recurrent states and a snapshot),
 taken from the expert pool at the start, so a larger N leaves fewer experts in VRAM; the log's `glm multi:` line gives
 the size. With N above 1 the engine decodes without a [DFlash2 drafter](#drafting-with-dflash2) (the log says so).
+
+### DeepSeek-V4.1-Flash: several requests at once
+
+`maya-ds4 --parallel N` holds N conversations, each with its own state: its window rings, its compressed KV and index
+keys, its checkpoints. That is about 1.1 KB a position on each GPU for each of them, a whole context's worth each,
+taken from the experts' VRAM at the start (the log's `ds4: --parallel` line gives the size). The setup's recommended
+context shares the memory beside the model among the N conversations.
+- **A request alone** decodes as with one conversation: the DSpark drafter and the prompt lookup as configured.
+- **Two or more:** a token of each goes through the model together. The dense weights, the router and the experts
+  the requests share are read once for all of them, and each request's attention reads its own conversation's caches.
+  Each request gets exactly the tokens it would get alone with plain steps: greedy, with the experts where the load put
+  them and the PCIe lane off, its logits are bit for bit its own (checked with 2 and 4 at once: `maya-ds4 --parallel 4
+  --multi-check --ids ...`). The CPU lane's and the PCIe lane's rounding can change the last bits, as it already can
+  between two runs of one request.
+- **A new request** takes the idle conversation its prompt continues. If none fits, it takes an empty one, else the
+  least recently used, which first goes to a [kept conversation](#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model)
+  with `MAYA_DS4_SLOT_KEEP=1`. The others wait while its prompt is read. Its pictures are read by the engine between two
+  of their tokens: the vision tower borrows its room and gives it back before the prompt.
+- **Several GPUs:** the layer split and the tensor-parallel groups take the batched step as they take one token; each
+  step's new compressed rows go to the other groups' GPUs in one hand-off.
+- **What it gains:** real questions through the server, against the same questions one after another (each alone,
+  with the DSpark drafter): x1.57 tokens a second in all for two at once and x1.26 for four on a V100 32 GB with most
+  of Maya-XS's experts in RAM. Each conversation brings its own experts, so where VRAM holds only part of them they
+  compete for it; the more of the model VRAM holds, the more it gains. On a Strix Halo (Radeon 8065S) with Maya-XS,
+  against plain steps one after another: x1.58 for two and x2.21 for four; there the drafter alone is about as fast as
+  two at once (x1.10 for two against one at a time with it), as the steps of several requests carry no drafts.
+- **Agents** (several tool-using conversations, long prompts): a turn's first token comes sooner - the requests no
+  longer wait in line for a whole answer - but a new prompt is read while the others wait, and their batched steps
+  carry no drafts, so on one GPU a whole turn can take longer than one at a time with the drafter.
 
 ## Drafting with DFlash2
 

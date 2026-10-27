@@ -4,7 +4,7 @@ each one runs with, and the engine settings the page changes in them.
 A config's settings, as the page shows them (None: the engine's own default, or "auto"):
   both:      context, images, gpus, reserve_mib, env
   GLM:       parallel, draft ("mtp" | "dflash2"), expert_cache, prefill, kv_streaming, kv_resident
-  DeepSeek:  draft ("dspark" | "none"), tp, mmap ("auto" | "on" | "off"), prefill_chunk, cpu_threads
+  DeepSeek:  parallel, draft ("dspark" | "none"), tp, mmap ("auto" | "on" | "off"), prefill_chunk, cpu_threads
   MiniMax:   draft ("dspark" | "none"), tp (0: the layers split, no groups), kv_cache, kv_streaming, kv_resident,
              cpu_threads (maya-mm3 stops at a flag it does not know: only its own are written)
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
@@ -37,7 +37,8 @@ MASK = "***"
 ENV_LOADER = re.compile(r"^(?:LD_\w*|DYLD_\w*|PYTHON\w*|PATH|PATHEXT|BASH_ENV|ENV|IFS|COMSPEC|SYSTEMROOT)$", re.I)
 GLM_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "expert_cache", "prefill",
             "kv_streaming", "kv_resident")
-DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "tp", "mmap", "prefill_chunk", "cpu_threads")
+DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "tp", "mmap", "prefill_chunk",
+            "cpu_threads")
 MM3_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
             "cpu_threads")
 
@@ -174,7 +175,7 @@ def settings_of(cfg: dict) -> dict:
     if family(cfg) == "deepseek":
         dspark = flag(args, "--dspark")
         out.update(images=flag(args, "--vision") != "off",
-                   reserve_mib=_int(flag(args, "--reserve-mib")),
+                   reserve_mib=_int(flag(args, "--reserve-mib")), parallel=_int(flag(args, "--parallel"), 1),
                    draft="none" if dspark == "none" or (dspark is None and not ds4_has_drafter(cfg)) else "dspark",
                    tp=_int(flag(args, "--tp"), 2), mmap=flag(args, "--mmap-experts", "auto"),   # (2: the engine's own)
                    prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")))
@@ -286,6 +287,9 @@ def apply(cfg: dict, settings: dict) -> dict:
         ct = _num(s, "cpu_threads", 1, 512, "CPU threads")
         args = set_flag(args, "--cpu-threads", ct) if ct is not None else drop_flag(args, "--cpu-threads")
     elif ds4:
+        # (maya-ds4 --parallel: n conversations at once - each its own context's caches in VRAM; written where it changes)
+        par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
+        args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this pack has no DSpark drafter" if s.get("draft") == "dspark"
                              else "Drafting: DSpark or none")

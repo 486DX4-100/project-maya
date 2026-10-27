@@ -163,6 +163,19 @@ class Settings(unittest.TestCase):
             M.apply(cfg, {"images": True})
         self.assertEqual(M.choices(M.read(ds4_cfg(self.d, "maya-x.json", drafter=False)))["draft"], ["none"])
 
+    def test_deepseek_answers_at_once(self):
+        """maya-ds4 --parallel: read (1 where the config names none), written where it changes, 1-8."""
+        cfg = M.read(ds4_cfg(self.d))
+        self.assertEqual(M.settings_of(cfg)["parallel"], 1)
+        self.assertNotIn("--parallel", M.apply(cfg, {"cpu_threads": 8})["args"])   # (an older config: as it was)
+        new = M.apply(cfg, {"parallel": 4})
+        self.assertEqual(M.flag(new["args"], "--parallel"), "4")
+        self.assertEqual(M.settings_of(new)["parallel"], 4)
+        self.assertEqual(M.flag(M.apply(new, {"parallel": 1})["args"], "--parallel"), "1")
+        for bad in (0, 9):
+            with self.assertRaisesRegex(ValueError, "Answers at once"):
+                M.apply(cfg, {"parallel": bad})
+
     def test_deepseek_tensor_parallel_beyond_two(self):
         # a 9-GPU config the calibration left at --tp 8: read as it is, and its other settings still save
         cfg = M.read(ds4_cfg(self.d))

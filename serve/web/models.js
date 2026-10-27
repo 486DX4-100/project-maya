@@ -256,6 +256,10 @@ function fieldsOf(m, d) {
   const dspark = m.choices.draft.includes("dspark");
   return [
     {label: "Model", rows: [context,
+      html`<${Row} label="Answers at once" flag="--parallel" changed=${ch("parallel")}
+        hint="Up to 8. Each extra conversation keeps its own context's caches in VRAM, which the experts give up. An answer written alone still drafts; several at once are decoded together."
+        warn=${d.parallel > 1 && d.context * d.parallel > 1048576 ? `${d.parallel} conversations of ${ctxfmt(d.context)} each: a smaller context leaves the experts more VRAM.` : null}>
+        <${Stepper} label="Answers at once" value=${d.parallel} min=${1} max=${8} on=${(v) => setDraft({parallel: v})}/><//>`,
       html`<${Row} label="Drafting" flag="--dspark" changed=${ch("draft")}
         hint=${dspark ? "DSpark drafts a few tokens at a time for the model to check. The speed calibration picks the faster on this PC."
           : "This pack has no DSpark drafter."}>

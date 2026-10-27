@@ -1469,10 +1469,15 @@ def config_family(cfg: dict) -> str:
     return Q.family_of(cfg)
 
 
+# the models whose engine answers several requests at once (--parallel): GLM-5.3-Flash's, DeepSeek-V4.1-Flash's
+# (maya-ds4 --parallel: a conversation's state each, their tokens decoded together)
+PARALLEL_FAMILIES = ("glm", "deepseek")
+
+
 def check_parallel(a, family: str) -> None:
-    if getattr(a, "parallel", None) is not None and family != "glm":
+    if getattr(a, "parallel", None) is not None and family not in PARALLEL_FAMILIES:
         model = DS4 if family == "deepseek" else MM3
-        fail(f"--parallel is only supported by GLM-5.3-Flash; {model} serves one request at a time",
+        fail(f"--parallel is supported by GLM-5.3-Flash and DeepSeek-V4.1-Flash; {model} serves one request at a time",
              "remove --parallel; saved conversations do not enable simultaneous decoding")
 
 
@@ -4287,17 +4292,19 @@ def ds4_kv_gb(ctx: int, gpus: int = 1) -> float:
     return ctx * DS4_KV_BYTES * max(1, gpus) / 2**30
 
 
-def ds4_recommended_context(vram: float, ram: float, need: float, gpus: int = 1) -> int:
+def ds4_recommended_context(vram: float, ram: float, need: float, gpus: int = 1, parallel: int = 1) -> int:
     """The context the setup recommends on this PC, as MiniMax's (mm3_recommended_context): the largest from
     DS4_DEFAULT_CONTEXT up to DS4_RECOMMENDED_CONTEXT (256K) whose caches fit in what VRAM + RAM hold beyond the
     model's files (need: ds4_memory_gb) - else DS4_DEFAULT_CONTEXT (64K), also when the RAM could not be read: a PC
-    that reads experts from the SSD reads a long prompt slowly."""
+    that reads experts from the SSD reads a long prompt slowly.  parallel: --parallel's conversations, each a whole
+    context's caches - the memory is shared among them (and below 64K for several, the largest that fits)."""
     if ram <= 0:
         return DS4_DEFAULT_CONTEXT
     spare = vram + ram - need
-    fits = [c for c in DS4_CONTEXTS
-            if DS4_DEFAULT_CONTEXT <= c <= DS4_RECOMMENDED_CONTEXT and ds4_kv_gb(c, gpus) <= spare]
-    return max(fits) if fits else DS4_DEFAULT_CONTEXT
+    n = max(1, int(parallel or 1))
+    lo = DS4_DEFAULT_CONTEXT if n == 1 else DS4_CONTEXTS[0]
+    fits = [c for c in DS4_CONTEXTS if lo <= c <= DS4_RECOMMENDED_CONTEXT and n * ds4_kv_gb(c, gpus) <= spare]
+    return max(fits) if fits else (DS4_DEFAULT_CONTEXT if n == 1 else DS4_CONTEXTS[0])
 
 
 def ds4_model(quant: str = "exl3") -> dict:
@@ -4468,7 +4475,10 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     same_gpus = tp_keepable(old, pc)
     kept = keep_args(old.get("args") or [], args, (("--tp",) if same_gpus else ()) +
                      ("--prefill-chunk", "--reserve-mib", "--vram-experts", "--cpu-threads", "--threads", "--dspark",
-                      "--dspark-conf", "--expert-profile", "--mmap-experts"))
+                      "--dspark-conf", "--expert-profile", "--mmap-experts", "--parallel"))
+    if getattr(a, "parallel", None):   # given now: written, and a later setup keeps it
+        set_arg(args, "--parallel", a.parallel)
+        ok(f"answers at once: {a.parallel} (--parallel; each its own context's caches in VRAM)")
     if not same_gpus and flag_value(old.get("args") or [], "--tp") not in (None, flag_value(args, "--tp")):
         ok(f"--tp {flag_value(args, '--tp')} for the GPU{'s' if gpus != 1 else ''} chosen now (the config before had "
            f"--tp {flag_value(old['args'], '--tp')} for GPUs {old.get('gpu')})")
@@ -4553,9 +4563,11 @@ def set_up_ds4(a, prev: dict) -> Path | None:
                                                  " (unsloth's GGUF)" if gguf else
                                                  f" (LibertAIDAI's EXL3 quant at {DS4_EXL3[quant]['bits']} bits)"))
     vram = sum(g.get("vram_gb", 0) for g in pc["gpus"])
-    rec = ds4_recommended_context(vram, mem_gb()[0], ds4_memory_gb(quant), len(pc["gpus"]))
+    par = getattr(a, "parallel", None) or int(flag_value(prev_args, "--parallel") or 1)   # (--parallel: kept)
+    rec = ds4_recommended_context(vram, mem_gb()[0], ds4_memory_gb(quant), len(pc["gpus"]), par)
     ctx = choose_context(a, prev_ctx, DS4_CONTEXTS, rec)
-    ok(f"context: {ctx} tokens" + (" (recommended for this PC's memory)" if ctx == rec else ""))
+    ok(f"context: {ctx} tokens" + (" (recommended for this PC's memory)" if ctx == rec else "") +
+       (f", for each of {par} conversations at once (--parallel)" if par > 1 else ""))
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
     d = ds4_dir(a, models, prev, quant)
@@ -5148,10 +5160,9 @@ def main() -> int:
                                    "0,1,2,3")
     ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
     ap.add_argument("--parallel", type=int, choices=range(1, 9), metavar="N",
-                    help="GLM-5.3-Flash only: answer up to N requests at once (1-8, default 1), kept in the config: "
-                         "on one GPU they are "
-                         "decoded together, more tokens per second in all; each extra conversation keeps its own "
-                         "context in VRAM, which the expert cache gives up")
+                    help="GLM-5.3-Flash and DeepSeek-V4.1-Flash: answer up to N requests at once (1-8, default 1), "
+                         "kept in the config: they are decoded together, more tokens per second in all; each extra "
+                         "conversation keeps its own context in VRAM, which the expert cache gives up")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
                          "programs (default 700), kept in the config")

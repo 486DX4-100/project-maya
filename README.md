@@ -205,7 +205,9 @@ the dense weights are read once for all of them. In tokens per second for all of
 questions one after another: x1.41 for two and x1.35 for four on a V100 that streams most of Maya-S's experts from
 RAM, x1.67 for two and x2.02 for four on a Gorgon Halo (Radeon 8065S, 160 GB for the GPU) that holds every expert in
 GPU memory. The more of the model
-VRAM holds, the more it gains ([how](docs/SETTINGS.md#several-requests-at-once)).
+VRAM holds, the more it gains ([how](docs/SETTINGS.md#several-requests-at-once)). DeepSeek-V4.1-Flash does the same
+(`maya-ds4 --parallel`): x1.57 for two and x1.26 for four on a V100 with most of Maya-XS's experts in RAM, against
+the same questions one after another with the DSpark drafter ([how](docs/SETTINGS.md#deepseek-v41-flash-several-requests-at-once)).
 
 ## What you need
 
@@ -265,7 +267,7 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
 - **DeepSeek GGUF expert-copy startup on Linux:** optional [direct reads](docs/SETTINGS.md#deepseek-expert-copy-io) for the experts copied into RAM (off by default).
 - **DeepSeek prompt experts on AMD:** `MAYA_DS4_EXPERT_MMQ=1` uses the existing int8 MMQ path for routed IQ experts.
   It is off by default and adds q8 activation rounding; see [settings](docs/SETTINGS.md).
-- **Several requests at once** (GLM-5.3-Flash): `./maya.sh --parallel 4` (Windows: `START-MAYA.bat --parallel 4`; up to 8) keeps
+- **Several requests at once** (GLM-5.3-Flash and DeepSeek-V4.1-Flash): `./maya.sh --parallel 4` (Windows: `START-MAYA.bat --parallel 4`; up to 8) keeps
   it in the config, and the dashboard shows how many answers are being written. Each extra request keeps its own
   context in VRAM, so a few fewer experts fit there ([how](docs/SETTINGS.md#several-requests-at-once)).
 - **Long contexts** (GLM-5.3-Flash): new setups keep each attention layer's cache in RAM with a window of it in VRAM
