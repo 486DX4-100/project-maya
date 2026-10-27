@@ -1629,6 +1629,17 @@ void test_kv_pack(cudaStream_t s) {
         CU(cudaEventCreate(&e0));
         CU(cudaEventCreate(&e1));
         const float scale = 1.0f / std::sqrt((float) HD);
+        // (kAttnWmma's slabs on CUDA compute capability 7.x: the FP16 tensor-core kernel, unless DS4_ATTN_V7=0)
+        bool fp16_slabs = false;
+#if !defined(STRATA_USE_HIP)
+        {
+            int dev = 0;
+            cudaDeviceProp p{};
+            const char* v7 = std::getenv("DS4_ATTN_V7");
+            fp16_slabs = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                         p.major == 7 && !(v7 != nullptr && std::atoi(v7) == 0);
+        }
+#endif
         const struct {
             int T, gen, iters;
             const char* what;
@@ -1680,7 +1691,13 @@ void test_kv_pack(cudaStream_t s) {
                 CU(cudaEventElapsedTime(&ms, e0, e1));
                 us[w] = ms * 1000.0f / sh.iters;
             }
-            if (T >= 16) {   // kAttnWmma: the matrix cores (RDNA 3/4; elsewhere the packed kernel)
+            // (a V100 / RTX 20 takes kAttnWmma's prompt slabs through FP16 tensor cores, sparse_attn_v7_kernel: this
+            //  broad-range fixture's rows reach ~1e6, past the ~2e5 its 2^-4 scaling keeps inside FP16 - the model's
+            //  rows stay below that - so it is checked on the bounded rows' WMMA cases below; DS4_ATTN_V7=0: here too)
+            if (T >= 16 && fp16_slabs) {
+                std::printf("kv pack: sparse attention, %-22s skip  matrix cores: sm_7x's FP16 kernel - the bounded "
+                            "rows' WMMA cases below check it\n", sh.what);
+            } else if (T >= 16) {   // kAttnWmma: the matrix cores (RDNA 3/4; elsewhere the packed kernel)
                 CU(cudaMemset(o2, 0xff, n * 4));
                 dk::sparse_attn(d_q, ext, c4, d_sel, SEL, ar, d_sink, NH, HD, T, scale, o2, s, dk::kKvFp4, dk::kAttnWmma,
                                 &scr);
