@@ -805,6 +805,25 @@ installs, or checked by hash before each start) can keep them elsewhere.
 | --- | --- | --- |
 | `MAYA_DS4_LT_STORE` | `<pack>/lt-picks.txt` | the picks in this file instead; empty: none kept, each start measures its own |
 
+## DeepSeek: packed EXL3 tensor-parallel cache transfers
+
+`DS4_EXL3_PACKED_HOST=1` stores resident EXL3 host experts as GPU-ready member blobs;
+the CPU reads views of those blobs while retaining the original split-K reduction
+order. This experimental layout requires a two-member tensor-parallel group, one
+host NUMA part, uniform integer-bit expert layouts and aligned FFN partitions.
+The additional host storage is checked against the available RAM budget.
+
+With that layout enabled, `DS4_EXL3_DIRECT_SWAPS=1` enables a cache replacement path.
+It copies the GPU-ready member blobs directly between their host and VRAM slots,
+avoiding host reassembly and splitting, and queues both members before waiting.
+The existing GPU-turn copy guards and cache publication rules still apply.
+
+Both options default to `0`; unsupported layouts use the original path. They change
+transfer scheduling, not expert selection or compute kernels. Different cache
+completion timing can still change CPU/GPU execution placement and model numerics.
+Use `DS4_CHECK_SWAPS=1` for byte checks against the model files during validation;
+leave those checks off for timing measurements.
+
 ## DeepSeek: the starting expert profile
 
 The engine keeps how often each expert was routed in `<pack>/expert-profile.bin`: at a start the most-routed experts

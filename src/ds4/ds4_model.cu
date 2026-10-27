@@ -760,6 +760,7 @@ struct Layer {
     std::vector<Layer> mates;
     x3::ExpertLayout hlay;
     size_t hblob = 0;
+    bool packed_host = false;  // NH1: consecutive GPU-ready member blobs in each resident host slot
     int ff0 = 0, ffn = 0;     // this member's FFN columns [ff0, ff0 + ffn) (split128 of n_ff; the whole one alone)
     // this member's heads [ah0, ah0 + ahn) and wo_a groups [og0, og0 + ogn) - all of them alone; in a group of more
     // members than the heads split among evenly (head_members: 9, 7 or 6 over 64 heads), the first ones none: their
@@ -2724,6 +2725,13 @@ struct Model::Impl {
 
     // the region of expert e -> its CPU-lane part X (columns [X n / NH, (X + 1) n / NH) of each matrix)
     void repack_part(const Layer& l, const uint8_t* region, int X, uint8_t* dst) const {
+        if (l.packed_host) {
+            std::vector<uint8_t> blob(l.blob);
+            // Packed host slots are restricted to a single expert layout class.
+            repack(l, 0, region, blob.data());
+            for (int m = 0; m < l.nm; ++m) blob_to_half(l, blob.data(), m, dst + (size_t) m * l.hblob);
+            return;
+        }
         for (int r = 0; r < 3; ++r) {
             const size_t tile = (size_t) 16 * l.lay.k2[r];
             const int k = l.hl.k[r], nt = l.hl.n[r] * NH / 16, nth = l.hl.n[r] / 16;
@@ -4336,6 +4344,12 @@ struct Model::Impl {
             return ok;
         }
         const auto& parts = l.hh[(size_t) e];
+        if (l.packed_host && src == nullptr) {
+            const bool ok = cudaMemcpyAsync(dst, parts[0] + (size_t) m * l.hblob, l.hblob,
+                                             cudaMemcpyHostToDevice, cs) == cudaSuccess;
+            if (!ok) err = "streaming packed layer " + std::to_string(l.il) + " expert " + std::to_string(e);
+            return ok;
+        }
         const int D = g.dim, FF = g.ff;
         auto cp2 = [&](uint8_t* d0, size_t dp, const uint8_t* s0, size_t sp, size_t w, size_t h) {
             return cudaMemcpy2DAsync(d0, dp, s0, sp, w, h, cudaMemcpyHostToDevice, cs) == cudaSuccess;
@@ -5298,6 +5312,10 @@ struct Model::Impl {
     }
     // an expert's VRAM blob -> its CPU-lane part X, and its NH parts -> the blob (the cache's swaps)
     void blob_to_part(const Layer& l, const uint8_t* blob, int X, uint8_t* dst) const {
+        if (l.packed_host) {
+            for (int m = 0; m < l.nm; ++m) blob_to_half(l, blob, m, dst + (size_t) m * l.hblob);
+            return;
+        }
         for (int r = 0; r < 3; ++r) {
             const size_t tile = (size_t) 16 * l.lay.k2[r];
             const int k = l.hl.k[r], nt = l.hl.n[r] * NH / 16, nth = l.hl.n[r] / 16;
@@ -5310,6 +5328,10 @@ struct Model::Impl {
         }
     }
     void parts_to_blob(const Layer& l, const std::array<uint8_t*, 4>& parts, uint8_t* blob) const {
+        if (l.packed_host) {
+            for (int m = 0; m < l.nm; ++m) half_to_blob(l, parts[0] + (size_t) m * l.hblob, m, blob);
+            return;
+        }
         for (int r = 0; r < 3; ++r) {
             const size_t tile = (size_t) 16 * l.lay.k2[r];
             const int k = l.hl.k[r], nt = l.hl.n[r] * NH / 16, nth = l.hl.n[r] / 16;
@@ -6015,6 +6037,28 @@ struct Model::Impl {
                     off += align256((size_t) n * 2);
                 }
                 l.hl.bytes = off;
+                const char* packed = std::getenv("DS4_EXL3_PACKED_HOST");
+                bool eligible = packed && std::atoi(packed) != 0 && !file_experts && NH == 1 &&
+                                l.lay.fmt != gg::kFmtMXFP4 && l.n_cls == 1 && l.nm == 2 &&
+                                (g.ff / l.nm) % 128 == 0;
+                for (int m = 0; m < l.nm && eligible; ++m)
+                    eligible = member(l, m).ff0 == m * (g.ff / l.nm) &&
+                               member(l, m).ffn == g.ff / l.nm && member(l, m).hblob == l.hblob;
+                for (int r = 0; r < 3 && eligible; ++r)
+                    eligible = (l.lay.k2[r] % 2) == 0;
+                if (eligible) {
+                    const size_t bytes = (size_t) l.nm * l.hblob;
+                    const size_t slots = (size_t) n_host + (l.spare_vram >= 0 ? 1 : 0);
+                    const uint64_t avail = ram_room();
+                    if (bytes >= off && (avail == ~uint64_t{0} ||
+                        (avail > kRamMargin && slots <= (avail - kRamMargin) / bytes))) {
+                        l.hl.bytes = bytes;
+                        l.packed_host = true;
+                        if (o.verbose)
+                            std::fprintf(stderr, "ds4: packed EXL3 TP host layer %d: %d members, %zu bytes/slot\n",
+                                         l.il, l.nm, bytes);
+                    }
+                }
             }
             l.hh.assign((size_t) l.n_exp, {nullptr, nullptr, nullptr, nullptr});
             if (l.lay.fmt == gg::kFmtMXFP4) {   // a GGUF's: read in place from the file's mapping
@@ -8132,6 +8176,140 @@ struct Model::Impl {
     double cpu_ph_ms[4] = {};
     long cpu_calls = 0, cpu_ents = 0, cpu_rows = 0;
     std::atomic<uint64_t> cpu_job_ns[4] = {}, cpu_job_n[4] = {};
+
+    void cpu_experts_packed(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
+                     const int* ord = nullptr) {
+        if (ldx == 0) ldx = (size_t) g.dim;
+        static const bool stats = std::getenv("DS4_CPU_STATS") != nullptr;
+        double tph = stats ? now_ms() : 0.0;
+        auto phase = [&](int i) {
+            if (!stats) return;
+            const double t = now_ms();
+            cpu_ph_ms[i] += t - tph;
+            tph = t;
+        };
+        const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
+        const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
+        const int ne = (int) ents.size();
+        const float lim = g.lim;
+        const int FH = FF / l.nm, blocks = FH / 128;
+        auto part = [&](int e, int X, int r, int m = 0) {
+            const uint8_t* b = l.hh[(size_t) e][0] + (size_t) m * l.hblob;
+            const auto& lay = member(l, m).hlay;
+            kc::Exl3Part p;
+            p.trellis = (const uint32_t*) (b + lay.trellis[r]);
+            p.suh = (const uint16_t*) (b + lay.suh[r]);
+            p.svh = (const uint16_t*) (b + lay.svh[r]);
+            p.k = r < 2 ? E : FH;
+            p.n = r < 2 ? FH : E;
+            p.k2 = l.lay.k2[r];
+            return p;
+        };
+        auto xh = [&](int X, int sl, int r) { return c_xh.data() + ((size_t) (X * kSlots + sl) * 2 + r) * E; };
+        auto xsb = [&](int X, int sl, int r) { return c_xsb.data() + ((size_t) (X * kSlots + sl) * 2 + r) * EB; };
+        auto acc = [&](int X, int sl, int r, int q) {
+            return c_acc.data() + (((size_t) (X * kSlots + sl) * 2 + r) * GQ + q) * FFh;
+        };
+        auto xhd = [&](int sl) { return c_xhd.data() + (size_t) sl * FF; };
+        auto xsd = [&](int sl) { return c_xsd.data() + (size_t) sl * FB; };
+        auto accd = [&](int X, int sl, int q) { return c_accd.data() + ((size_t) (X * kSlots + sl) * DQ + q) * Eh; };
+        std::function<void(int)> f[4];
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (j / (2 * GQ))];
+                const int r = (j / GQ) % 2, q = j % GQ;
+                const kc::Exl3Part p = part(en.e, X, r);
+                const float* xp[kc::kExl3CpuMaxN];
+                float* ap[kc::kExl3CpuMaxN];
+                for (int i = 0; i < en.n; ++i) {
+                    const int sl = en.slot0 + i;
+                    const float* xt = x + (size_t) en.tok[i] * ldx;
+                    for (int b = 2 * q; b < 2 * q + 2; ++b)
+                        xsb(X, sl, r)[b] = kc::exl3_cpu_prepare_block(p.suh + b * 128, xt + b * 128, xh(X, sl, r) + b * 128);
+                    xp[i] = xh(X, sl, r);
+                    ap[i] = acc(X, sl, r, q);
+                }
+                for (int m = 0; m < l.nm; ++m) {
+                    const auto view = part(en.e, X, r, m);
+                    float* out[kc::kExl3CpuMaxN];
+                    for (int i = 0; i < en.n; ++i) out[i] = ap[i] + m * FH;
+                    if (en.n == 1) kc::exl3_cpu_rows_acc(view, xp[0], q * 16, (q + 1) * 16, out[0]);
+                    else kc::exl3_cpu_rows_acc_n(view, xp, en.n, q * 16, (q + 1) * 16, out);
+                }
+            };
+        run_nodes(ne * 2 * GQ, f, 0);
+        phase(0);
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (j / GB)];
+                const int b = j % GB;
+                const kc::Exl3Part pg = part(en.e, X, 0, b / blocks), pu = part(en.e, X, 1, b / blocks),
+                                      pd = part(en.e, X, 2, b / blocks);
+                for (int i = 0; i < en.n; ++i) {
+                    const int sl = en.slot0 + i;
+                    float y[2][128], a[128], hb[128];
+                    for (int r = 0; r < 2; ++r) {
+                        for (int c = 0; c < 128; ++c) a[c] = 0.0f;
+                        for (int q = 0; q < GQ; ++q) {
+                            const float* aq = acc(X, sl, r, q) + b * 128;
+                            for (int c = 0; c < 128; ++c) a[c] += aq[c];
+                        }
+                        double xs = 0.0;
+                        for (int k = 0; k < EB; ++k) xs += xsb(X, sl, r)[k];
+                        kc::exl3_cpu_band_out(r == 0 ? pg : pu, a, (float) xs, (b % blocks) * 128, y[r]);
+                    }
+                    for (int c = 0; c < 128; ++c) {
+                        float gv = y[0][c], uv = y[1][c];
+                        if (lim > 0.0f) {
+                            gv = std::min(gv, lim);
+                            uv = std::min(std::max(uv, -lim), lim);
+                        }
+                        hb[c] = gv / (1.0f + std::exp(-gv)) * uv;
+                    }
+                    const int gb = X * GB + b;
+                    xsd(sl)[gb] = kc::exl3_cpu_prepare_block(pd.suh + (gb % blocks) * 128, hb, xhd(sl) + gb * 128);
+                }
+            };
+        run_nodes(ne * GB, f, 1);
+        phase(1);
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (j / DQ)];
+                const int q = j % DQ;
+                const kc::Exl3Part p = part(en.e, X, 2, q / blocks);
+                const float* xp[kc::kExl3CpuMaxN];
+                float* ap[kc::kExl3CpuMaxN];
+                for (int i = 0; i < en.n; ++i) {
+                    xp[i] = xhd(en.slot0 + i) + (q / blocks) * FH;
+                    ap[i] = accd(X, en.slot0 + i, q);
+                }
+                if (en.n == 1) kc::exl3_cpu_rows_acc(p, xp[0], (q % blocks) * 8, (q % blocks + 1) * 8, ap[0]);
+                else kc::exl3_cpu_rows_acc_n(p, xp, en.n, (q % blocks) * 8, (q % blocks + 1) * 8, ap);
+            };
+        run_nodes(ne * DQ, f, 2);
+        phase(2);
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (j / DB)];
+                const int b = j % DB;
+                const kc::Exl3Part pd = part(en.e, X, 2);
+                for (int i = 0; i < en.n; ++i) {
+                    const int sl = en.slot0 + i;
+                    float a[128];
+                    for (int c = 0; c < 128; ++c) a[c] = 0.0f;
+                    for (int q = 0; q < DQ; ++q) {
+                        const float* aq = accd(X, sl, q) + b * 128;
+                        for (int c = 0; c < 128; ++c) a[c] += aq[c];
+                    }
+                    double xs = 0.0;
+                    for (int k = 0; k < FB; ++k) xs += xsd(sl)[k];
+                    kc::exl3_cpu_band_out(pd, a, (float) xs, b * 128, c_yd.data() + (size_t) sl * E + (size_t) X * Eh + b * 128);
+                }
+            };
+        run_nodes(ne * DB, f, 3);
+        phase(3);
+    }
+
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
                      const int* ord = nullptr) {
         if (ldx == 0) ldx = (size_t) g.dim;
@@ -8148,6 +8326,7 @@ struct Model::Impl {
             cpu_ents += (long) ents.size();
             for (const Ent& en : ents) cpu_rows += en.n;
         }
+        if (l.packed_host) return cpu_experts_packed(l, x, ents, ldx, ord);
         if (l.lay.fmt == gg::kFmtMXFP4) return cpu_experts_mx(l, x, ents, ldx, ord);
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
         const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
@@ -8292,6 +8471,7 @@ struct Model::Impl {
     }
 
     void cache_loop(SwapBufs& B) {
+        const bool direct_packed = env_f("DS4_EXL3_DIRECT_SWAPS", 0) != 0;
         for (;;) {
             Swap sw;
             {
@@ -8308,7 +8488,6 @@ struct Model::Impl {
                 sw_ready.push_back(sw);
                 continue;
             }
-            parts_to_blob(l, l.hh[(size_t) sw.in], B.a);
             auto off_turn = [&](int di, cudaStream_t cs) {   // (false: quitting)
                 while (!copy_open(di, sw.win)) {
                     if (quit.load()) return false;
@@ -8317,35 +8496,83 @@ struct Model::Impl {
                 copy_after_idle(di, cs);
                 return true;
             };
-            if (l.nm == 1) {
-                const Dev& d = devs[(size_t) l.dev];
-                cudaSetDevice(d.id);
-                cudaStream_t cs = B.st[(size_t) l.dev];
-                if (!off_turn(l.dev, cs)) return;
-                cudaMemcpyAsync(sat(l, l, l.spare_vram, l.blob), B.a, l.blob, cudaMemcpyHostToDevice, cs);
-                if (!file_experts)
-                    cudaMemcpyAsync(B.b, sat(l, l, l.slot[(size_t) sw.out], l.blob), l.blob,
-                                    cudaMemcpyDeviceToHost, cs);
-                cudaStreamSynchronize(cs);
-            } else {   // a group: each member's part in, each member's part out
+            if (direct_packed && l.packed_host && NH == 1 && !file_experts && l.nm == 2 &&
+                member(l, 0).hblob == member(l, 1).hblob) {
+                // Packed host slots already contain the members' GPU-ready blobs.
+                // The incoming host and outgoing VRAM slots stay owned until
+                // publication; spare_host is private to this pending swap.
+                auto checked = [&](cudaError_t status) {
+                    if (status != cudaSuccess) {
+                        std::fprintf(stderr, "ds4: direct packed swap failed at layer %d: %s\n",
+                                     l.il, cudaGetErrorString(status));
+                        std::abort();
+                    }
+                };
+                // A quit can arrive between member submissions; drain issued
+                // transfers before the cache thread releases its buffers.
+                auto drain = [&] {
+                    for (int m = 0; m < l.nm; ++m) {
+                        const Layer& x = member(l, m);
+                        checked(cudaSetDevice(devs[(size_t) x.dev].id));
+                        checked(cudaStreamSynchronize(B.st[(size_t) x.dev]));
+                    }
+                };
                 for (int m = 0; m < l.nm; ++m) {
                     const Layer& x = member(l, m);
-                    cudaSetDevice(devs[(size_t) x.dev].id);
+                    checked(cudaSetDevice(devs[(size_t) x.dev].id));
+                    const size_t offset = (size_t) m * l.hblob;
                     cudaStream_t cs = B.st[(size_t) x.dev];
-                    blob_to_half(l, B.a, m, B.h);
-                    if (!off_turn(x.dev, cs)) return;
-                    cudaMemcpyAsync(sat(l, x, l.spare_vram, x.hblob), B.h, x.hblob, cudaMemcpyHostToDevice, cs);
-                    cudaStreamSynchronize(cs);
-                    if (file_experts) continue;
-                    if (!off_turn(x.dev, cs)) return;
-                    cudaMemcpyAsync(B.h, sat(l, x, l.slot[(size_t) sw.out], x.hblob), x.hblob,
-                                    cudaMemcpyDeviceToHost, cs);
-                    cudaStreamSynchronize(cs);
-                    half_to_blob(l, B.h, m, B.b);
+                    if (!off_turn(x.dev, cs)) {
+                        drain();
+                        return;
+                    }
+                    checked(cudaMemcpyAsync(sat(l, x, l.spare_vram, x.hblob),
+                                            l.hh[(size_t) sw.in][0] + offset, x.hblob,
+                                            cudaMemcpyHostToDevice, cs));
+                    if (!off_turn(x.dev, cs)) {
+                        drain();
+                        return;
+                    }
+                    checked(cudaMemcpyAsync(l.spare_host[0] + offset,
+                                            sat(l, x, l.slot[(size_t) sw.out], x.hblob), x.hblob,
+                                            cudaMemcpyDeviceToHost, cs));
                 }
+                drain();
+                if (check_swaps)
+                    std::fprintf(stderr, "ds4 direct packed swap: layer %d expert %d in, %d out\n",
+                                 l.il, sw.in, sw.out);
+            } else {
+                parts_to_blob(l, l.hh[(size_t) sw.in], B.a);
+                if (l.nm == 1) {
+                    const Dev& d = devs[(size_t) l.dev];
+                    cudaSetDevice(d.id);
+                    cudaStream_t cs = B.st[(size_t) l.dev];
+                    if (!off_turn(l.dev, cs)) return;
+                    cudaMemcpyAsync(sat(l, l, l.spare_vram, l.blob), B.a, l.blob, cudaMemcpyHostToDevice, cs);
+                    if (!file_experts)
+                        cudaMemcpyAsync(B.b, sat(l, l, l.slot[(size_t) sw.out], l.blob), l.blob,
+                                        cudaMemcpyDeviceToHost, cs);
+                    cudaStreamSynchronize(cs);
+                } else {   // a group: each member's part in, each member's part out
+                    for (int m = 0; m < l.nm; ++m) {
+                        const Layer& x = member(l, m);
+                        cudaSetDevice(devs[(size_t) x.dev].id);
+                        cudaStream_t cs = B.st[(size_t) x.dev];
+                        blob_to_half(l, B.a, m, B.h);
+                        if (!off_turn(x.dev, cs)) return;
+                        cudaMemcpyAsync(sat(l, x, l.spare_vram, x.hblob), B.h, x.hblob, cudaMemcpyHostToDevice, cs);
+                        cudaStreamSynchronize(cs);
+                        if (file_experts) continue;
+                        if (!off_turn(x.dev, cs)) return;
+                        cudaMemcpyAsync(B.h, sat(l, x, l.slot[(size_t) sw.out], x.hblob), x.hblob,
+                                        cudaMemcpyDeviceToHost, cs);
+                        cudaStreamSynchronize(cs);
+                        half_to_blob(l, B.h, m, B.b);
+                    }
+                }
+                if (!file_experts)
+                    for (int X = 0; X < NH; ++X) blob_to_part(l, B.b, X, l.spare_host[(size_t) X]);
             }
-            if (!file_experts)
-                for (int X = 0; X < NH; ++X) blob_to_part(l, B.b, X, l.spare_host[(size_t) X]);
             if (check_swaps) {   // DS4_CHECK_SWAPS: both moves against the model file, byte for byte
                 std::vector<uint8_t> reg, blob(l.blob), part(l.hl.bytes);
                 bool ok = true;
@@ -8370,6 +8597,14 @@ struct Model::Impl {
                             ok = ok && std::memcmp(dev.data() + l.lay.trellis[r], blob.data() + l.lay.trellis[r], l.piece_bytes[r][0]) == 0 &&
                                  std::memcmp(dev.data() + l.lay.suh[r], blob.data() + l.lay.suh[r], l.piece_bytes[r][1]) == 0 &&
                                  std::memcmp(dev.data() + l.lay.svh[r], blob.data() + l.lay.svh[r], l.piece_bytes[r][2]) == 0;
+                    } else if (l.packed_host) {
+                        repack(l, e, reg.data(), blob.data());
+                        std::vector<uint8_t> actual(l.blob);
+                        parts_to_blob(l, l.spare_host, actual.data());
+                        for (int r = 0; r < 3; ++r)
+                            ok = ok && std::memcmp(actual.data() + l.lay.trellis[r], blob.data() + l.lay.trellis[r], l.piece_bytes[r][0]) == 0 &&
+                                 std::memcmp(actual.data() + l.lay.suh[r], blob.data() + l.lay.suh[r], l.piece_bytes[r][1]) == 0 &&
+                                 std::memcmp(actual.data() + l.lay.svh[r], blob.data() + l.lay.svh[r], l.piece_bytes[r][2]) == 0;
                     } else {
                         for (int X = 0; X < NH; ++X) {
                             repack_part(l, reg.data(), X, part.data());
