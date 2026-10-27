@@ -17,6 +17,7 @@
 // span's start, its pixels' fingerprint, its length): it comes back only for a prompt whose pictures are the same at
 // the same places.
 #include "ds4_model.hpp"
+#include "ds4_watchdog.hpp"
 #include "strata/platform/env_alias.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -455,12 +456,44 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
 
+// the serve watchdog (#539, #494): a request whose heartbeat - its prompt's progress, its tokens, the steps between -
+// stops for MAYA_DS4_WATCHDOG_S seconds (600; 0: off) ends the engine with a line saying where each device's thread
+// was, and the server starts it again for the next request (a run that never ends otherwise holds every request behind
+// it until someone restarts the engine by hand).  A healthy request beats every few seconds - a prompt every chunk, a
+// slow PC's chunk of a long prompt a minute or two
+std::atomic<uint64_t> g_beats{0};
+std::atomic<bool> g_busy{false};
+void beat() { g_beats.fetch_add(1, std::memory_order_relaxed); }
+void start_watchdog(const strata::ds4::Model& m) {
+    const char* v = std::getenv("STRATA_DS4_WATCHDOG_S");
+    if (v == nullptr) v = std::getenv("MAYA_DS4_WATCHDOG_S");
+    const int limit = v != nullptr ? std::atoi(v) : 600;
+    if (limit <= 0) return;
+    std::thread([&m, limit] {
+        strata::ds4::StallRule rule;   // (ds4_watchdog.hpp: the time since the last beat, never the request's length)
+        rule.limit_s = limit;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (!rule.stalled(g_busy.load(), g_beats.load(), now)) continue;
+            std::fprintf(stderr, "maya ds4 serve: where it stopped: %s\n", m.where().c_str());
+            // (the server reads the line with "issue #29" as the engine's own watchdog, not a lack of RAM)
+            std::fprintf(stderr, "maya ds4 serve: no progress for %d s during a request - stopping the engine so the "
+                                 "server starts it again (issue #29, #539; MAYA_DS4_WATCHDOG_S)\n", limit);
+            std::fflush(stderr);
+            std::_Exit(3);   // (not abort(): a core dump of the pinned expert tiers takes minutes)
+        }
+    }).detach();
+}
+
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack,
           Lookup* lk) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("READY %lld stop\n", (long long) m.max_context());
     std::fflush(stdout);
+    start_watchdog(m);
     std::fprintf(stderr, "maya ds4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; STOP, QUIT\n");
     Lines in;
     in.start();
@@ -921,8 +954,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::signal(SIGPIPE, SIG_IGN);
 #endif
     }
-    while (in.next(line)) {
-        if (line == "QUIT") break;
+    for (;;) {
+        g_busy.store(false);   // (waiting for a request: no watchdog)
+        if (!in.next(line) || line == "QUIT") break;
+        beat();
+        g_busy.store(true);
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
             std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
@@ -977,10 +1013,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // first (another one takes the model, and its state is lost otherwise), then the kept conversation this
             // prompt does continue is taken back - if it goes further back than the checkpoints the state itself holds
             if (slot_max > 0) slot_put("");
+            beat();
             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
             const int64_t rs = m.restorable(limit);
             bool whole = false;
             const size_t back = slot_take(r.ids, pics, rs > 0 ? (size_t) rs : 0, whole);
+            beat();
             if (back > 0) {
                 from = back;
                 continued = whole;
@@ -1014,6 +1052,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     break;
                 }
                 ++encoded;
+                beat();
                 q.len = rows->size() / (size_t) m.dim();
                 bool fits = (size_t) q.start + q.len <= r.ids.size() - 1;
                 for (size_t i = 0; fits && i < q.len; ++i) fits = r.ids[(size_t) q.start + i] == img_tok;
@@ -1040,7 +1079,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // token and one after it: the next turn re-renders this one, and shares its start up to one of them
         const size_t total = r.ids.size();
         size_t done = from, next_pp = from + 64;
+        int64_t beat_at = -1;   // (the run's progress at the last beat)
         m.set_progress([&](int64_t d) {   // (a run of chunks: each one through every layer)
+            // (a beat only when it moved: the run calls this every 50 ms with what is done so far - a wedged chunk run
+            //  repeats its last value for hours, #539, and must not look alive to the watchdog)
+            if (d + (int64_t) done != beat_at) {
+                beat_at = d + (int64_t) done;
+                beat();
+            }
             const double ms = now_ms() - t0;
             std::printf("PP %zu %zu %.1f %.1f %zu\n", done + (size_t) d, r.ids.size(), ms,
                         ms > 0 ? 1000.0 * (double) (done + (size_t) d - from) / ms : 0.0, from);
@@ -1070,6 +1116,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 ok = fin ? m.feed_mark(r.ids.data() + done, (int) n, 1, 1, err)
                          : m.feed(r.ids.data() + done, (int) n, 0, err);
             done += n;
+            beat();
             if (ok && (done >= next_pp || done == total)) {
                 const double ms = now_ms() - t0;
                 std::printf("PP %zu %zu %.1f %.1f %zu\n", done, r.ids.size(), ms,
@@ -1224,6 +1271,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 break;
             }
             std::printf("T %d\n", tok);
+            beat();
             ++produced;
             if (lk) lk->sfx.append(tok);
             if (in_think && tok == r.think_end) in_think = false;   // (closed: by the model, or by the budget)

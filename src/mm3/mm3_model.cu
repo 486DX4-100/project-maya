@@ -665,7 +665,12 @@ struct Model::Impl {
         if (const char* v = ::mm3::env("MM3_LANE_SPLIT"); v != nullptr && std::atoi(v) == 0) return;
         // eight pooled experts of one GPU's layers (different ones: the CPU's caches must not hold them yet), all of the
         // first one's format - the lane's call for four takes one layer's format for them all (with few experts outside
-        // VRAM the eight can span layers whose experts differ in type: a GGUF's IQ1_S and IQ2_XXS - it read past them)
+        // VRAM the eight can span layers whose experts differ in type: a GGUF's IQ1_S and IQ2_XXS - it read past them).
+        // A round whose four experts took no longer than one was disturbed (#548: the PC busy for that moment - a
+        // previous engine's pinned memory still being released - read 3.98 ms an expert instead of 0.31 and staged every
+        // expert for the session): another round on eight other experts, up to kRounds, and the least disturbed one
+        // (the fastest expert) is kept.  A first round that reads consistently is the only one, as before
+        constexpr int kRounds = 3;
         Dev* dp = nullptr;
         std::vector<std::pair<const Layer*, int>> ex;
         const auto same_fmt = [&](const Layer& a, const Layer& b) {
@@ -680,7 +685,7 @@ struct Model::Impl {
             for (int li : d.layers) {
                 const Layer& l = L[(size_t) li];
                 if (!ex.empty() && !same_fmt(l, *ex[0].first)) continue;
-                for (int e = 0; e < g.n_exp && ex.size() < 8 && !l.host_blob.empty(); ++e)
+                for (int e = 0; e < g.n_exp && ex.size() < 8 * kRounds && !l.host_blob.empty(); ++e)
                     if (l.host_blob[(size_t) e] != nullptr) ex.push_back({&l, e});
             }
             if (ex.size() >= 8) {
@@ -694,40 +699,64 @@ struct Model::Impl {
             return v[v.size() / 2];
         };
         cudaSetDevice(dp->id);
-        std::vector<double> tc;
-        for (int r = 0; r < 5; ++r) {   // (the first warms the path up)
-            const Layer& l = *ex[(size_t) r].first;
-            const double t0 = now();
-            if (cudaMemcpyAsync(dp->stg, l.host_blob[(size_t) ex[(size_t) r].second], l.blob, cudaMemcpyHostToDevice,
-                                dp->s) != cudaSuccess ||
-                cudaStreamSynchronize(dp->s) != cudaSuccess) {
-                cudaGetLastError();
-                return;
-            }
-            if (r > 0) tc.push_back(1e3 * (now() - t0));
-        }
-        dp->slot_owner.assign((size_t) dp->n_slots, -1);   // (slot 0 was written)
         std::vector<float> x((size_t) g.dim), out((size_t) g.dim);
         for (int i = 0; i < g.dim; ++i) x[(size_t) i] = 0.01f * (float) ((i * 37) % 101 - 50);
-        std::vector<double> t1;
-        for (int r = 0; r < 4; ++r) {
-            const std::vector<CpuExpert> one{cpu_expert(*ex[(size_t) r].first, ex[(size_t) r].second, 1.0f)};
+        const int rounds = (int) ex.size() / 8;
+        int round = 0, disturbed = 0;
+        double best1 = 0, best_add = 0, best_copy = 0;
+        for (; round < rounds; ++round) {
+            const size_t b0 = (size_t) round * 8;   // (this round's eight experts)
+            std::vector<double> tc;
+            for (int r = 0; r < 5; ++r) {   // (the first warms the path up)
+                const Layer& l = *ex[b0 + (size_t) r].first;
+                const double t0 = now();
+                if (cudaMemcpyAsync(dp->stg, l.host_blob[(size_t) ex[b0 + (size_t) r].second], l.blob,
+                                    cudaMemcpyHostToDevice, dp->s) != cudaSuccess ||
+                    cudaStreamSynchronize(dp->s) != cudaSuccess) {
+                    cudaGetLastError();
+                    dp->slot_owner.assign((size_t) dp->n_slots, -1);
+                    if (round == 0) return;
+                    break;   // (an earlier round's numbers stand)
+                }
+                if (r > 0) tc.push_back(1e3 * (now() - t0));
+            }
+            if (tc.size() < 4) break;
+            dp->slot_owner.assign((size_t) dp->n_slots, -1);   // (slot 0 was written)
+            std::vector<double> t1;
+            for (int r = 0; r < 4; ++r) {
+                const std::vector<CpuExpert> one{
+                    cpu_expert(*ex[b0 + (size_t) r].first, ex[b0 + (size_t) r].second, 1.0f)};
+                const double t0 = now();
+                lane_run(one, x.data(), out.data());
+                t1.push_back(1e3 * (now() - t0));
+            }
+            std::vector<CpuExpert> four;
+            for (int r = 4; r < 8; ++r)
+                four.push_back(cpu_expert(*ex[b0 + (size_t) r].first, ex[b0 + (size_t) r].second, 0.25f));
             const double t0 = now();
-            lane_run(one, x.data(), out.data());
-            t1.push_back(1e3 * (now() - t0));
+            lane_run(four, x.data(), out.data());
+            const double t4 = 1e3 * (now() - t0);
+            const double c1 = med(t1);
+            if (round == 0 || c1 < best1) {
+                best1 = c1;
+                best_add = std::max(0.0, (t4 - c1) / 3.0);
+                best_copy = med(tc);
+            }
+            if (t4 > c1) break;   // (four took longer than one: a consistent reading)
+            ++disturbed;
         }
-        std::vector<CpuExpert> four;
-        for (int r = 4; r < 8; ++r) four.push_back(cpu_expert(*ex[(size_t) r].first, ex[(size_t) r].second, 0.25f));
-        const double t0 = now();
-        lane_run(four, x.data(), out.data());
-        const double t4 = 1e3 * (now() - t0);
-        lane_copy = med(tc);
-        lane_cpu1 = med(t1);
-        lane_cpu_add = std::max(0.0, (t4 - lane_cpu1) / 3.0);
-        char b[200];
+        lane_copy = best_copy;
+        lane_cpu1 = best1;
+        lane_cpu_add = best_add;
+        char b[260];
         std::snprintf(b, sizeof b, "CPU lane vs staging (measured): an expert %.2f ms on the CPU lane (+%.2f ms each more), "
-                      "%.2f ms to copy - 4 such experts: %d staged", lane_cpu1, lane_cpu_add, lane_copy, lane_split(4));
+                      "%.2f ms to copy - 4 such experts: %d staged%s", lane_cpu1, lane_cpu_add, lane_copy, lane_split(4),
+                      disturbed == 0 ? "" : disturbed == 1 ? " (one disturbed reading measured again)"
+                                                           : " (disturbed readings measured again)");
         info.push_back(b);
+        if (disturbed > 0 && lane_split(4) >= 4)
+            std::fprintf(stderr, "mm3: the CPU lane's timing at load stayed disturbed (the PC busy?): every expert outside "
+                                 "VRAM is staged this session - restart when the PC is quiet, or MM3_LANE_SPLIT=0\n");
     }
 
     // RAM a load leaves free (the OS, the page cache's working set, the engine's own threads): a tenth of the RAM,

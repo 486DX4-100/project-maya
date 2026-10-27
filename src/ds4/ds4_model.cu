@@ -700,6 +700,10 @@ struct Chunk {
     // (a group's Engram rows read once, Impl::eg_src_dev: the seq of the chunk last read into each slot - the reader's
     //  - and of the chunk whose copies out of the slot this device last issued)
     std::atomic<unsigned> eg_read_seq[2] = {}, eg_copied_seq[2] = {};
+    // where this device's thread is in a run of chunks (Model::where: the serve watchdog's report of a run that stopped
+    // moving, #539 / #494 - which device waits for what)
+    std::atomic<int> at_k{-1}, at_il{-1};
+    std::atomic<const char*> at{"no run yet"};
     double stream_bytes = 0;     // the experts streamed in, in all
     // the flow (a GGUF's in-place experts, every layer of the device on it alone; DS4_FLOW=0: the batches above): a
     // (chunk, layer)'s streamed experts are those it routes to - its likely ones (the profile's chance of a pick by the
@@ -1037,6 +1041,11 @@ struct Model::Impl {
     int halt_k = INT_MAX, halt_seen = -1;
     bool halted = false;                      // the last run ended early on a Stop
     static constexpr const char* kHalted = "stopped";
+    bool past_halt(int k) {   // a Stop came and chunk k is one no device starts
+        if (!halt.load(std::memory_order_acquire)) return false;
+        std::lock_guard<std::mutex> lk(halt_mu);
+        return k >= halt_k;
+    }
     bool chunk_go(int k) {   // chunk k may start on this device (several GPUs)
         std::lock_guard<std::mutex> lk(halt_mu);
         if (k >= halt_k) return false;
@@ -1049,6 +1058,7 @@ struct Model::Impl {
     bool halt_end(int di, std::string& err) {
         Chunk& c = *chunks[(size_t) di];
         cudaSetDevice(devs[(size_t) di].id);
+        c.at.store("stopping on a Stop: waiting for its expert reads and streams", std::memory_order_relaxed);
         if (c.flow)
             for (size_t i = c.base; i < c.n_read; ++i)
                 while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_any(500);
@@ -1056,6 +1066,20 @@ struct Model::Impl {
         cudaStreamSynchronize(devs[(size_t) di].st);
         err = kHalted;
         return false;
+    }
+    // the main thread's place in a request (Model::where, with each device's: the serve watchdog's report)
+    std::atomic<const char*> main_at{"idle"};
+    std::string where() const {
+        std::string s = std::string("main thread: ") + main_at.load(std::memory_order_relaxed);
+        for (size_t di = 0; di < chunks.size() && di < devs.size(); ++di) {
+            if (chunks[di] == nullptr) continue;
+            const Chunk& c = *chunks[di];
+            char b[256];
+            std::snprintf(b, sizeof b, "; CUDA%d: %s (chunk %d, layer %d)", devs[di].id, c.at.load(std::memory_order_relaxed),
+                          c.at_k.load(std::memory_order_relaxed), c.at_il.load(std::memory_order_relaxed));
+            s += b;
+        }
+        return s;
     }
     std::vector<cudaEvent_t> chunk_done;     // on the last layer's device: chunk k through every layer
     std::unique_ptr<std::atomic<int>[]> chunk_rec;   // chunk k's event recorded
@@ -14039,6 +14063,7 @@ struct Model::Impl {
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
     bool step(int token, bool want_logits, std::string& err) {
+        main_at.store("a decode step", std::memory_order_relaxed);
         tok_ab_begin();
         const bool ok = forward(&token, 1, want_logits ? 1 : 0, err);
         tok_ab_end(1, ok);
@@ -14822,6 +14847,13 @@ struct Model::Impl {
     bool run_dev_chunks(int di, const Run& run, std::string& err) {
         Dev& d = devs[(size_t) di];
         Chunk& c = *chunks[(size_t) di];
+        struct AtEnd {   // (Model::where: every way out of the run)
+            Chunk& c;
+            ~AtEnd() { c.at.store("its part of the run ended", std::memory_order_relaxed); }
+        } at_end_{c};
+        c.at_k.store(-1, std::memory_order_relaxed);
+        c.at_il.store(-1, std::memory_order_relaxed);
+        c.at.store("starting a run of chunks", std::memory_order_relaxed);
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
         const int D = g.dim, H = g.hc, nk = (int) run.T.size();
@@ -14908,9 +14940,13 @@ struct Model::Impl {
         std::vector<int> eg_mates;   // the devices whose copies read this one's slots (this one too)
         for (size_t j = 0; j < devs.size() && eg_src == di; ++j)
             if (chunks[j] != nullptr && devs[j].grp == d.grp && eg_src_dev((int) j) == di) eg_mates.push_back((int) j);
-        auto eg_wait_seq = [this](const std::atomic<unsigned>& a, unsigned seq) {   // (false: the run ends)
+        // (false: the run ends - a device failed, or a Stop and chunk k is one no device starts.  A chunk a device has
+        //  started is one every device runs (chunk_go): its rows are waited for through a Stop - a member that left
+        //  chunk k there while its group's other members ran it left them waiting on its sums for good, one GPU
+        //  spinning and the other idle, the run never ending, #539)
+        auto eg_wait_seq = [this](const std::atomic<unsigned>& a, unsigned seq, int k) {
             while ((int) (a.load(std::memory_order_acquire) - seq) < 0) {
-                if (eg_abort.load(std::memory_order_acquire) || halt.load(std::memory_order_acquire)) return false;
+                if (eg_abort.load(std::memory_order_acquire) || past_halt(k)) return false;
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
             }
             return true;
@@ -14920,7 +14956,7 @@ struct Model::Impl {
             if (k >= 2)
                 for (int j : eg_mates) {
                     Chunk& m = *chunks[(size_t) j];
-                    if (!eg_wait_seq(m.eg_copied_seq[sl], run.seq[(size_t) k - 2])) return;
+                    if (!eg_wait_seq(m.eg_copied_seq[sl], run.seq[(size_t) k - 2], k)) return;
                     cudaEventSynchronize(m.eg_ev[sl]);
                 }
             for (int li : egs) {
@@ -14935,21 +14971,28 @@ struct Model::Impl {
         if (!egs.empty() && eg_src == di) eg_next = std::async(std::launch::async, read_eg, 0);
         for (int k = 0; k < nk; ++k) {
             if (!chunk_go(k)) return halt_end(di, err);   // (a Stop: the chunks every device reaches are done)
+            c.at_k.store(k, std::memory_order_relaxed);
+            c.at_il.store(-1, std::memory_order_relaxed);
             const int64_t p0 = run.p0[(size_t) k];
             const int T = run.T[(size_t) k], slot = k % 2;
             const bool last_k = k + 1 == nk;
             if (!egs.empty()) {   // chunk k's rows ready, chunk k + 1's on their way
                 const double te = now_ms();
                 if (eg_src == di) {
+                    c.at.store("reading the Engram rows", std::memory_order_relaxed);
                     eg_next.get();
                     if (k + 1 < nk) eg_next = std::async(std::launch::async, read_eg, k + 1);
-                } else if (!eg_wait_seq(chunks[(size_t) eg_src]->eg_read_seq[slot], run.seq[(size_t) k])) {
-                    if (halt.load(std::memory_order_acquire)) return halt_end(di, err);
-                    err = "the Engram rows' reader stopped";
-                    return false;
+                } else {
+                    c.at.store("waiting for the Engram rows its group's reader reads", std::memory_order_relaxed);
+                    if (!eg_wait_seq(chunks[(size_t) eg_src]->eg_read_seq[slot], run.seq[(size_t) k], k)) {
+                        if (halt.load(std::memory_order_acquire)) return halt_end(di, err);
+                        err = "the Engram rows' reader stopped";
+                        return false;
+                    }
                 }
                 if (d.mi == 0) st.engram_ms += now_ms() - te;
             }
+            c.at.store("putting the chunk's layers on its streams", std::memory_order_relaxed);
             WinPlan wp;
             wp.par = true;
             wp.async = true;
@@ -14965,6 +15008,7 @@ struct Model::Impl {
                 for (int m = 0; m < L0.nm; ++m)
                     if (member(L0, m).dev == di) mi = m;
                 if (mi < 0) continue;
+                c.at_il.store(il, std::memory_order_relaxed);
                 if (!started && run.runs(k, il)) {   // the chunk's input: its embedding rows, or the previous group's hand-off
                     started = true;
                     if (il == 0) {
@@ -16053,10 +16097,16 @@ struct Model::Impl {
                 std::string e;
                 if (!run_dev_chunks((int) di, run, e)) {
                     errs[di] = e.empty() ? "a device's thread failed" : e;
-                    eg_abort.store(true, std::memory_order_release);
-                    if (eg_pf != nullptr) eg_pf->wake();
+                    // (a device's failure ends every wait; a Stop's early end does not - the devices still in a chunk
+                    //  every device runs wait for its Engram rows, #539: one device's early end let another group's
+                    //  member leave its chunk while its partner ran it)
+                    if (e != kHalted) {
+                        eg_abort.store(true, std::memory_order_release);
+                        if (eg_pf != nullptr) eg_pf->wake();
+                    }
                 }
             });
+        main_at.store("a run of chunks: waiting for the devices", std::memory_order_relaxed);
         size_t reported = 0;
         for (;;) {
             bool all = true;
@@ -16081,6 +16131,7 @@ struct Model::Impl {
             if (all) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+        main_at.store("a run of chunks: the devices done, the head next", std::memory_order_relaxed);
         for (const std::string& e : errs)   // (a device's failure first: a Stop's early end is not one)
             if (!e.empty() && e != kHalted) {
                 err = e;
@@ -17374,8 +17425,10 @@ Model::Model() : p_(new Impl) {}
 Model::~Model() = default;
 bool Model::load(const Options& o, std::string& err) { return p_->load(o, err); }
 bool Model::step(int token, bool logits, std::string& err) { return p_->step(token, logits, err); }
+std::string Model::where() const { return p_->where(); }
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
+    p.main_at.store("reading a prompt", std::memory_order_relaxed);
     p.pm.last = -1;
     p.halted = false;
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
@@ -17389,6 +17442,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
 }
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
     Impl& p = *p_;
+    p.main_at.store("reading a prompt", std::memory_order_relaxed);
     p.pm.last = -1;
     p.halted = false;
     const double t0 = now_ms();

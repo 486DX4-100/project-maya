@@ -93,6 +93,19 @@ GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
 > **The start takes a few minutes**: the engine pins most of the free RAM (all but about 6 GB) for its expert tier
 > and warms its caches. Other programs get little RAM while Maya runs.
 
+**Linux: systemd-oomd.** Stock Ubuntu 22.04 and newer run `systemd-oomd`, which ends a desktop session's whole
+terminal (Maya, and the setup's own tuning with it) when the session's memory pressure stays over 50% for 20 seconds.
+Loading a large RAM tier - about 200 GB of DeepSeek experts - reclaims the page cache for minutes and can cross that,
+with RAM still free and nothing in `dmesg`; only the journal says `systemd-oomd killed ... process(es)` (issue #497).
+`--check` and the setup warn when it runs. Stop it for the run with `sudo systemctl stop systemd-oomd` (it starts again
+at the next boot), or exempt your user sessions for good with a drop-in, then log out and in:
+
+```bash
+sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nManagedOOMMemoryPressure=auto\n' | sudo tee /etc/systemd/system/user@.service.d/90-maya-oomd.conf
+sudo systemctl daemon-reload
+```
+
 ## Next time, and updating
 
 **Next time**, just run `./setup.sh` again (or the model's `./run-maya-<model>.sh`): it starts right away, nothing is

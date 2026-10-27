@@ -228,6 +228,9 @@ public:
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.
     std::vector<std::string> info_lines() const;
+    /// Where the main thread and each device's thread of a run of chunks are (any thread may ask; the serve watchdog's
+    /// report of a request that stopped moving).
+    std::string where() const;
     /// Where the routed experts live (the drafter's apart), for the Monitor's tiers: in VRAM; in RAM - copied there, or
     /// read ahead into the page cache (in place); the rest read from the SSD when routed.  cpu_blob: a CPU-lane expert's
     /// bytes on average (the SSD's reads a token -> experts a token)

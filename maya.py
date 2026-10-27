@@ -936,14 +936,31 @@ def install_rocm(a, chosen) -> None:
              "messages")
 
 
+VS2026_HIP_HINT = ("with Visual Studio 2026's Build Tools alone, ROCm 7.2's compiler can stop on its C++ library's math "
+                   "headers ('__device__ function 'isgreater' cannot overload __host__ __device__ function', #544): "
+                   "install the VS 2022 Build Tools beside it (winget install -e --id "
+                   "Microsoft.VisualStudio.2022.BuildTools; the setup takes 2022 first), delete the build-hip folder "
+                   "and run the setup again")
+
+
+def vs_2026(vcvars) -> bool:
+    """Whether a vcvars64.bat is Visual Studio 2026's or newer (its folder is named by its major version, 18; 2019 and
+    2022 by their year)."""
+    from pathlib import PureWindowsPath   # (a Windows path, read the same on any OS: the tests run on Linux too)
+    return vcvars is not None and any(p.isdigit() and 18 <= int(p) < 1000 for p in PureWindowsPath(str(vcvars)).parts)
+
+
 def check_hip_pc(a, installed=False, text_only=True) -> dict:
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
         fail("Maya's experimental HIP backend runs on native Linux or Windows")
-    if WIN and S.find_vcvars(cuda=False) is None:      # (before ROCm's download: ROCm's clang needs its headers)
+    vcvars = S.find_vcvars(cuda=False) if WIN else None
+    if WIN and vcvars is None:      # (before ROCm's download: ROCm's clang needs its headers)
         fail("Visual Studio Build Tools (2022 or 2026) are needed: ROCm's compiler uses their headers and libraries",
              "winget install -e --id Microsoft.VisualStudio.2022.BuildTools --override \"--wait --passive --add "
              "Microsoft.VisualStudio.Workload.VCTools --includeRecommended\" - or "
              "https://visualstudio.microsoft.com/visual-cpp-build-tools/ with 'Desktop development with C++'")
+    if vs_2026(vcvars):
+        warn("only Visual Studio 2026's Build Tools were found - " + VS2026_HIP_HINT)
     root, bindir = windows_rocm() if WIN else (None, None)
     hipinfo = hip_info(bindir) if WIN else None
     found = S.amd_gpus(hipinfo) if WIN else S.amd_gpus()
@@ -1182,6 +1199,14 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "") -> list:
     return opts[pick]
 
 
+def oomd_active() -> bool:
+    """Linux: systemd-oomd runs (stock Ubuntu 22.04 and newer; it ends a session's whole scope when its memory pressure
+    stays over 50% for 20 s - a long load's page-cache reclaim can do that, #497)."""
+    if WIN or not sys.platform.startswith("linux"):
+        return False
+    return S.out(["systemctl", "is-active", "systemd-oomd"]).strip() == "active"
+
+
 def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3") -> dict:
     step(1, "checking this PC")
     ds4 = family == "deepseek"
@@ -1321,6 +1346,12 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
              "those experts are read from the SSD (issue #20: 2.4-4.1 -> 8.4-11 tokens/s on an RTX 5090). \"System "
              f"managed\" can stay small (8 GB on a 128 GB PC): set a custom size of {need_pf} GB or more - System > "
              "About > Advanced system settings > Performance > Advanced > Virtual memory - and restart")
+    if oomd_active() and (ds4 or mm3 or total >= 128):
+        warn("systemd-oomd is running: while a large RAM tier loads (the page cache reclaimed for minutes), it can "
+             "end the terminal's whole session - Maya, the setup's own tuning - with nothing in dmesg (issue #497: "
+             "~200 GB of DeepSeek experts on stock Ubuntu 22.04, 'systemd-oomd killed ... processes' in the journal). "
+             "Stop it for the run (sudo systemctl stop systemd-oomd) or exempt your session: docs/SETUP.md, "
+             "'Linux: systemd-oomd'")
     cpu, avx2, avx512 = S.cpu_info()
     if S.ARM:
         ok(f"CPU: {cpu} (ARM64, {os.cpu_count()} threads; the expert kernels use ggml-cpu's NEON paths)")
@@ -1788,12 +1819,14 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
         conf.append(f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}")
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
     say("  Compiling Maya for AMD " + ", ".join(pc["archs"]) + " ...")
+    vcvars = S.find_vcvars(cuda=False) if WIN else None
     if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)], env,
-                   "build-maya-hip.bat", vcvars=S.find_vcvars(cuda=False) if WIN else None):
+                   "build-maya-hip.bat", vcvars=vcvars):
         if soft:
             warn("HIP rebuild failed; starting the previous engine")
             return None
-        fail("the HIP engine build failed", "see the compiler output above")
+        fail("the HIP engine build failed", "see the compiler output above" +
+             (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
     if WIN:
         # Windows takes a program's DLLs from its own folder, then System32 - where AMD's driver puts its own HIP
         # runtime - and PATH only after: the runtime the engine was built with goes next to it (as llama.cpp's
@@ -3568,7 +3601,50 @@ BENCH_TOPICS = [
 def bench_exe(cfg: dict) -> Path:
     """Which engine binary a HIP config's --bench should relaunch - config_family(cfg)'s target, through the same
     exe_for_target every build step uses, so this can't drift out of sync with either."""
-    return exe_for_target("maya-ds4" if config_family(cfg) == "deepseek" else "maya")
+    return exe_for_target({"deepseek": "maya-ds4", "minimax": "maya-mm3"}.get(config_family(cfg), "maya"))
+
+
+BENCH_MIN_ANSWER = 64   # an answer shorter than this (the model stopped early) is listed, not in the decode mean (#549)
+
+
+def bench_chat(family: str, tokenizer_dir: Path):
+    """--bench's prompt for a question, in the model family's own chat format, thinking off: GLM's markers, DeepSeek's
+    (#416), MiniMax's through its chat template as the server renders it (#549: it got GLM's markers)."""
+    if family == "deepseek":
+        return "<｜begin▁of▁sentence｜><｜User｜>{}<｜Assistant｜></think>".format
+    if family == "minimax":
+        from serve.frontend import ChatTemplate
+        path = Path(tokenizer_dir) / "chat_template.jinja"
+        tpl = ChatTemplate(path if path.exists() else ROOT / "tools" / "mm3" / "chat_template.jinja")
+        return lambda q: tpl.render([{"role": "user", "content": q}], enable_thinking=False)
+    return "[gMASK]<sop><|user|>\n{}<|assistant|>\n</think>".format
+
+
+def bench_gen_line(n_new: int, ids, multi: bool) -> str:
+    """The GEN line --bench sends: an engine that runs several conversations (READY ... multi=<n>, a --parallel config)
+    takes a request only with its id (#420, #509: 'GEN needs rid=<id>')."""
+    return f"GEN {n_new} temperature=0{' rid=0' if multi else ''} " + ",".join(map(str, ids)) + "\n"
+
+
+def bench_reply(line: str, multi: bool):
+    """A DONE / ERR line's fields as a one-conversation engine writes them (several conversations: DONE <rid> ...,
+    the id dropped); None for another request's line or one that is neither."""
+    f = line.split()
+    if not f or f[0] not in ("DONE", "ERR"):
+        return None
+    if multi and len(f) > 1 and f[1].isdigit():
+        if f[1] != "0":
+            return None
+        f = f[:1] + f[2:]
+    return f
+
+
+def bench_decode_mean(results) -> tuple[float, int]:
+    """The decode mean of --bench's answers and how many it covers: the answers of BENCH_MIN_ANSWER tokens or more (a
+    short one - an answer the model ended early - says little about the speed, #549); all of them when none is."""
+    dec = [r for r in results if r[0] == "decode"]
+    full = [r for r in dec if r[3] >= BENCH_MIN_ANSWER] or dec
+    return (sum(r[2] for r in full) / len(full) if full else 0.0), len(full)
 
 
 def bench(cfg_path: Path, version: str) -> int:
@@ -3610,35 +3686,38 @@ def bench(cfg_path: Path, version: str) -> int:
                              stdout=subprocess.PIPE, stderr=log, text=True, env=SV.child_env(cfg),
                              cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
 
+        multi = False   # (READY ... multi=<n>: a --parallel config's engine - its requests carry an id)
+
         def gen(ids, n_new):
-            p.stdin.write(f"GEN {n_new} temperature=0 " + ",".join(map(str, ids)) + "\n")
+            p.stdin.write(bench_gen_line(n_new, ids, multi))
             p.stdin.flush()
             while True:
                 line = p.stdout.readline()
                 if not line:
                     fail("the engine stopped during the benchmark", f"its log: {log_path}")
-                if line.startswith("DONE") or line.startswith("ERR"):
-                    return line.split()
+                f = bench_reply(line, multi)
+                if f is not None:
+                    return f
 
         while True:
             line = p.stdout.readline()
             if not line:
                 fail("the engine stopped while loading", f"its log: {log_path}")
             if line.startswith("READY"):
+                multi = any(w.startswith("multi=") for w in line.split())
                 break
         ok(f"loaded in {time.time() - t0:.0f} s")
-        if config_family(cfg) == "deepseek":   # (its own chat format, thinking off - issue #416: not GLM's markers)
-            chat = lambda q: tok.encode("<｜begin▁of▁sentence｜><｜User｜>" + q + "<｜Assistant｜></think>",
-                                        parse_special=True)
-        else:
-            chat = lambda q: tok.encode("[gMASK]<sop><|user|>\n" + q + "<|assistant|>\n</think>", parse_special=True)
+        fmt = bench_chat(config_family(cfg), tp)   # (each family's own chat format, thinking off - #416, #549)
+        chat = lambda q: tok.encode(fmt(q), parse_special=True)   # noqa: E731
         gen(chat("Say hello in five languages."), 64)          # warm-up: the first answer after a start is slower
         results = []
         for q in BENCH_TOPICS:
             f = gen(chat(q), 256)
             if f[0] == "DONE" and float(f[4]) > 0:
-                results.append(("decode", q, int(f[1]) / float(f[4]) * 1000.0))
-                say(f"  decode  {results[-1][2]:6.1f} tokens/s   {q[:60]}")
+                results.append(("decode", q, int(f[1]) / float(f[4]) * 1000.0, int(f[1])))
+                say(f"  decode  {results[-1][2]:6.1f} tokens/s   {q[:60]} ({f[1]} tokens)")
+            elif f[0] == "ERR":
+                warn("the engine refused a benchmark request: " + " ".join(f[1:]))
         if lens:                                            # warm-up: the first prompt after a start is slower
             gen(doc[-lens[0]:], 1)                          # (cold caches, issue #8); its opening is not reused below
         for i, n in enumerate(lens):
@@ -3653,7 +3732,7 @@ def bench(cfg_path: Path, version: str) -> int:
         except subprocess.TimeoutExpired:
             p.kill()
     stats = speed_lines(log_path.read_text(encoding="utf-8", errors="replace").splitlines())
-    dec = [r[2] for r in results if r[0] == "decode"]
+    mean, n_mean = bench_decode_mean(results)
     found = S.amd_gpus() if cfg.get("backend") == "hip" else S.gpus()
     if cfg.get("backend") == "hip" and SV.gpu_list(cfg):
         by_index = {g["index"]: g for g in found}
@@ -3663,9 +3742,11 @@ def bench(cfg_path: Path, version: str) -> int:
     lines = [f"Project Maya v{version} benchmark, {time.strftime('%Y-%m-%d %H:%M')}",
              f"GPUs: {gpus}; RAM {total:.0f} GB; CPU {S.cpu_info()[0]}",
              f"setup: {cfg_path.name}, context {ctx}, GPUs {cfg.get('gpu')}",
-             f"decode (writing the answer): mean {sum(dec) / max(1, len(dec)):.1f} tokens/s over {len(dec)} answers of "
-             f"256 tokens (greedy, thinking off)"]
-    lines += [f"  {r[2]:6.1f} tokens/s  {r[1]}" for r in results if r[0] == "decode"]
+             f"decode (writing the answer): mean {mean:.1f} tokens/s over {n_mean} answers of up to 256 tokens "
+             f"(greedy, thinking off)"]
+    lines += [f"  {r[2]:6.1f} tokens/s  {r[1]}" + (f" ({r[3]} tokens: not in the mean)" if r[3] < BENCH_MIN_ANSWER and
+                                                    n_mean < sum(x[0] == "decode" for x in results) else "")
+              for r in results if r[0] == "decode"]
     lines += [f"prefill (reading the prompt): {r[2]:.0f} tokens/s, {r[1]}" for r in results if r[0] == "prefill"]
     lines += ["", "engine lines:"] + [x.replace(str(Path.home()), "~") for x in stats[-40:]]
     out = ROOT / "maya-bench.txt"
