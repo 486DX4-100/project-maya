@@ -253,6 +253,8 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
   [docs/SETTINGS.md](docs/SETTINGS.md).
 - **DeepSeek on large-RAM Linux hosts:** optional [locked Engram tables and strict CPU-expert RAM placement](docs/SETTINGS.md#deepseek-explicit-ram-residency). Both are off by default; they need enough physical RAM.
 - **DeepSeek GGUF expert-copy startup on Linux:** optional [direct reads](docs/SETTINGS.md#deepseek-expert-copy-io) for the experts copied into RAM (off by default).
+- **DeepSeek prompt experts on AMD:** `MAYA_DS4_EXPERT_MMQ=1` uses the existing int8 MMQ path for routed IQ experts.
+  It is off by default and adds q8 activation rounding; see [settings](docs/SETTINGS.md).
 - **Several requests at once** (GLM-5.3-Flash): `./maya.sh --parallel 4` (Windows: `START-MAYA.bat --parallel 4`; up to 8) keeps
   it in the config, and the dashboard shows how many answers are being written. Each extra request keeps its own
   context in VRAM, so a few fewer experts fit there ([how](docs/SETTINGS.md#several-requests-at-once)).

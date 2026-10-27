@@ -28,8 +28,9 @@ __device__ __forceinline__ void pdl_trigger() {
 }
 
 /// Whether the current device takes programmatic launches: compute capability 9.0 or later, unless DS4_PDL=0.
-/// (STRATA_DS4_NO_PDL: maya-mm3 and its tests, which build ds4_iq.cu without ds4_kernels.cu - their launches as before)
-#if defined(STRATA_DS4_NO_PDL)
+/// (MAYA_DS4_IQ_ONLY: ds4_iq.cu built into another engine without the rest of maya-ds4 - maya-mm3 and its tests: their
+/// launches as before)
+#if defined(MAYA_DS4_IQ_ONLY)
 inline bool pdl_on() { return false; }
 #else
 bool pdl_on();

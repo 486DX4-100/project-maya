@@ -1086,3 +1086,13 @@ Setup and debugging variables:
 | `MM3_STRESS`, `MM3_STRESS_T` | off | debugging: a drafting stress run |
 | `MM3_DUMP_KEPT`, `MM3_DUMP_HS` | off | debugging: write the sparse attention's kept blocks / hidden states to files |
 | `MM3_TOPK` | the model's | debugging only: routes each token to this many experts - the answers are no longer the model's |
+
+## DeepSeek: routed prompt experts on AMD
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_EXPERT_MMQ` | unset (off) | `1`: use the existing GLM q8_1/int8 MMQ path for supported DeepSeek IQ expert prompt sets of at least 32 rows; other sets keep the existing path. HIP only. |
+
+The switch quantizes both the prompt activations and the FP16 SwiGLU intermediate to q8_1.
+This approximate prompt path can change answers; it is off by default. It uses a separate workspace for each
+host thread, device and stream, and keeps the existing path during graph capture.
