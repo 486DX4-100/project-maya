@@ -749,6 +749,35 @@ no stalls. That is the machine's setting, not the engine's - a `tmpfiles.d` line
 
     w /sys/kernel/mm/transparent_hugepage/defrag - - - - defer
 
+## DeepSeek: Engram prompt read-ahead
+
+On one GPU with a nonzero `DS4_ENGRAM_CACHE_MB`, `DS4_ENGRAM_PREFETCH=1` reads a prompt's Engram rows into the ordinary
+row cache before the consuming layers ask for them. Sorted canonical rows are read in zones, duplicate destinations are
+filled from the canonical row, and a consumer waits for its own unit rather than racing the prefetcher. This changes I/O
+scheduling only: the row payload presented to the model is the same, and decode does not use the prefetcher.
+
+The automatic policy uses 75% of the row-cache budget for its live-set estimate. It reads the whole prompt when that fits.
+On chunk-major runs it otherwise picks the largest compute-chunk window whose current-plus-previous live set fits;
+layer-major retains completed layers in the shared cache, so its automatic policy is whole-prompt-or-ordinary instead of
+using that two-window estimate. Sparse YOCO unit lists also use the ordinary path because their chunk-index gaps cannot
+receive consumption credits. Scratch space, the hash index, reader buffers, and the model itself still need RAM beyond
+the row payload, so a large cache is not a promise that any particular full-context prompt fits. If even one look-ahead
+unit cannot fit the estimate, the ordinary read path is used instead.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_ENGRAM_PREFETCH` | `0` | `1`: enable one-GPU prompt read-ahead; `0`: the existing prompt/decode behavior |
+| `DS4_ENGRAM_PREFETCH_CHUNKS` | `-1` | `-1`: automatic cache-budgeted whole/bounded planning; `0`: explicit whole-prompt look-ahead, allowed up to actual row capacity; a positive value fixes look-ahead to that many compute chunks |
+| `DS4_EG_ZONE_KB` | `0` | maximum read-zone span in KiB (capped at 64 MiB); `0`: ordinary row reads. `4096` was validated on Windows with an NVMe Engram file; other storage may prefer another value |
+
+`DS4_EG_SORT_MODE=std` forces the portable sort, and `DS4_EG_DEDUP=0` disables post-sort deduplication; both exist as
+fallbacks and A/B controls. By default radix32 is used only after every row proves its 32-bit row-ID/byte-offset mapping;
+otherwise radix64 or `std::sort` is used. `DS4_EG_PROFILE=1` logs planning and read/cache timings. Cancellation wakes the
+prefetch condition variable, and an active batch finishes before its worker can exit. While prefetch is active, `STAT`
+reports `eg_prefetch_rows`, `eg_prefetch_hits`, `eg_prefetch_reads`, `eg_prefetch_io_ms`, and `eg_prefetch_wait_ms`;
+these are separate from the consumer's lookup/on-demand-read counters, so prefetched physical reads are not mislabeled
+as consumer cache hits.
+
 ## DeepSeek: conversations kept (an agent's parent and workers on one model)
 
 The engine holds one conversation: a prompt that continues it reuses its state, anything else starts over. An agent

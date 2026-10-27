@@ -107,18 +107,25 @@ inline fd_t open_unbuffered(const std::string& path) {
 }
 /// [off, off + n) through open_unbuffered's handle (one thread's) into buf, kDirectAlign-aligned and at least
 /// direct_span(off, n) bytes: the bytes land at buf + off % kDirectAlign
-inline bool pread_unbuffered(fd_t f, void* buf, uint64_t n, uint64_t off) {
+inline bool pread_unbuffered_aligned(fd_t f, void* buf, uint64_t n, uint64_t off, uint64_t alignment) {
 #if defined(_WIN32)
-    const uint64_t a0 = off & ~(kDirectAlign - 1), span = direct_span(off, n);
+    if (alignment == 0 || off > UINT64_MAX - n) return false;
+    const uint64_t a0 = off - off % alignment, delta = off - a0;
+    if (delta > UINT64_MAX - n || delta + n > UINT64_MAX - (alignment - 1)) return false;
+    const uint64_t span = (delta + n + alignment - 1) / alignment * alignment;
+    if (span > MAXDWORD) return false;
     OVERLAPPED ov{};
     ov.Offset = (DWORD) a0;
     ov.OffsetHigh = (DWORD) (a0 >> 32);
     DWORD got = 0;
-    return ReadFile((HANDLE) f, buf, (DWORD) span, &got, &ov) && got >= (off - a0) + n;
+    return ReadFile((HANDLE) f, buf, (DWORD) span, &got, &ov) && got >= delta + n;
 #else
-    (void) f, (void) buf, (void) n, (void) off;
+    (void) f, (void) buf, (void) n, (void) off, (void) alignment;
     return false;
 #endif
+}
+inline bool pread_unbuffered(fd_t f, void* buf, uint64_t n, uint64_t off) {
+    return pread_unbuffered_aligned(f, buf, n, off, kDirectAlign);
 }
 /// The same file opened for reads from many threads at once (Windows runs the reads of a synchronous handle one at a
 /// time, so an overlapped one; Linux: a plain descriptor, pread is concurrent anyway)

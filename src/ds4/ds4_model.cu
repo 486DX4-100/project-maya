@@ -1153,11 +1153,14 @@ struct Model::Impl {
     // an Engram layer: asked for when the window's tokens are known, collected right before that layer)
     EgReader eg_io;
     EgRowCache eg_cache;
+    struct EgPrefetch;
+    EgPrefetch* eg_pf = nullptr;
     std::mutex eg_cache_mu;
     std::vector<std::unique_ptr<EgBatch>> eg_win;
     std::vector<uint8_t> eg_q6k;   // Engram layer li's row format: 1 ggml Q6_K (superblocks of 256), 2 IQ4_NL (blocks of
                                    // 32), 0 FP8
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
+    std::atomic<int64_t> eg_pf_rows_n{0}, eg_pf_hits_n{0}, eg_pf_reads_n{0}, eg_pf_wait_ns{0}, eg_pf_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
     // the state
@@ -6941,7 +6944,8 @@ struct Model::Impl {
     // [hd] codes then the scales; nullptr: h_eg).  eg_issue serves the rows already fetched from the row cache (and a
     // row the window needs twice from one read) and hands the rest to the reader's threads; eg_finish waits for them,
     // copies the repeats and keeps the new rows in the cache.  The rows are the file's bytes either way.
-    void eg_issue(int64_t p0, int T, int li, uint8_t* dst, EgBatch& b) {
+    void eg_issue(int64_t p0, int T, int li, uint8_t* dst, EgBatch& b, bool account = true, bool submit = true,
+                  bool defer_dups = false) {
         const int cols = (pk.eg_ngram - 1) * pk.eg_heads, hd = pk.eg_hd;
         const size_t per = (size_t) cols * (hd + hd / 32);
         b.clear();
@@ -6953,6 +6957,7 @@ struct Model::Impl {
         const bool q6k = eg_q6k[(size_t) li] == 1;   // (a GGUF: one Q6_K superblock a 256 values, its scales inside)
         const bool iq4 = eg_q6k[(size_t) li] == 2;   // (IQ4_NL blocks of 32, their scales inside)
         std::unordered_map<uint64_t, int> first;   // a row this batch reads already -> its read
+        if (!defer_dups) first.reserve((size_t) T * cols);
         int64_t hits = 0;
         {
             std::lock_guard<std::mutex> lk(eg_cache_mu);
@@ -6986,12 +6991,14 @@ struct Model::Impl {
                             ++hits;
                             continue;
                         }
-                        const auto fi = first.find(key);
-                        if (fi != first.end()) {
-                            b.dups.push_back({fi->second, {rd, sd}});
-                            continue;
+                        if (!defer_dups) {
+                            const auto fi = first.find(key);
+                            if (fi != first.end()) {
+                                b.dups.push_back({fi->second, {rd, sd}});
+                                continue;
+                            }
+                            first.emplace(key, (int) b.reads.size());
                         }
-                        first.emplace(key, (int) b.reads.size());
                         EgRead r;
                         r.file = tw->file;
                         r.dst = rd;
@@ -7016,13 +7023,16 @@ struct Model::Impl {
                 }
             }
         }
-        eg_rows_n += hits + (int64_t) b.reads.size() + (int64_t) b.dups.size();
-        eg_hits_n += hits + (int64_t) b.dups.size();
-        eg_reads_n += (int64_t) b.reads.size();
-        eg_io.submit(b);
+        b.lookups = hits + (int64_t) b.reads.size() + (int64_t) b.dups.size();
+        if (account) {
+            eg_rows_n += b.lookups;
+            eg_hits_n += hits + (int64_t) b.dups.size();
+            eg_reads_n += (int64_t) b.reads.size();
+        }
+        if (submit) eg_io.submit(b);
     }
     // b's rows all in place (any thread; a group's members may ask at once: one finishes, the others wait for it)
-    void eg_finish(EgBatch& b) {
+    void eg_finish(EgBatch& b, bool account = true) {
         if (b.post.load(std::memory_order_acquire) == 2) return;
         const int64_t t0 = now_ns();
         eg_io.wait(b);
@@ -7031,13 +7041,19 @@ struct Model::Impl {
             const int hd = pk.eg_hd;
             for (const auto& d : b.dups) {
                 const EgRead& r = b.reads[(size_t) d.first];
-                std::memcpy(d.second.first, r.dst, (size_t) hd);
-                std::memcpy(d.second.second, r.scales, (size_t) hd / 32);
+                if (b.ok[(size_t) d.first] == 1) {
+                    std::memcpy(d.second.first, r.dst, (size_t) hd);
+                    std::memcpy(d.second.second, r.scales, (size_t) hd / 32);
+                } else {   // a failed canonical read must not publish uninitialised duplicate destinations
+                    std::memset(d.second.first, 0, (size_t) hd);
+                    std::memset(d.second.second, 0, (size_t) hd / 32);
+                }
             }
             {
                 std::lock_guard<std::mutex> lk(eg_cache_mu);
                 for (size_t i = 0; i < b.reads.size(); ++i) {
                     const EgRead& r = b.reads[i];
+                    if (b.ok[i] == 2) continue;   // sorted duplicate: copied above; only the canonical enters the cache
                     if (!b.ok[i]) {   // (a failed read: zeros, its gate adds nothing; not kept)
                         std::memset(r.dst, 0, (size_t) hd);
                         std::memset(r.scales, 0, (size_t) hd / 32);
@@ -7049,29 +7065,43 @@ struct Model::Impl {
                     }
                 }
             }
-            eg_io_ns += b.t1.load() - b.t0;
+            if (!account) {
+                // One logical lookup is either a canonical read attempt or served by cache/a duplicate destination.
+                // Account here, after zone planning has reduced the reads to their canonical set, and only once.
+                eg_pf_rows_n += b.lookups;
+                eg_pf_hits_n += b.lookups - b.io_reads;
+                eg_pf_reads_n += b.io_reads;
+            }
+            if (account) eg_io_ns += b.t1.load() - b.t0;
+            else eg_pf_io_ns += b.t1.load() - b.t0;
             b.live = false;
             b.post.store(2, std::memory_order_release);
         } else {
             while (b.post.load(std::memory_order_acquire) != 2) std::this_thread::yield();
         }
-        eg_wait_ns += now_ns() - t0;
+        if (account) eg_wait_ns += now_ns() - t0;
+        else eg_pf_wait_ns += now_ns() - t0;
     }
     void eg_stats() {
         st.eg_rows = eg_rows_n.load();
         st.eg_hits = eg_hits_n.load();
         st.eg_reads = eg_reads_n.load();
+        st.eg_pf_rows = eg_pf_rows_n.load();
+        st.eg_pf_hits = eg_pf_hits_n.load();
+        st.eg_pf_reads = eg_pf_reads_n.load();
         st.eg_io_ms = (double) eg_io_ns.load() / 1e6;
+        st.eg_pf_io_ms = (double) eg_pf_io_ns.load() / 1e6;
+        st.eg_pf_wait_ms = (double) eg_pf_wait_ns.load() / 1e6;
         std::lock_guard<std::mutex> lk(eg_cache_mu);
         st.eg_cached = (int64_t) eg_cache.size();
         st.eg_cache_cap = (int64_t) eg_cache.capacity();
         st.eg_cache_row_bytes = (int64_t) eg_cache.row_bytes();
     }
     // the chunked prompt path: rows of Engram layer `only` into dst, now (a helper thread, a chunk ahead)
-    void engram_rows(int64_t p0, int T, int only, uint8_t* dst) {
+    void engram_rows(int64_t p0, int T, int only, uint8_t* dst, bool account = true) {
         EgBatch b;
-        eg_issue(p0, T, only, dst, b);
-        eg_finish(b);
+        eg_issue(p0, T, only, dst, b, account);
+        eg_finish(b, account);
     }
 
     // ---- the CPU lane: a window's routed experts that live on the host, as entries (an expert and up to 8 of its
@@ -11307,6 +11337,145 @@ struct Model::Impl {
         bool kv_only(int k, int il) const { return yoco >= 0 && k < cut_k && il == yoco; }
         int r0(int k, int il) const { return yoco >= 0 && k == cut_k && il >= yoco ? cut_r : 0; }   // the first row
     };
+    // Whole-prompt Engram read-ahead: fill the ordinary row cache in consumption order, independently of the two
+    // pinned staging slots.  A consumer waits for its unit before doing the normal lookup/copy, so no row is read by
+    // the prefetcher and the normal path at once.  The worker never outlives forward_chunks' tokens or image state.
+    struct EgPrefetch {
+        Impl* p;
+        const Run& run;
+        std::vector<std::pair<int, int>> units;
+        std::vector<char> ready;
+        std::vector<int> seen;
+        bool lm;
+        int ahead;
+        int seen_chunk = -1;
+        std::mutex mu;
+        std::condition_variable cv;
+        std::atomic<bool> stop{false};
+        bool done = false;
+        std::thread worker;
+        EgPrefetch(Impl* p, const Run& run, std::vector<std::pair<int, int>> units, bool lm, int ahead)
+            : p(p), run(run), units(std::move(units)), ready(this->units.size(), 0),
+              seen((size_t) p->pk.eg_layers, -1), lm(lm), ahead(ahead) {}
+        ~EgPrefetch() {
+            stop.store(true, std::memory_order_release);
+            cv.notify_all();
+            if (worker.joinable()) worker.join();
+            if (p->eg_pf == this) p->eg_pf = nullptr;
+        }
+        void start() { worker = std::thread([this] { work(); }); }
+        void wake() { cv.notify_all(); }   // halt/eg_abort are set by other threads, not through this prefetcher
+        void work() {
+            const size_t per = (size_t) (p->pk.eg_ngram - 1) * p->pk.eg_heads * (p->pk.eg_hd + p->pk.eg_hd / 32);
+            size_t zone = std::getenv("DS4_EG_ZONE_KB") ? (size_t) std::max(0, std::atoi(std::getenv("DS4_EG_ZONE_KB"))) << 10 : 0;
+            auto publish = [&](size_t u) {
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    ready[u] = 1;
+                }
+                cv.notify_all();
+            };
+            auto gate = [&](int li, int start) {
+                if (start == 0) return;
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] {
+                    const int seen_at = li >= 0 ? seen[(size_t) li] : seen_chunk;
+                    return seen_at >= start - ahead || stop.load(std::memory_order_acquire) ||
+                           p->halt.load(std::memory_order_acquire) || p->eg_abort.load(std::memory_order_acquire);
+                });
+            };
+            if (zone) {
+                std::vector<int> lis;
+                for (const auto& unit : units)
+                    if (std::find(lis.begin(), lis.end(), unit.first) == lis.end()) lis.push_back(unit.first);
+                for (int li : lis) {
+                    size_t count = 0;
+                    for (const auto& unit : units) count += unit.first == li;
+                    if (count != run.T.size()) {
+                        zone = 0;
+                        break;
+                    }
+                }
+                auto load = [&](int li, int start) {
+                    const int end = std::min((int) run.T.size(), start + ahead);
+                    int total = 0;
+                    for (int k = start; k < end; ++k) total += run.T[(size_t) k];
+                    std::vector<uint8_t> scratch((size_t) total * per);
+                    EgBatch b;
+                    static const bool profile = std::getenv("DS4_EG_PROFILE") != nullptr;
+                    const double t0 = now_ms();
+                    p->eg_issue(run.p0[(size_t) start], total, li, scratch.data(), b, false, false, true);
+                    const double t1 = now_ms();
+                    p->eg_io.submit_zones(b, zone);
+                    const double t2 = now_ms();
+                    p->eg_finish(b, false);
+                    if (profile)
+                        std::fprintf(stderr, "ds4: Engram window: layer %d, chunk %d, %d tokens: generate %.1f ms, plan %.1f ms, read/cache %.1f ms\n",
+                                     li, start, total, t1 - t0, t2 - t1, now_ms() - t2);
+                    for (size_t u = 0; u < units.size(); ++u)
+                        if (units[u].first == li && units[u].second >= start && units[u].second < end) publish(u);
+                };
+                if (lm) {
+                    for (int li : lis)
+                        for (int start = 0; start < (int) run.T.size() && zone; start += ahead) {
+                            gate(li, start);
+                            if (stop.load(std::memory_order_acquire) || p->halt.load(std::memory_order_acquire) ||
+                                p->eg_abort.load(std::memory_order_acquire)) break;
+                            load(li, start);
+                        }
+                } else {
+                    for (int start = 0; start < (int) run.T.size() && zone; start += ahead) {
+                        gate(-1, start);
+                        if (stop.load(std::memory_order_acquire) || p->halt.load(std::memory_order_acquire) ||
+                            p->eg_abort.load(std::memory_order_acquire)) break;
+                        for (int li : lis) load(li, start);
+                    }
+                }
+                if (zone) {
+                    std::lock_guard<std::mutex> lk(mu);
+                    done = true;
+                    cv.notify_all();
+                    return;
+                }
+            }
+            std::vector<uint8_t> scratch;
+            for (size_t u = 0; u < units.size(); ++u) {
+                const int li = units[u].first, k = units[u].second;
+                gate(lm ? li : -1, k);
+                if (stop.load(std::memory_order_acquire) || p->halt.load(std::memory_order_acquire) ||
+                    p->eg_abort.load(std::memory_order_acquire)) break;
+                scratch.resize((size_t) run.T[(size_t) k] * per);
+                p->engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, scratch.data(), false);
+                publish(u);
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                done = true;
+            }
+            cv.notify_all();
+        }
+        void wait_unit(int li, int k) {
+            size_t u = 0;
+            while (u < units.size() && (units[u].first != li || units[u].second != k)) ++u;
+            if (u == units.size()) return;
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return ready[u] || done || stop.load(std::memory_order_acquire); });
+        }
+        void finish_unit(int li, int k) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                seen[(size_t) li] = std::max(seen[(size_t) li], k);
+            }
+            cv.notify_all();
+        }
+        void finish_chunk(int k) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                seen_chunk = std::max(seen_chunk, k);
+            }
+            cv.notify_all();
+        }
+    };
     // topk's segments (TopkScratch): for a verify window's rows (a drafter's block and its token: 6; wider windows, a
     // prompt's 16, take topk_kernel), as many a row as the longest row needs - 0.5 MB a device at 256K
     static constexpr size_t kTksRows = 8;
@@ -11361,7 +11530,9 @@ struct Model::Impl {
         auto read_eg = [this, &c, &run, &egu, eg_per](size_t u) {
             if (u >= 2) cudaEventSynchronize(c.eg_ev[u % 2]);
             const int li = egu[u].first, k = egu[u].second;
+            if (eg_pf != nullptr) eg_pf->wait_unit(li, k);
             engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[u % 2] + (size_t) li * c.C * eg_per);
+            if (eg_pf != nullptr) eg_pf->finish_unit(li, k);
         };
         size_t eg_u = 0;
         std::future<void> eg_next;
@@ -11553,8 +11724,12 @@ struct Model::Impl {
                     if (!eg_wait_seq(m.eg_copied_seq[sl], run.seq[(size_t) k - 2])) return;
                     cudaEventSynchronize(m.eg_ev[sl]);
                 }
-            for (int li : egs)
+            for (int li : egs) {
+                if (eg_pf != nullptr) eg_pf->wait_unit(li, k);
                 engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[sl] + (size_t) li * c.C * eg_per);
+                if (eg_pf != nullptr) eg_pf->finish_unit(li, k);
+            }
+            if (eg_pf != nullptr) eg_pf->finish_chunk(k);
             c.eg_read_seq[sl].store(run.seq[(size_t) k], std::memory_order_release);
         };
         std::future<void> eg_next;
@@ -12394,6 +12569,99 @@ struct Model::Impl {
                 if (on) p->lm_end();
             }
         } lm_end_{this, lm};
+        std::unique_ptr<EgPrefetch> prefetch;
+        static const int eg_prefetch_on = std::getenv("DS4_ENGRAM_PREFETCH") ?
+                                          std::max(0, std::atoi(std::getenv("DS4_ENGRAM_PREFETCH"))) : 0;
+        static const int eg_zone_kb = std::getenv("DS4_EG_ZONE_KB") ?
+                                      std::max(0, std::atoi(std::getenv("DS4_EG_ZONE_KB"))) : 0;
+        static const int eg_prefetch_chunks = std::getenv("DS4_ENGRAM_PREFETCH_CHUNKS") ?
+                                              std::max(-1, std::atoi(std::getenv("DS4_ENGRAM_PREFETCH_CHUNKS"))) : -1;
+        if (eg_prefetch_on && devs.size() == 1 && eg_cache.capacity() > 0) {
+            std::vector<std::pair<int, int>> units;
+            size_t lookups = 0;
+            const size_t cols = (size_t) (pk.eg_ngram - 1) * pk.eg_heads;
+            auto add = [&](int k, int il) {
+                const int li = L[(size_t) il].eg;
+                if (li < 0 || !run.runs(k, il)) return;
+                units.push_back({li, k});
+                lookups += (size_t) run.T[(size_t) k] * cols;
+            };
+            if (lm) {
+                for (int il = 0; il < g.nl; ++il)
+                    for (int k = 0; k < (int) run.T.size(); ++k) add(k, il);
+            } else {
+                for (int k = 0; k < (int) run.T.size(); ++k)
+                    for (int il = 0; il < g.nl; ++il) add(k, il);
+            }
+            const int nk = (int) run.T.size();
+            std::vector<int> eg_layer_ids;
+            for (const auto& unit : units)
+                if (std::find(eg_layer_ids.begin(), eg_layer_ids.end(), unit.first) == eg_layer_ids.end())
+                    eg_layer_ids.push_back(unit.first);
+            const size_t eg_layers = eg_layer_ids.size();
+            // Consumption credits use compute-chunk indices. A sparse YOCO unit list can start beyond `ahead` or have
+            // gaps no consumer can ever credit; keep that valid but unusual layout on the ordinary read path.
+            const bool dense_units = units.size() == eg_layers * (size_t) nk;
+            std::vector<size_t> token_prefix((size_t) nk + 1, 0);
+            for (int k = 0; k < nk; ++k) token_prefix[(size_t) k + 1] = token_prefix[(size_t) k] + run.T[(size_t) k];
+            auto max_window_tokens = [&](int ahead) {
+                size_t widest = 0;
+                for (int start = 0; start + ahead <= nk; ++start)
+                    widest = std::max(widest, token_prefix[(size_t) (start + ahead)] - token_prefix[(size_t) start]);
+                return widest;
+            };
+            auto live_lookups = [&](int ahead) {
+                // One whole prompt needs no next-window headroom. A bounded pipeline can hold its current window
+                // and the previous one until consumption credits arrive; count every layer and do not assume dedup.
+                return ahead >= nk ? lookups : 2 * eg_layers * cols * max_window_tokens(ahead);
+            };
+            const size_t budget = eg_cache.capacity() - eg_cache.capacity() / 4;   // 75%: index/scratch/old rows
+            int eg_ahead = 0;
+            size_t window_lookups = 0, limit = budget;
+            const char* policy = "auto";
+            if (eg_prefetch_chunks < 0) {
+                if (lookups <= budget) {
+                    eg_ahead = nk;   // the whole prompt fits comfortably
+                    window_lookups = lookups;
+                    policy = "auto whole";
+                } else if (lm) {
+                    // Layer-major retains completed layers in the shared clock cache while it reads the next one. The
+                    // two-window estimate does not bound that occupancy, so automatic mode is whole-or-ordinary here.
+                    policy = "auto bounded skipped layer-major";
+                } else {
+                    int lo = 0, hi = nk - 1;   // largest bounded window whose two-window live set fits
+                    while (lo < hi) {
+                        const int mid = lo + (hi - lo + 1) / 2;
+                        if (live_lookups(mid) <= budget) lo = mid;
+                        else hi = mid - 1;
+                    }
+                    eg_ahead = lo;
+                    window_lookups = lo > 0 ? live_lookups(lo) : 0;
+                    policy = "auto bounded";
+                }
+            } else if (eg_prefetch_chunks == 0) {
+                eg_ahead = nk;   // explicit experiment: whole prompt, guarded by actual capacity rather than the budget
+                window_lookups = lookups;
+                limit = eg_cache.capacity();
+                policy = "explicit whole";
+            } else {
+                eg_ahead = std::min(eg_prefetch_chunks, nk);
+                window_lookups = live_lookups(eg_ahead);
+                policy = "fixed";
+            }
+            if (dense_units && !units.empty() && eg_ahead > 0 && window_lookups <= limit) {
+                prefetch.reset(new EgPrefetch(this, run, std::move(units), lm, eg_ahead));
+                eg_pf = prefetch.get();
+                if (o.verbose || std::getenv("DS4_EG_PROFILE"))
+                    std::fprintf(stderr,
+                                 "ds4: Engram prefetch: %s, %s, %zu units, chunk %d, ahead %d (%zu tokens max), "
+                                 "live <= %zu / %zu rows, zone %d KiB, up to %.1f MiB scratch/layer\n",
+                                 policy, lm ? "layer-major" : "chunk-major", prefetch->units.size(), chunk,
+                                 prefetch->ahead, max_window_tokens(eg_ahead),
+                                 window_lookups, eg_cache.capacity(), eg_zone_kb,
+                                 (double) max_window_tokens(eg_ahead) * cols * (pk.eg_hd + pk.eg_hd / 32) / 1048576.0);
+            }
+        }
         std::vector<std::string> errs(devs.size());
         halted = false;
         halt.store(false);
@@ -12404,12 +12672,14 @@ struct Model::Impl {
         }
         bool halting = false;
         eg_abort.store(false);
+        if (prefetch) prefetch->start();
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, &run, &errs] {
                 std::string e;
                 if (!run_dev_chunks((int) di, run, e)) {
                     errs[di] = e.empty() ? "a device's thread failed" : e;
                     eg_abort.store(true, std::memory_order_release);
+                    if (eg_pf != nullptr) eg_pf->wake();
                 }
             });
         size_t reported = 0;
@@ -12421,6 +12691,7 @@ struct Model::Impl {
                 std::lock_guard<std::mutex> lk(halt_mu);
                 halt_k = halt_seen + 1;
                 halt.store(true, std::memory_order_release);
+                if (eg_pf != nullptr) eg_pf->wake();
             }
             if (progress && lm) {   // (layer-major: the share of the layers every chunk went through)
                 const int nd = lm_layers.load(std::memory_order_acquire);

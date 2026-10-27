@@ -266,6 +266,13 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
   [speed calibration](docs/SETTINGS.md#the-speed-calibration) measures it on your PC and keeps it only where it is
   faster. The drafter's license is non-commercial (CC BY-NC-ND 4.0).
 
+### DeepSeek: Engram prompt read-ahead
+
+On one GPU, optional Engram prompt read-ahead fills the ordinary row cache before each consuming layer. It groups sorted
+rows into larger zone reads, removes duplicate reads, and sizes look-ahead from the cache budget instead of letting a
+large prompt overwrite rows before their use. The model's row bytes and decode path are unchanged; it is off by default
+([settings and caveats](docs/SETTINGS.md#deepseek-engram-prompt-read-ahead)).
+
 ### DeepSeek: conversations kept
 
 The DeepSeek-V4.1-Flash-1017 engine holds one conversation: a prompt that continues it reuses its state, anything else

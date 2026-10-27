@@ -1092,6 +1092,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                               slot_disk, (unsigned long long) slot_ram_bytes(), (unsigned long long) slot_ram_budget);
                 out += b;
             }
+            if (s.eg_pf_rows > 0) {
+                std::snprintf(b, sizeof b,
+                              " eg_prefetch_rows=%lld eg_prefetch_hits=%lld eg_prefetch_reads=%lld "
+                              "eg_prefetch_io_ms=%.2f eg_prefetch_wait_ms=%.2f",
+                              (long long) s.eg_pf_rows, (long long) s.eg_pf_hits, (long long) s.eg_pf_reads,
+                              s.eg_pf_io_ms, s.eg_pf_wait_ms);
+                out += b;
+            }
             if (io >= 0 && io_dec >= 0) {
                 const double disk = tr.cpu_blob > 0 ? std::min(cx / fed, (double) (io - io_dec) / tr.cpu_blob / fed) : 0.0;
                 std::snprintf(b, sizeof b, " disk_mb=%.3f disk=%.3f ram_fetch=%.3f", (double) (io - io_dec) / 1e6 / fed,
