@@ -644,6 +644,10 @@ struct Chunk {
     // member (DS4_TP_BORROW=1: each member its own part of the group's last slots, the group's members all or none)
     bool borrow = false, tp_lend = false;
     uint8_t* own = nullptr;
+    // its largest buffers' region of its own (all of them, or a lending device's fixed part): between prompts the
+    // vision tower's room for a picture (Impl::take_vis_room), zeroed again after it
+    uint8_t* room = nullptr;
+    size_t room_bytes = 0;
     float *h = nullptr, *x = nullptr, *acc = nullptr, *qr = nullptr, *kvr = nullptr, *ckr = nullptr, *cgr = nullptr,
           *latent = nullptr, *ikr = nullptr, *q = nullptr, *o = nullptr, *oa = nullptr, *iq = nullptr, *iw = nullptr,
           *scores = nullptr, *bm = nullptr, *mix = nullptr, *a_pre = nullptr, *a_post = nullptr, *a_comb = nullptr,
@@ -4196,8 +4200,10 @@ struct Model::Impl {
             c.borrow = (lend || c.tp_lend) && stride > 0;
             {   // (its own room, laid out once: all of it, or a lending device's buffers of a fixed size)
                 const int part = c.borrow ? 1 : 3;
-                if (!dalloc(d, c.own, lay_chunk(c, chunk, nullptr, part), err)) return false;
+                c.room_bytes = lay_chunk(c, chunk, nullptr, part);
+                if (!dalloc(d, c.own, c.room_bytes, err)) return false;
                 lay_chunk(c, chunk, c.own, part);
+                c.room = c.own;
             }
             if (!halloc(c.bounds_pin, 2048, err)) return false;
             if (stride > 0) {   // DS4_RING_MB (400) of slots in kParts batches
@@ -5666,6 +5672,7 @@ struct Model::Impl {
             uint8_t* rows = nullptr;
             if (!dalloc(d, rows, need, err)) return false;
             lay_chunk(c, chunk, rows, 2);
+            if (need > c.room_bytes) c.room = rows, c.room_bytes = need;
             if (o.verbose)
                 std::fprintf(stderr, "ds4: CUDA%d keeps the prompt path's room for itself (%.2f GB): its experts' room "
                                      "(%.2f GB) holds too little to lend it\n", d.id, need / 1e9, room_e / 1e9);
@@ -5699,10 +5706,29 @@ struct Model::Impl {
                 uint8_t* rows = nullptr;
                 if (!dalloc(d, rows, need, err)) return false;
                 lay_chunk(c, chunk, rows, 2);
+                if (need > c.room_bytes) c.room = rows, c.room_bytes = need;   // (a picture's room too)
                 std::fprintf(stderr, "ds4: CUDA%d keeps the prompt path's room for itself (%.2f GB), as every member "
                                      "of its group does: one's experts' room holds too little to lend it "
                                      "(DS4_TP_BORROW)\n",
                              d.id, need / 1e9);
+            }
+        }
+        // a picture's room (load_vision: lent on demand): the first device's prompt buffers when their region holds
+        // it; else, where that device alone lends its prompt buffers' rows to the experts (Chunk::borrow, one GPU), its
+        // tail of expert slots (sized for it below); else - a tensor-parallel member's tail (DS4_TP_BORROW: the slots a
+        // group shares part by part) is not lent to the tower - the tower's own after all, taken now, before the experts
+        // take the rest
+        if (vis_mode == kVisChunk) {
+            const Chunk* c = chunks.empty() ? nullptr : chunks[0].get();
+            if (c != nullptr && c->room != nullptr && c->room_bytes >= vt.room_bytes()) {
+            } else if (c != nullptr && c->borrow && !c->tp_lend) {
+                vis_mode = kVisTail;
+            } else {
+                if (!dalloc(devs[0], vis_res, vt.room_bytes(), err, &vis_acct)) return false;
+                vis_mode = kVisResident;
+                std::fprintf(stderr, "ds4: the vision tower's room (%.0f MiB) stays on CUDA%d: its prompt buffers (%.0f "
+                                     "MiB) are smaller\n", (double) vt.room_bytes() / (1 << 20), devs[0].id,
+                             (c != nullptr ? (double) c->room_bytes : 0.0) / (1 << 20));
             }
         }
         // (Windows, an integrated GPU: what its experts may commit - commit_room - and what that kept off the GPU)
@@ -5920,8 +5946,16 @@ struct Model::Impl {
                     min_slots = std::min(min_slots, std::min(l.n_vram, l.n_exp));
                 }
             const size_t need = lay_chunk(c, chunk, nullptr, 2) + 256;
-            const int k = (int) std::min<size_t>((need + step - 1) / step, (size_t) std::max(0, min_slots - 1));
+            // (the first device's tail is a picture's room too, kVisTail: as many slots a layer as that takes, when it
+            //  is more - the tail stays expert slots between prompts and pictures, so it costs the decode nothing)
+            const size_t vneed = di == 0 && vis_mode == kVisTail ? vt.room_bytes() + 256 : 0;
+            const int k = (int) std::min<size_t>((std::max(need, vneed) + step - 1) / step,
+                                                 (size_t) std::max(0, min_slots - 1));
             const size_t cap = (size_t) k * step;
+            if (vneed > cap)
+                std::fprintf(stderr, "ds4: CUDA%d keeps too few experts in VRAM (%d a layer) to lend a picture its room: "
+                                     "a picture takes %.0f MiB of free memory while it is read\n",
+                             d.id, min_slots, (double) vt.room_bytes() / (1 << 20));
             if (cap < need) {   // (a device with few VRAM slots a layer: chunks as large as its tail holds)
                 int c2 = chunk;
                 while (c2 > 256 && lay_chunk(c, c2, nullptr, 2) + 256 > cap) c2 = (c2 - 1) / 256 * 256;
@@ -7838,6 +7872,21 @@ struct Model::Impl {
     std::string vision_err;              // why the tower did not load (pictures off), or empty
     std::vector<uint16_t> img_mark[3];   // image_start, image_newline, image_end: BF16 [dim]
     std::vector<Image> imgs;             // the pictures of the prompt being fed, by start
+    // Nothing of the tower stays in VRAM between pictures: a picture's room (VisionTower::room_bytes, ~320 MB) on the
+    // first GPU is lent for its encode and given back after it - by the device's prompt buffers (idle between prompts:
+    // kVisChunk, zeroed again after), by its tail of expert slots (a device that lends those to the prompt path:
+    // kVisTail, the experts under it read back after, as after a run of chunks), or taken from free memory (kVisFree).
+    // A device with no prompt buffers to lend it (prompts in windows) keeps the room for the whole run (kVisResident,
+    // as before v1.1.31; MAYA_DS4_VISION_RESIDENT=1 asks for that too).
+    enum { kVisNone = 0, kVisChunk, kVisTail, kVisFree, kVisResident };
+    int vis_mode = kVisNone;             // where a picture's room comes from (load_vision, then place_experts)
+    uint8_t* vis_res = nullptr;          // kVisResident: the room, held for the run
+    size_t vis_acct = 0;                 // ... its bytes
+    uint8_t* vis_room = nullptr;         // the room held now (an encode, or a request's pictures: vision_hold)
+    int vis_src = kVisNone;              // ... and who lent it
+    bool vis_hold = false;               // keep it from one encode_image to the next, till vision_release
+    std::function<void()> vis_note;      // after the room is taken and after it is given back (the VRAM lines)
+    double vis_ms = 0;                   // the last lending's cost: taking the room and giving it back
     bool load_vision(std::string& err) {
         vg.layers = (int) pk.num("vision.num_hidden_layers", 0);
         const int tok = (int) pk.num("image_token_id", -1);
@@ -7865,22 +7914,148 @@ struct Model::Impl {
         };
         if (!vt.load(vg, d.id, read, err)) return false;
         img_tok = tok;
+        // a picture's room: lent on demand (place_experts says by whom) where the prompt runs in chunks; prompts in
+        // windows have no buffers to lend it, so the room is the tower's own then - taken here, before the split
+        // (the settings' MAYA_DS4_VISION_RESIDENT=1, or DS4_VISION_RESIDENT for tests: the room kept, as before)
+        const char* rv = std::getenv("DS4_VISION_RESIDENT");
+        if (rv == nullptr) rv = std::getenv("STRATA_DS4_VISION_RESIDENT");
+        const bool resident = rv != nullptr && std::atoi(rv) != 0;
+        vis_mode = o.vision_only ? kVisFree : chunk > 0 && !resident ? kVisChunk : kVisResident;
+        if (vis_mode == kVisResident && !dalloc(d, vis_res, vt.room_bytes(), err, &vis_acct)) return false;
         CK(cudaSetDevice(d.id));
         CK(mem_info(&d.free0, &d.total));   // (the split sees what the tower left)
         if (o.verbose)
-            std::fprintf(stderr, "ds4: vision tower (%d blocks) on CUDA%d: %.0f MiB, up to %d patches, %.1f s\n",
-                         vg.layers, d.id, (double) vt.device_bytes() / (1 << 20), vt.max_patches(),
-                         (now_ms() - t0) / 1000.0);
+            std::fprintf(stderr, "ds4: vision tower (%d blocks) for CUDA%d: its weights %.0f MiB in pinned RAM, a picture's "
+                                 "room %.0f MiB (%s), up to %d patches, %.1f s\n",
+                         vg.layers, d.id, (double) vt.host_bytes() / (1 << 20), (double) vt.room_bytes() / (1 << 20),
+                         vis_mode == kVisResident ? "kept on the GPU for the run" : "lent for each picture",
+                         vt.max_patches(), (now_ms() - t0) / 1000.0);
         return true;
+    }
+    // (the INFO line's name of a room's lender)
+    static const char* vis_name(int m) {
+        return m == kVisChunk ? "chunk" : m == kVisTail ? "tail" : m == kVisFree ? "free" : m == kVisResident ? "resident"
+                                                                                                           : "none";
+    }
+    // a picture's room on the tower's GPU (vis_mode's lender; one that cannot lend it now: free memory)
+    uint8_t* take_vis_room(int& src, std::string& err) {
+        Dev& d = devs[0];
+        const size_t need = vt.room_bytes();
+        cudaSetDevice(d.id);
+        src = kVisNone;
+        Chunk* c = chunks.empty() ? nullptr : chunks[0].get();
+        // (DS4_VISION_ROOM=tail or =free, tests: that lender even where the prompt buffers would lend the room - the
+        //  tail only on a device that has one, Chunk::borrow)
+        static const std::string force = std::getenv("DS4_VISION_ROOM") != nullptr ? std::getenv("DS4_VISION_ROOM") : "";
+        const bool chunk_room = force.empty() && c != nullptr && c->room != nullptr && c->room_bytes >= need;
+        // (DS4_VISION_LEND=1, tests: the prompt buffers lend the room even to a tower that keeps its own - the experts
+        //  placed as with the room kept, so the answers show that where the room is changes nothing)
+        static const bool lend_test = std::getenv("DS4_VISION_LEND") != nullptr && std::atoi(std::getenv("DS4_VISION_LEND")) != 0;
+        if (vis_mode == kVisResident && !(lend_test && chunk_room)) {
+            src = kVisResident;
+            return vis_res;
+        }
+        // (between prompts: no run of chunks, no decode - what the device's streams still hold done first)
+        cudaStreamSynchronize(d.st);
+        if (d.st2 != nullptr) cudaStreamSynchronize(d.st2);
+        if (c != nullptr && c->cs != nullptr) cudaStreamSynchronize(c->cs);
+        if ((vis_mode == kVisChunk || vis_mode == kVisResident) && chunk_room) {
+            src = kVisChunk;
+            return c->room;
+        }
+        uint8_t* p = nullptr;
+        if ((vis_mode == kVisTail || force == "tail") && lend_tail(need, p)) {
+            src = kVisTail;
+            return p;
+        }
+        void* v = nullptr;
+        if (cudaMalloc(&v, need) == cudaSuccess) {
+            src = kVisFree;
+            return (uint8_t*) v;
+        }
+        cudaGetLastError();
+        err = "vision: " + std::to_string(need >> 20) + " MiB of CUDA" + std::to_string(d.id) +
+              " for the picture: none free and none lent";
+        return nullptr;
+    }
+    // false: the tail's experts did not all come back as they were (borrow_end's false: DS4_CHECK_LEND, or a device
+    // failed - lend_broken, sticky), so the request fails before its prompt, as after a run of chunks
+    bool give_vis_room(uint8_t* p, int src) {
+        Dev& d = devs[0];
+        cudaSetDevice(d.id);
+        if (src == kVisChunk) {   // (zeroed again: the prompt buffers as the tower found them, where it wrote)
+            cudaMemsetAsync(p, 0, vt.room_bytes(), d.st);
+            cudaStreamSynchronize(d.st);
+        } else if (src == kVisTail) {
+            return borrow_end();   // (the experts under it read back into their slots)
+        } else if (src == kVisFree) {
+            cudaFree(p);
+        }
+        return true;
+    }
+    // the tail of the first device's expert slots (Chunk::borrow's region) lent to a picture: as borrow_begin, its end
+    // `need` bytes out of the VRAM set until borrow_end reads their experts back
+    bool lend_tail(size_t need, uint8_t*& p) {
+        Dev& d = devs[0];
+        if (lent || d.tail == nullptr || need + 256 > d.tail_bytes) return false;
+        cache_drain();
+        if (ln_one || ln_land) rc_drain();
+        const size_t b0 = (d.tail_bytes - need) & ~(size_t) 255;
+        for (Layer& l : L) {
+            if (l.dev != 0 || l.mtp || l.n_main >= l.n_slots) continue;
+            const size_t off = (size_t) (l.xbase - d.tail), u = align256(unit(l));
+            int keep = 0;   // (the slots wholly before the room)
+            while (l.n_main + keep < l.n_slots && off + (size_t) keep * d.tail_step + u <= b0) ++keep;
+            l.pv_n = l.n_main + keep;
+        }
+        lent = true;
+        cudaSetDevice(d.id);
+        cudaStreamSynchronize(d.st);
+        p = d.tail + b0;
+        return true;
+    }
+    bool vision_release() {
+        if (vis_room == nullptr) return true;
+        const double t0 = now_ms();
+        const bool back = give_vis_room(vis_room, vis_src);
+        vis_ms += now_ms() - t0;
+        const int src = vis_src;
+        vis_room = nullptr;
+        vis_src = kVisNone;
+        if (src != kVisResident && vis_note) vis_note();
+        return back;
     }
     bool encode_image(const uint8_t* rgb, int w, int h, std::vector<uint16_t>& span, std::string& err) {
         if (img_tok < 0) {
             err = "this model has no vision tower (or it is off)";
             return false;
         }
+        if (vis_room == nullptr) {
+            const double t0 = now_ms();
+            vis_room = take_vis_room(vis_src, err);
+            if (vis_room == nullptr) return false;
+            vis_ms = now_ms() - t0;
+            if (vis_src != kVisResident) {
+                static bool said[kVisResident + 1] = {};
+                if (!said[vis_src] || o.verbose)
+                    std::fprintf(stderr, "ds4: vision: a picture's room, %.0f MiB of CUDA%d, %s (%.0f ms)\n",
+                                 (double) vt.room_bytes() / (1 << 20), devs[0].id,
+                                 vis_src == kVisChunk  ? "lent by the prompt buffers"
+                                 : vis_src == kVisTail ? "lent by the tail of expert slots (their experts read back after)"
+                                                       : "from free memory",
+                                 vis_ms);
+                said[vis_src] = true;
+                if (vis_note) vis_note();
+            }
+        }
         std::vector<uint16_t> rows;
         int nh = 0, nw = 0;
-        if (!vt.encode(rgb, w, h, rows, nh, nw, err)) return false;
+        const bool ok = vt.encode(rgb, w, h, vis_room, rows, nh, nw, err);
+        if (!vis_hold && !vision_release() && ok) {
+            err = "vision: the expert slots lent for the picture were not read back as they were";
+            return false;
+        }
+        if (!ok) return false;
         const size_t D = (size_t) g.dim;
         span.resize(((size_t) nh * (nw + 1) + 2) * D);
         uint16_t* o = span.data();
@@ -16769,7 +16944,12 @@ struct Model::Impl {
             mtp_exp = std::min(mtp_exp, d.experts);
             const size_t tn = groups[(size_t) d.grp].mem.size();
             const size_t tp_w = std::min(d.tp_w, d.weights - mtp_dense), tp_kv = tn > 1 ? d.caches / tn * (tn - 1) : 0;
-            const size_t vis = img_tok >= 0 && vt.device() == d.id ? vt.device_bytes() : 0;
+            // the vision tower: its room while a picture is read (its lender's part less by as much), else nothing -
+            // or the room it keeps for the run (kVisResident)
+            const bool vdev = img_tok >= 0 && vt.device() == d.id;
+            const size_t vis = !vdev ? 0 : vis_res != nullptr ? vis_acct : vis_room != nullptr ? vt.room_bytes() : 0;
+            const size_t v_prompt = vdev && vis_room != nullptr && vis_src == kVisChunk ? std::min(vis, d.prompt) : 0;
+            const size_t v_pool = vdev && vis_room != nullptr && vis_src == kVisTail ? std::min(vis, d.experts - mtp_exp) : 0;
             char pci[32] = "-";
             if (cudaDeviceGetPCIBusId(pci, sizeof pci, d.id) != cudaSuccess) std::snprintf(pci, sizeof pci, "-");
             std::snprintf(b, sizeof b,
@@ -16777,7 +16957,8 @@ struct Model::Impl {
                           "pool=%zu tail=0 borrow=0 vision=0 vision_own=%zu prompt=%zu tp=%zu tp_n=%zu slots=%lld ctx=%lld "
                           "layers=%d-%d",
                           d.id, pci, tot, fr, d.weights - mtp_dense - tp_w, d.caches - tp_kv, d.scratch, mtp_dense + mtp_exp,
-                          d.experts - mtp_exp, vis, d.prompt, tp_w + tp_kv, tn, slots, (long long) o.max_context, a, z);
+                          d.experts - mtp_exp - v_pool, vis, d.prompt - v_prompt, tp_w + tp_kv, tn, slots,
+                          (long long) o.max_context, a, z);
             v.push_back(b);
         }
         if (commit_kept > 0) {   // (Windows, an integrated GPU: the commit kept experts off the GPU - the server says so)
@@ -16798,10 +16979,11 @@ struct Model::Impl {
         if (img_tok >= 0) {   // the server's image resize (DeepSeek's image_processor.py)
             std::snprintf(b, sizeof b,
                           "INFO vision=ds4 vision_patch=%d vision_merge=%d vision_min_pixels=%lld vision_max_tokens=%d "
-                          "vision_max_wh_ratio=%lld image_token=%d vision_gpu=%d vision_mib=%lld",
+                          "vision_max_wh_ratio=%lld image_token=%d vision_gpu=%d vision_mib=%lld vision_room_mib=%lld "
+                          "vision_room=%s",
                           vg.patch, vg.merge, (long long) pk.num("vision.min_pixels", 0), vg.max_tokens,
                           (long long) pk.num("vision.max_wh_ratio", 0), img_tok, vt.device(),
-                          (long long) (vt.device_bytes() >> 20));
+                          (long long) (vis_acct >> 20), (long long) (vt.room_bytes() >> 20), vis_name(vis_mode));
             v.push_back(b);
         } else if (!vision_err.empty()) {   // (the server offers no pictures and says why)
             std::string why = vision_err;
@@ -16868,6 +17050,12 @@ int Model::dim() const { return p_->g.dim; }
 bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<uint16_t>& span, std::string& err) {
     return p_->encode_image(rgb, width, height, span, err);
 }
+void Model::vision_hold() { p_->vis_hold = true; }
+bool Model::vision_release() {
+    p_->vis_hold = false;
+    return p_->vision_release();
+}
+void Model::set_vision_note(std::function<void()> note) { p_->vis_note = std::move(note); }
 void Model::set_images(std::vector<Image> images) {
     std::sort(images.begin(), images.end(), [](const Image& a, const Image& b) { return a.start < b.start; });
     p_->imgs = std::move(images);

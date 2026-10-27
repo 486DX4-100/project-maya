@@ -3880,7 +3880,8 @@ def ds4_pack_has_vision(pack: Path) -> bool:
 
 def ds4_vision_blocker(pc: dict) -> str | None:
     """Why the vision tower cannot run on this PC, or None: it needs ~1 GB of RAM (its weights, streamed from there)
-    and ~350 MB of the first GPU's memory - every GPU the GGUF path runs on has the BF16 matrix products it uses."""
+    and, while a picture is read, ~320 MB of the first GPU's memory (lent, none between pictures) - every GPU the GGUF
+    path runs on has the BF16 matrix products it uses."""
     total = mem_gb()[0]
     if 0 < total < 16:
         return f"{total:.0f} GB of RAM is too little beside the model"
@@ -3902,8 +3903,8 @@ def ds4_vision_step(a, pc: dict, d: Path) -> bool:
         return False
     v = ds4_vision_dir(d)
     if (v / "vision.bin").is_file() and (v / "vision.json").is_file():
-        ok(f"the vision tower: {v / 'vision.bin'} (on the first GPU, about 320 MB of its memory, the weights streamed "
-           "from RAM; the server resizes the pictures)")
+        ok(f"the vision tower: {v / 'vision.bin'} (its weights in RAM; no VRAM between pictures - about 320 MB of the "
+           "first GPU's while one is read; the server resizes the pictures)")
         return True
     if not os.access(existing(v), os.W_OK):
         warn(f"{existing(v)} is not writable: no vision tower, the model reads text only")
@@ -3925,8 +3926,8 @@ def ds4_vision_step(a, pc: dict, d: Path) -> bool:
         return False
     for f in files:                                    # (the setup's own download, now in vision.bin)
         f.unlink(missing_ok=True)
-    ok(f"the vision tower: {v / 'vision.bin'} (on the first GPU, about 320 MB of its memory, the weights streamed from "
-       "RAM; the server resizes the pictures)")
+    ok(f"the vision tower: {v / 'vision.bin'} (its weights in RAM; no VRAM between pictures - about 320 MB of the first "
+       "GPU's while one is read; the server resizes the pictures)")
     return True
 
 
@@ -4283,8 +4284,8 @@ def set_up_ds4(a, prev: dict) -> Path | None:
         if a.no_vision:
             ok("skipped (--no-vision): the model reads text only")
         else:
-            ok("the model's own vision tower runs in the engine, on the first GPU (about 320 MB of its memory, the "
-               "weights streamed from RAM); the server resizes the pictures")
+            ok("the model's own vision tower runs in the engine: its weights in RAM, no VRAM between pictures (about "
+               "320 MB of the first GPU's while one is read); the server resizes the pictures")
     cfg_path = write_config_ds4(a, pc, meta, pack, ctx, models, d, quant, vision)   # 8
     if (drafter or not gguf) and CDS.has_drafter(read_json(cfg_path)):
         how = drafting_choice(a, "The DSpark drafter", "10-30")

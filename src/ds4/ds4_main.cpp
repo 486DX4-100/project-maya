@@ -478,6 +478,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     SpanCache spans;
     const int img_tok = m.image_token();
+    // the vision tower's room taken for a request's pictures and given back: the VRAM lines again, so the server's
+    // Monitor shows the tower only while it reads them
+    m.set_vision_note([&m] {
+        for (const std::string& l : m.info_lines())
+            if (l.rfind("VRAM ", 0) == 0) std::printf("%s\n", l.c_str());
+        std::fflush(stdout);
+    });
     // CONVERSATION SLOTS: a request that does not continue the conversation in the model first sets that one aside
     // (Model::slot_save: its window rings, the compressors' partial groups and every source's compressed KV and index
     // keys), then takes back the kept conversation this prompt does continue (slot_load) - chats, and an agent's side
@@ -996,6 +1003,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::vector<strata::ds4::Image> imgs;
             const double te = now_ms();
             int encoded = 0;
+            m.vision_hold();   // (one borrowing of the tower's room for all of them, given back before the prompt)
             for (Pic& q : pics) {
                 for (const Pic& x : held)
                     if (x.start == q.start && x.hash == q.hash) q.len = x.len;
@@ -1016,6 +1024,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     break;
                 }
                 imgs.push_back({q.start, rows});
+            }
+            if (!m.vision_release() && ok) {
+                ok = false;
+                err = "vision: the expert slots lent for the pictures were not read back as they were";
             }
             if (ok) {
                 m.set_images(std::move(imgs));

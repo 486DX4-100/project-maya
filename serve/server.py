@@ -668,6 +668,9 @@ class StrataEngine:
 
     def _pump(self):
         for line in self.proc.stdout:
+            if line.startswith("VRAM "):
+                self._vram_line(line)
+                continue
             if self.multi and self._route(line):
                 continue
             self.lines.put(line)
@@ -676,6 +679,13 @@ class StrataEngine:
         with self._routes_lock:
             for q in self._routes.values():
                 q.put(None)
+
+    def _vram_line(self, line: str) -> None:
+        """A VRAM line after the start (maya-ds4: its vision tower's room taken for a request's pictures, then given
+        back): the Monitor's map of that GPU follows it."""
+        part = gpu_map.parse(line)
+        if part:
+            self.vram = [part if v.get("dev") == part["dev"] else v for v in self.vram]
 
     _TAGGED = ("T ", "PP ", "DONE ", "ERR ")
 
@@ -4741,8 +4751,12 @@ def main() -> int:
             # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
             vision = ds4_vision.Vision(ds4_vision.Geometry.from_info(engine.info),
                                        Path(tempfile.mkdtemp(prefix="maya-ds4-pictures-")), Vision.load)
-            print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}, "
-                  f"{engine.info.get('vision_mib')} MiB), up to {vision.g.max_tokens} tokens a picture", flush=True)
+            room = engine.info.get("vision_room")
+            where = (f"{engine.info.get('vision_mib')} MiB kept" if room in (None, "resident") else
+                     f"none between pictures, ~{engine.info.get('vision_room_mib')} MiB while one is read, lent by "
+                     + {"chunk": "the prompt buffers", "tail": "expert slots", "free": "free memory"}.get(room, room))
+            print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}: "
+                  f"{where}), up to {vision.g.max_tokens} tokens a picture", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "mm3":
             # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
             vision = mm3_vision.Vision(mm3_vision.Geometry.from_info(engine.info),

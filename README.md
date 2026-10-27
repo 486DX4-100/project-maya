@@ -78,8 +78,9 @@ results. See [the prompt format notes](docs/deepseek-prompt-format.md) for API d
 - **The DSpark drafter:** with the GGUFs the setup also fetches the model's own drafter (8 GB from Maya's repo:
   DeepSeek's FP4 experts, its dense weights in 8-bit) and measures whether drafting makes your PC faster; it keeps it
   only where it does.
-- **Pictures:** with the GGUFs the setup fetches DeepSeek's vision tower (1 GB of its checkpoint); it runs on the first
-  GPU in about 320 MB. `--no-vision` leaves it out.
+- **Pictures:** with the GGUFs the setup fetches DeepSeek's vision tower (1 GB of its checkpoint). It waits in RAM
+  and takes no VRAM between pictures: while a picture is read it borrows about 320 MB of the first GPU's memory, then
+  gives it back to the model. `--no-vision` leaves it out.
 - **One GPU or several:** the layers are split across the GPUs (pairs of equal GPUs also split each layer where the
   files' formats allow), its thinking levels (Off, Low, High, Max) in the chat, and its own numbers in the monitor.
 - **Strix Halo / Gorgon Halo on Windows:** Windows counts the GPU's share of the memory against its page file, so the

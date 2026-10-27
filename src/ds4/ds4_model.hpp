@@ -210,6 +210,15 @@ public:
     /// rows of its span, BF16 [n_h * (n_w + 1) + 2][dim]: image_start, n_h rows of (n_w aligner rows, image_newline),
     /// image_end.
     bool encode_image(const uint8_t* rgb, int width, int height, std::vector<uint16_t>& span, std::string& err);
+    /// The tower holds no GPU memory between pictures: an encode_image borrows its room (the prompt buffers, expert
+    /// slots, or free memory) and gives it back.  vision_hold(): a request's pictures share one borrowing - the room,
+    /// taken at the first encode_image, stays till vision_release() (before the prompt is fed: its buffers may be the
+    /// lender).
+    void vision_hold();
+    /// false: expert slots lent for the pictures did not come back as they were (the request must fail).
+    bool vision_release();
+    /// Called after the tower's room is taken and after it is given back (the server's Monitor follows the VRAM lines).
+    void set_vision_note(std::function<void()> note);
     /// The pictures of the prompt about to be fed ({}: none): positions inside a span read its rows (and route with
     /// the image bias, and take no part in the Engram n-grams); the rest the embedding table's.
     void set_images(std::vector<Image> images);

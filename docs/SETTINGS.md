@@ -1014,6 +1014,27 @@ split in 3 (n_ff 2304: 768 rows a member, whole 256-value blocks) and not in 2.
 | --- | --- | --- |
 | `DS4_TP_UNEVEN_HEADS` | off | `1`: keep a width the heads do not split in evenly. The heads go over the most members they split among evenly (64 heads over 3: 2 members of 32), the remaining member computes only its FFN share, as a non-GGUF pack's group does; a BF16 / Q8_0 head whose vocabulary does not split evenly takes 128-column shares. The FFN must still split in whole blocks |
 
+## DeepSeek: pictures without VRAM between them
+
+DeepSeek's vision tower keeps its weights (about 1 GB) in RAM and holds no VRAM between pictures, so that memory
+goes to the model's experts. A picture borrows about 320 MB of the first GPU's memory while it is read, and the
+engine gives it back before the prompt is read. Where the memory comes from depends on the setup:
+
+- Usually it is the prompt buffers, which are idle between prompts. This costs nothing.
+- On one GPU with unsloth's GGUFs, the prompt path borrows expert slots of its own, and a picture borrows those same
+  slots. The experts in them are read back afterwards, as after a long prompt. A tensor-parallel group's borrowed
+  slots (`DS4_TP_BORROW`) are not lent to pictures: there the tower keeps its room if the prompt buffers are smaller.
+- Otherwise, a picture takes free memory while it is read.
+
+The pictures of one request share a single borrowing. The monitor's GPU map shows the vision tower only while a
+picture is being read. The picture itself is read exactly as before. When prompts run in windows
+(`--prefill-chunk 0`), there are no prompt buffers to lend, so the tower keeps its room for the whole run, as before
+v1.1.31.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `MAYA_DS4_VISION_RESIDENT` | off | `1`: the tower keeps its ~320 MB on the first GPU for the whole run (as before v1.1.31) |
+
 ## MiniMax-M3.1-Flash
 
 `./maya.sh --setup --model MiniMax-M3.1-Flash` writes `maya-mm3.json` (Maya's GGUF quants: their own, below) with what fits this PC: the context (below), the

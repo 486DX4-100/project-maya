@@ -373,6 +373,21 @@ class GpuMap(unittest.TestCase):
         eng.vram = []
         self.assertIsNone(svc.metrics()["gpu_map"])             # (an engine without VRAM lines: no card)
 
+    def test_later_lines_follow_a_picture(self):
+        """maya-ds4 prints its VRAM lines again when a picture's room is lent to its vision tower and when it is given
+        back: the map of that GPU follows them, the others stay."""
+        from types import SimpleNamespace
+        from serve.server import StrataEngine
+        other = dict(self.r, dev=1, pci="0000:02:00")
+        eng = SimpleNamespace(vram=[self.r, other])
+        lent = LINE.replace("vision=0", "vision=0 vision_own=334495744").replace("pool=15536793108", "pool=15202297364")
+        StrataEngine._vram_line(eng, lent)
+        self.assertEqual((eng.vram[0]["vision_own"], eng.vram[0]["pool"], eng.vram[1]), (334495744, 15202297364, other))
+        StrataEngine._vram_line(eng, LINE)
+        self.assertEqual(eng.vram, [self.r, other])
+        StrataEngine._vram_line(eng, "VRAM nonsense\n")      # (not a GPU's line: nothing changes)
+        self.assertEqual(eng.vram, [self.r, other])
+
 
 class GpuRelease(unittest.TestCase):
     """A reload starts the new engine only once the GPUs have dropped the old one (its memory is freed after it ends)."""
