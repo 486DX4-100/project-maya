@@ -1313,11 +1313,14 @@ void q8_round(const float* x, int k, int8_t* q, float* d, cudaStream_t s) {
         q8_quant(x, (size_t) k, 1, k, q, d, s);
 }
 
+// (the low-bit types ds4_iq's GEMVs take: the routed experts' and the dense matrices' beside them - Q6_K, as
+//  orcarouter's mixes and maya-mm3's GGUFs hold some; a routed expert's own: expert_type_ok)
 size_t type_row_bytes(int type, int64_t k) {
     if (type == kTypeMXFP4) return k % kMxBlock == 0 ? mx_row_bytes(k) : 0;
-    return iq::supported(type) && k % 256 == 0 ? iq::row_bytes(type, k) : 0;
+    return iq::mv_supported(type) && k % iq::block_values(type) == 0 ? iq::row_bytes(type, k) : 0;
 }
-int type_block(int type) { return type == kTypeMXFP4 ? kMxBlock : iq::supported(type) ? 256 : 0; }
+int type_block(int type) { return type == kTypeMXFP4 ? kMxBlock : iq::mv_supported(type) ? iq::block_values(type) : 0; }
+bool expert_type_ok(int type) { return type == kTypeMXFP4 || iq::supported(type); }
 const char* type_name(int type) { return type == kTypeMXFP4 ? "MXFP4" : iq::name(type); }
 
 namespace {

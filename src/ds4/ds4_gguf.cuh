@@ -44,10 +44,13 @@ inline int expert_type(const x3::ExpertLayout& l, int r) { return l.gg_type[r] =
 inline bool mx_experts(const x3::ExpertLayout& l) {
     return expert_type(l, 0) == kTypeMXFP4 && expert_type(l, 1) == kTypeMXFP4 && expert_type(l, 2) == kTypeMXFP4;
 }
-/// Bytes of a row of k values of an expert type (0: not one the device kernels take, or k not whole blocks).
+/// Bytes of a row of k values of a type the device kernels take - MXFP4, a routed expert's low-bit type, or a dense
+/// matrix's beside them (Q6_K) - 0: not one, or k not whole blocks.
 size_t type_row_bytes(int type, int64_t k);
-/// Values a block of an expert type (32: MXFP4, 256: the low-bit ones; 0: neither).
+/// Values a block of such a type (32: MXFP4, 256: the K and IQ types; 0: none).
 int type_block(int type);
+/// Whether a routed expert may be of this type (MXFP4, or one ds4_iq's expert kernels take).
+bool expert_type_ok(int type);
 /// The type's name (ggml's), "?" when unknown.
 const char* type_name(int type);
 

@@ -6,6 +6,7 @@ No GPU, no network.
     python -m unittest tools.test_setup_ds4 -v
 """
 from pathlib import Path
+import hashlib
 import json
 import re
 import sys
@@ -490,49 +491,109 @@ class Gguf(unittest.TestCase):
 
 
 class Abliterated(unittest.TestCase):
-    """orcarouter's abliterated model as GGUFs (--ds4-quant abliterated): Mix-256G's 7 shards pinned in
-    download_gguf.json, in <models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Mix-256G, served under a name of its own;
-    its repo is gated, so the download sends the user's Hugging Face token (never on a command line)."""
+    """orcarouter's abliterated model as GGUFs (--ds4-quant abliterated-128g / abliterated-256g, abliterated: the one this
+    PC holds): both versions pinned in download_gguf.json at one revision, each in
+    <models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/<version>, served under a name of its own; each one's shard 2 (the
+    n-gram table alone) listed but never fetched - Maya's Q6_K tables are read instead; the repo is gated, so the
+    download sends the user's Hugging Face token (never on a command line)."""
     REPO = "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF"
-    REV = "43fac7992b3d6e750b2e4a52569c1f097c67cd8f"
 
     def test_manifest_and_urls(self):
-        m = maya.ds4_gguf_model("abliterated")
-        self.assertEqual((m["format"], m["folder"], m["repo"], m["revision"], m.get("gated")),
-                         ("ds4-gguf", "Mix-256G", self.REPO, self.REV, True))
-        self.assertEqual(sorted(m["files"]), ["DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-%05d-of-00007.gguf" % i
-                                              for i in range(1, 8)])
-        for n in m["files"]:
-            self.assertRegex(m["sha256"][n], r"^[0-9a-f]{64}$")
-        self.assertEqual(m["files"]["DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00002-of-00007.gguf"], 110595290592)
-        self.assertAlmostEqual(m["download_gb"], 346.38, delta=0.01)
-        self.assertEqual(maya.file_url(m, "DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00001-of-00007.gguf"),
-                         f"https://huggingface.co/{self.REPO}/resolve/{self.REV}/Mix-256G/"
-                         "DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00001-of-00007.gguf")
+        rev = maya.read_json(maya.DS4_GGUF_MANIFEST)["abliterated"]["revision"]
+        self.assertTrue(rev.startswith("349470a09c1f"))
+        for q, n, gb in (("abliterated-128g", 5, 113.98), ("abliterated-256g", 7, 235.78)):
+            m = maya.ds4_gguf_model(q)
+            v = maya.DS4_QUANTS[q]
+            name = "DeepSeek-V4.1-Flash-1017-abliterated-%s-%%05d-of-%05d.gguf" % (v, n)
+            self.assertEqual((m["format"], m["folder"], m["repo"], m["revision"], m.get("gated")),
+                             ("ds4-gguf", v, self.REPO, rev, True))
+            self.assertEqual(m["table"], name % 2)                     # (listed, left out)
+            self.assertEqual(sorted(m["files"]), [name % i for i in range(1, n + 1) if i != 2])
+            for f in m["files"]:
+                self.assertRegex(m["sha256"][f], r"^[0-9a-f]{64}$")
+            self.assertAlmostEqual(m["download_gb"], gb, delta=0.01)
+            self.assertEqual(maya.file_url(m, name % 1), f"https://huggingface.co/{self.REPO}/resolve/{rev}/{v}/" + name % 1)
+        man = maya.read_json(maya.DS4_GGUF_MANIFEST)["abliterated"]
+        for v in ("Mix-128G", "Mix-256G"):   # (the table shard keeps its size and sha256 in the manifest)
+            q = man["quants"][v]
+            self.assertEqual(q["files"][q["table"]][0], 110595290592)
         self.assertNotIn("gated", maya.ds4_gguf_model("gguf-q8"))
 
     def test_choice_folder_and_name(self):
-        rows = []
+        rows, tags = [], []
         def pick(title, intro, opts, default, yes, *x):
             rows.extend(o[0] for o in opts)
+            tags.extend(o[1] for o in opts)
             return default
         with patch.object(maya, "say", lambda *a: None), patch.object(maya.S, "UI", None), \
-                patch.object(maya.S, "gpus", return_value=[{"arch": 86}]), patch.object(maya, "choose", pick):
-            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="abliterated"), {}), "abliterated")
-            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-s")   # (offered, not the default)
-            self.assertIn("DeepSeek V4.1 · Abliterated Mix-256G (346 GB)", rows)
-            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {"installer": {"ds4_quant": "abliterated"}}),
-                             "abliterated")
-        self.assertEqual(maya.ds4_dir(args(), Path("/models"), {}, "abliterated"),
+                patch.object(maya.S, "gpus", return_value=[{"arch": 86, "vram_gb": 24}]), patch.object(maya, "choose", pick):
+            for ram, want in ((128, "abliterated-128g"), (256, "abliterated-256g")):   # (VRAM + RAM: the one that fits)
+                with patch.object(maya, "mem_gb", return_value=(ram, ram)):
+                    self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="abliterated"), {}), want)
+            with patch.object(maya, "mem_gb", return_value=(128, 128)):
+                self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-s")   # (offered, not the default)
+            maya_rows = [r for r in rows if "Maya-" in r]
+            i = rows.index("DeepSeek V4.1 · orcarouter Abliterated Mix-128G (275 GB)")   # (the n-gram tables included)
+            self.assertEqual(rows[i + 1], "DeepSeek V4.1 · orcarouter Abliterated Mix-256G (397 GB)")
+            self.assertEqual(rows[:i], maya_rows)                                   # (right below the Maya quants)
+            self.assertEqual(tags[i], "abliterated: fits this PC")
+            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {"installer": {"ds4_quant": "abliterated-256g"}}),
+                             "abliterated-256g")
+        self.assertEqual(maya.ds4_dir(args(), Path("/models"), {}, "abliterated-256g"),
                          Path("/models") / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Mix-256G")
         root = Path(tempfile.mkdtemp())
         with patch.object(maya, "ROOT", root), patch.object(maya, "say", lambda *a: None), \
                 patch.object(maya, "ok", lambda *a: None), patch.object(maya, "step", lambda *a: None):
-            for q, name in (("abliterated", "deepseek-v4.1-flash-abliterated"), ("gguf-q8", maya.DS4_MODEL_NAME)):
+            for q, name in (("abliterated-128g", "deepseek-v4.1-flash-abliterated"), ("gguf-q8", maya.DS4_MODEL_NAME)):
                 p = maya.write_config_ds4(args(), {"gpus": [{"index": 0}]}, {}, Path("/m/A/maya-ds4"), 65536,
                                           Path("/models"), Path("/m/A"), q)
                 c = json.loads(p.read_text())
                 self.assertEqual((c["model_name"], c["installer"]["ds4_quant"]), (name, q))
+
+    def test_engram_linked_from_a_maya_quant(self):
+        """Maya's Q6_K tables for an orcarouter version: hard-linked from a Maya quant beside it (no second copy), the
+        sha256 its own folder checked once taken over; else downloaded."""
+        models = Path(tempfile.mkdtemp())
+        man = json.loads(maya.DS4_GGUF_MANIFEST.read_text(encoding="utf-8"))
+        pair = man["abliterated"]["engram"]["from"]["Maya-XS"]
+        src = models / "DeepSeek-V4.1-Flash-1017-Maya-GGUF" / "Maya-XS"
+        src.mkdir(parents=True)
+        small = {}
+        for n in pair:   # (small files standing in for the 80 GB shards: the manifest's sizes patched to theirs)
+            f = src / Path(n).name
+            f.write_bytes(Path(n).name.encode() * 3)
+            small[n] = [f.stat().st_size, hashlib.sha256(f.read_bytes()).hexdigest()]
+        man["maya"]["quants"]["Maya-XS"]["files"].update(small)
+        d = models / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Mix-128G"
+        d.mkdir(parents=True)
+        real = maya.read_json
+        with patch.object(maya, "read_json", lambda p: man if Path(p) == maya.DS4_GGUF_MANIFEST else real(p)), \
+                patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None), \
+                patch.object(maya, "offer_download") as dl:
+            e = maya.ds4_abl_engram_step(args(), d, models)
+        dl.assert_not_called()
+        self.assertEqual(e, d.parent / "Engram-Q6_K")
+        for n in pair:
+            self.assertEqual((e / Path(n).name).stat().st_ino, (src / Path(n).name).stat().st_ino)   # (one file)
+        with patch.object(maya, "read_json", lambda p: man if Path(p) == maya.DS4_GGUF_MANIFEST else real(p)):
+            self.assertTrue(maya.ds4_abl_engram_there(d, models))
+            self.assertFalse(maya.ds4_abl_engram_there(Path(tempfile.mkdtemp()) / "A" / "Mix-128G", Path(tempfile.mkdtemp())))
+
+    def test_free_space_counts_the_tables_when_needed(self):
+        """The model step's free-space check adds the n-gram tables the setup downloads after it (also_gb) - only when
+        no copy is there to use."""
+        m = dict(maya.ds4_gguf_model("abliterated-128g"))
+        d = Path(tempfile.mkdtemp()) / "Mix-128G"
+        shards = [d / n for n in m["files"]]
+        free = (m["download_gb"] + 10) * 1e9
+        with patch.object(maya, "say", lambda *a: None), patch.object(maya, "hf_token", return_value="t"), \
+                patch.object(maya.shutil, "disk_usage", return_value=SimpleNamespace(free=free)), \
+                patch.object(maya, "ask", return_value="n"):
+            self.assertFalse(maya.offer_download(args(download_model=False), "x", d, shards, m))   # (room: asked, no)
+            with self.assertRaises(SystemExit):
+                maya.offer_download(args(download_model=False), "x", d, shards,
+                                    dict(m, also_gb=maya.ds4_abl_engram_gb(), also_what="the tables"))
+        self.assertAlmostEqual(maya.ds4_abl_engram_gb(), 161.28, delta=0.01)
 
     def test_token(self):
         home = Path(tempfile.mkdtemp())
@@ -570,7 +631,7 @@ class Abliterated(unittest.TestCase):
         self.assertFalse(f.exists() or f.parent.exists())
 
     def test_no_token_stops_before_downloading(self):
-        m = dict(maya.ds4_gguf_model("abliterated"))
+        m = dict(maya.ds4_gguf_model("abliterated-256g"))
         d = Path(tempfile.mkdtemp()) / "Mix-256G"
         shards = [d / n for n in m["files"]]
         said = []
@@ -578,7 +639,7 @@ class Abliterated(unittest.TestCase):
                 patch.object(maya, "fetch_files") as fetch, patch.object(maya.shutil, "disk_usage",
                                                                          return_value=SimpleNamespace(free=10 ** 13)), \
                 self.assertRaises(SystemExit):
-            maya.offer_download(args(download_model=True), "abliterated", d, shards, m)
+            maya.offer_download(args(download_model=True), "abliterated-256g", d, shards, m)
         fetch.assert_not_called()
         self.assertTrue(any("gated" in str(x) for x in said))
         self.assertTrue(any("Authorization: Bearer $HF_TOKEN" in str(x) or "%HF_TOKEN%" in str(x) for x in said))

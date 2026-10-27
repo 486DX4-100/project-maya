@@ -2473,7 +2473,7 @@ struct Model::Impl {
             const Tensor* t0 = pk.get(P + "0." + parts[r] + ".weight");
             const Tensor* t1 = l.n_exp > 1 ? pk.get(P + "1." + parts[r] + ".weight") : t0;
             const int ty = t0 != nullptr ? gg_type_of(t0->dtype) : -1;
-            const size_t bytes = ty > 0 ? (size_t) n * gg::type_row_bytes(ty, k) : 0;
+            const size_t bytes = ty > 0 && gg::expert_type_ok(ty) ? (size_t) n * gg::type_row_bytes(ty, k) : 0;
             if (t0 == nullptr || t1 == nullptr || bytes == 0 || t0->bytes != bytes) {
                 err = P + "0." + parts[r] + ": not an MXFP4 or low-bit [" + std::to_string(n) + "][" + std::to_string(k) +
                       "] matrix the engine reads (" + (t0 != nullptr ? t0->dtype : std::string("missing")) + ")";
@@ -3606,16 +3606,17 @@ struct Model::Impl {
             const Tensor* t = pk.get("embed.weight");
             const size_t nv = (size_t) g.vocab * g.dim;
             const bool q8 = t != nullptr && t->dtype == "Q8_0" && t->bytes == nv / 32 * gg::kQ8Bytes;
-            // (Q5_K: 176 bytes every 256 values; Q6_K: 210)
+            // (Q4_K: 144 bytes every 256 values; Q5_K: 176; Q6_K: 210)
+            const bool q4k = t != nullptr && t->dtype == "Q4_K" && g.dim % 256 == 0 && t->bytes == nv / 256 * 144;
             const bool q5k = t != nullptr && t->dtype == "Q5_K" && g.dim % 256 == 0 && t->bytes == nv / 256 * 176;
             const bool q6k = t != nullptr && t->dtype == "Q6_K" && g.dim % 256 == 0 && t->bytes == nv / 256 * kQ6kBytes;
-            if (t == nullptr || (!q8 && !q5k && !q6k && (t->dtype != "BF16" || t->bytes != nv * 2))) {
-                err = "embed.weight: not a BF16 (or Q8_0, Q5_K, Q6_K) [vocab][dim] table";
+            if (t == nullptr || (!q8 && !q4k && !q5k && !q6k && (t->dtype != "BF16" || t->bytes != nv * 2))) {
+                err = "embed.weight: not a BF16 (or Q8_0, Q4_K, Q5_K, Q6_K) [vocab][dim] table";
                 return false;
             }
             if (!halloc(embed_pinned, nv, err)) return false;
-            if (q8 || q5k || q6k) {   // (a GGUF's: each value rounded to BF16, a row at a time)
-                const size_t kb = q5k ? 176 : kQ6kBytes;   // (a K-quant's bytes every 256 values)
+            if (q8 || q4k || q5k || q6k) {   // (a GGUF's: each value rounded to BF16, a row at a time)
+                const size_t kb = q4k ? 144 : q5k ? 176 : kQ6kBytes;   // (a K-quant's bytes every 256 values)
                 std::vector<uint8_t> row(q8 ? (size_t) g.dim / 32 * gg::kQ8Bytes : (size_t) g.dim / 256 * kb);
                 for (size_t r = 0; r < (size_t) g.vocab; ++r) {
                     if (!pk.read_at(t->file, t->off + r * row.size(), row.size(), row.data())) {
@@ -3628,7 +3629,7 @@ struct Model::Impl {
                     } else {
                         v.resize((size_t) g.dim);
                         for (size_t b = 0; b < (size_t) g.dim / 256; ++b)
-                            (q5k ? q5k_values : q6k_values)(row.data() + b * kb, v.data() + b * 256);
+                            (q4k ? q4k_values : q5k ? q5k_values : q6k_values)(row.data() + b * kb, v.data() + b * 256);
                     }
                     for (size_t c = 0; c < (size_t) g.dim; ++c) {
                         uint32_t u;
