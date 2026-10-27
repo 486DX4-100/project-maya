@@ -485,11 +485,11 @@ class MiniMaxExl3Folder(Tmp):
             self.assertEqual((cfg["installer"]["mm3_quant"], cfg["installer"]["own"], cfg["installer"]["model_dir"]),
                              ("exl3", True, str(d)))
             self.assertEqual(pinned.read_text(), before)                      # (the pinned quant's config is not touched)
-            cfg["sampling"] = {"temperature": 0.2}                             # (edited by the user: a setup again keeps it)
-            path.write_text(json.dumps(cfg))
+            cfg["sampling"] = {"temperature": 0.2}                             # (edited by hand: a setup again writes the
+            path.write_text(json.dumps(cfg))                                   #  model's own, as for every model)
             again = json.loads(maya.write_config_mm3(self.a, pc, {"lib_dirs": []}, pack, 65536, self.root / "models",
                                                      d, "exl3", True).read_text())
-            self.assertEqual(again["sampling"], {"temperature": 0.2})
+            self.assertEqual(again["sampling"], {"temperature": 0.5, "top_p": 0.8})
 
     def test_a_folder_with_no_sampling_of_its_own_gets_minimaxs(self):
         d = self.own(gen={"bos_token_id": 1, "eos_token_id": 2})
