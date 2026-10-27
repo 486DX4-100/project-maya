@@ -406,16 +406,24 @@ size_t block_bytes(int t) {
 }  // namespace
 
 bool enabled() {
+#if defined(STRATA_USE_HIP)
+    return false;   // (CUDA only: HIP's compiler fuses these kernels' multiplies and adds unlike ds4_iq's mv - other bits)
+#else
     static const bool on = [] {
         const char* v = ::mm3::env("MM3_GV");
         return v == nullptr || std::atoi(v) != 0;
     }();
     return on;
+#endif
 }
 
 bool needs_sums(int type) { return type == kQ4_K || type == kQ5_K; }
 
 bool covered(const Job& j) {
+#if defined(STRATA_USE_HIP)
+    (void) j;
+    return false;
+#endif
     const size_t bb = block_bytes(j.type);
     if (bb == 0 || j.w == nullptr || j.ncol < 1 || j.ncol > 16 || j.n < 1 || j.k < 256) return false;
     const int qk = j.type == kQ8_0 ? 32 : 256;

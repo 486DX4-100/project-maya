@@ -669,7 +669,12 @@ void test_gv(cudaStream_t s) {
                 const std::vector<float> h0 = host(y0, (size_t) nc * n), h1 = host(y1, (size_t) nc * n);
                 char what[96];
                 std::snprintf(what, sizeof what, "gv %s k %d, %d activations = ds4_iq's mv", iq::name(t), k, nc);
-                if (!cov && t == iq::kQ6_K && k % 1024 != 0) {   // (Q6_K rows of 3072: ds4_iq's mv - not covered)
+#if defined(STRATA_USE_HIP)
+                const bool hip = true;   // (HIP: the GEMVs stay ds4_iq's - mm3_gv covers nothing there)
+#else
+                const bool hip = false;
+#endif
+                if (!cov && (hip || (t == iq::kQ6_K && k % 1024 != 0))) {   // (Q6_K rows of 3072: ds4_iq's mv)
                     std::printf("%-52s ok    not covered (ds4_iq's mv)\n", what);
                 } else if (!r0 || !r1) {
                     ++g_fail;

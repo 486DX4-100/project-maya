@@ -42,7 +42,8 @@ bool covered(const Job& j);
 bool needs_sums(int type);
 /// The jobs (each covered, ncol <= 16), grouped by type a launch.  false: one not covered (nothing launched for it).
 bool run(const Job* jobs, int n, cudaStream_t s);
-/// MAYA_MM3_GV=0: every job through ds4_iq's mv (as before).  On by default.
+/// MAYA_MM3_GV=0: every job through ds4_iq's mv (as before).  On by default - CUDA only: on HIP the compiler contracts
+/// these kernels' multiplies and adds otherwise than ds4_iq's mv (other bits), so HIP keeps ds4_iq's mv (covered false).
 bool enabled();
 
 }  // namespace mm3::gv
