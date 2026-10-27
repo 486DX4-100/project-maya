@@ -700,6 +700,8 @@ struct Chunk {
         const uint8_t* src[3] = {nullptr, nullptr, nullptr};   // where its gate / up / down (its parts) lie once read
         const uint8_t* ram = nullptr;                  // its RAM-tier blob, copied into staging (not pinned there)
         uint8_t* keep = nullptr;                       // (layer-major) its layer-cache slot: what is read kept there
+        const uint8_t* hsrc = nullptr;                 // (DS4_FLOW_HELPER) its blob in the helper's pool, copied into
+                                                       // staging out of the helper's memory instead of read
         int64_t after = -1;                            // (layer-major) the items up to this one read first
         std::atomic<int> left{0};                      // parts still being read
         std::atomic<bool> bad{false};
@@ -725,6 +727,9 @@ struct Chunk {
     double wait_ms = 0;                      // the compute waiting for a read
     uint64_t it_file = 0, it_ram = 0, it_spec = 0, it_spec_unused = 0;
     uint64_t io_d0 = 0, io_b0 = 0;           // io's unbuffered / buffered bytes when the run started
+    uint64_t it_helper = 0, io_h0 = 0;       // (DS4_FLOW_HELPER) items out of the helper's pool; io's bytes of
+                                             // them when the run started
+    uint64_t chk_n = 0;                      // (DS4_FLOW_HELPER_CHECK) the run's items compared with the files
     bool buffered = false;                   // the run's reads all through the page cache (a short run: run_dev_chunks)
     // layer-major (a run of several chunks, every layer on this device): the layers one after another, each through
     // all the chunks; a chunk's state between its layers (h | pre | topk | cand, chunk k at k chunk_hand_bytes()) in
@@ -1058,6 +1063,24 @@ struct Model::Impl {
     unsigned mk_seq = 0;
     int d_dev = 0;                    // the drafter's first block's device
     std::vector<int> draft_dev;       // DS4_DRAFT_DEV: each block's member of the drafter's group (draft_devs; empty: the lead)
+    // DS4_FLOW_HELPER=1: the prompt's streamed experts the helper holds in its pool copied into staging out of the
+    // helper's memory instead of read from the model's files - the same bytes, so the same results; the decode is not
+    // touched.  DS4_FLOW_HELPER_CHECK=N: the load's first N prompt runs compare every such item with the files (each
+    // read again, so those runs time nothing), a difference failing the prompt; each member of such a run ends with its
+    // check line.  (Tests) DS4_FLOW_HELPER_FAIL=copy: the first such copy fails as a failed read would; =check: the
+    // first compared item's file bytes altered, the check must fail the prompt
+    bool flow_helper = ds4_env("DS4_FLOW_HELPER") != nullptr && std::atoi(ds4_env("DS4_FLOW_HELPER")) != 0;
+    const int flow_check_runs =
+        ds4_env("DS4_FLOW_HELPER_CHECK") ? std::max(0, std::atoi(ds4_env("DS4_FLOW_HELPER_CHECK"))) : 0;
+    int flow_check_done = 0;          // (the main thread's) the runs checked so far
+    bool flow_check_now = false;      // this run compares its pool items (set before its devices start)
+    const std::string flow_helper_fail = std::getenv("DS4_FLOW_HELPER_FAIL") ? std::getenv("DS4_FLOW_HELPER_FAIL") : "";
+    std::atomic<bool> flow_fail_armed{true};   // (DS4_FLOW_HELPER_FAIL: once a load)
+    // (an IoQueue thread's copy of a pool's part to pinned staging: the helper is integrated, its memory the host's)
+    static bool helper_copy(int dev, void* dst, const void* src, size_t n) {
+        return cudaSetDevice(dev) == cudaSuccess && cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+    static bool helper_copy_fail(int, void*, const void*, size_t) { return false; }   // (DS4_FLOW_HELPER_FAIL=copy)
     bool spec_win = false;            // the window being run is a draft's verification (layer() keeps backups)
     float* h_taps = nullptr;          // pinned [kWin][targets][dim]: the last window's taps (each block device's seeding
                                       // read it: Dev::ev_seed; the next window's taps wait for every one, wait_seed)
@@ -4220,6 +4243,29 @@ struct Model::Impl {
         return r < 2 && l.nm > 1 ? (size_t) member(l, m).ffn * gg::type_row_bytes(gg::expert_type(l.lay, r), g.dim)
                                  : mx_part_bytes(l, r);
     }
+    // (DS4_FLOW_HELPER_CHECK) item it's parts as copied out of the helper's pool against the same ranges read from the
+    // model's files: false (err set) on any difference.  (Any thread: the device's own)
+    bool flow_helper_same(const Layer& l, const Chunk::Item& it, std::string& err) {
+        std::vector<uint8_t> f;
+        for (int r = 0; r < 3; ++r) {
+            const uint64_t off = l.mx_off[r] + (uint64_t) it.e * l.mx_stride[r] + mx_read_off(l, it.mi, r);
+            const size_t n = mx_read_len(l, it.mi, r);
+            f.resize(n);
+            if (!pk.read_at(l.mx_file[r], off, n, f.data())) {
+                err = "DS4_FLOW_HELPER_CHECK: reading layer " + std::to_string(l.il) + " expert " +
+                      std::to_string(it.e) + " from the files failed";
+                return false;
+            }
+            if (r == 0 && flow_helper_fail == "check" && flow_fail_armed.exchange(false)) f[0] ^= 1;   // (the test's)
+            if (std::memcmp(f.data(), it.src[r], n) != 0) {
+                err = "DS4_FLOW_HELPER_CHECK: layer " + std::to_string(l.il) + " expert " + std::to_string(it.e) +
+                      " member " + std::to_string(it.mi) + " matrix " + std::to_string(r) +
+                      ": the helper's pool differs from the model's files";
+                return false;
+            }
+        }
+        return true;
+    }
     // (DS4_FLOW_TP with DS4_TP_GGUF_UNEVEN) the down scratch device di's flow copies a member's part through: the whole
     // down of its largest split layer.  0 - no scratch - for one GPU's layers, a load without the flow for its groups,
     // or an even split's members (DS4_FLOW_TP without the knob), whose down part keeps its 2D copy (flow_copy)
@@ -4286,8 +4332,13 @@ struct Model::Impl {
         }
         if (in_ram)   // (copied into staging by io, then DMA'd; copy_mode: from its NH parts, flow_pump)
             it.ram = copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0] : ram_slots[(size_t) l.ram[(size_t) e]];
+        // (DS4_FLOW_HELPER) one in the helper's pool: copied into staging out of it by io, then DMA'd as a read's
+        const bool from_helper =
+            !in_ram && flow_helper && helper_owned(l, e) && !helper_dead.load(std::memory_order_relaxed);
+        if (from_helper) it.hsrc = l.helper[(size_t) e];
         bool hit = false;
-        if (!in_ram && c.lc != nullptr && l.nm == 1) {   // layer-major: from the layer cache, or kept for the chunks after
+        // layer-major: from the layer cache, or kept for the chunks after
+        if (!in_ram && !from_helper && c.lc != nullptr && l.nm == 1) {
             const size_t i = c.base + c.items.size() - 1, stride = (l.blob + 63) & ~(size_t) 63;
             if (c.lc_il != l.il) {   // (a layer's first item: the slots the layer before used are its own again
                 c.lc_il = l.il;      // once that layer's items are all read - `after` below)
@@ -4313,11 +4364,11 @@ struct Model::Impl {
         uint8_t* sb = c.stage + (size_t) it.stage * c.stage_stride;
         for (int r = 0; r < 3; ++r) {
             const uint64_t off = l.mx_off[r] + (uint64_t) e * l.mx_stride[r] + mx_read_off(l, mi, r);
-            it.src[r] = sb + (in_ram || hit ? 0 : off % os::kDirectAlign);
+            it.src[r] = sb + (in_ram || hit || from_helper ? 0 : off % os::kDirectAlign);
             sb += flow_region(r);
         }
         it.left.store(in_ram && copy_mode ? 3 * NH : 3, std::memory_order_relaxed);
-        ++(in_ram ? c.it_ram : hit ? c.it_lc : c.it_file);
+        ++(in_ram ? c.it_ram : hit ? c.it_lc : from_helper ? c.it_helper : c.it_file);
     }
     // the likely experts of (chunk k, layer il) for T tokens, first in its stream: the CPU lane's experts whose chance
     // to be picked at least once, 1 - (1 - share)^(picks), is at least DS4_SPEC_Q (0.9: the reads are what takes the
@@ -4483,7 +4534,23 @@ struct Model::Impl {
                         sb += flow_region(r);
                         continue;
                     }
+                    if (it.hsrc != nullptr) {   // (DS4_FLOW_HELPER) the member's part of matrix r out of the pool
+                        IoQueue::Job& j = jobs[nj++];
+                        j = IoQueue::Job{};
+                        j.len = mx_read_len(l, it.mi, r);
+                        j.dst = sb;
+                        j.left = &it.left;
+                        j.bad = &it.bad;
+                        j.dmem = it.hsrc + l.lay.trellis[r] + mx_read_off(l, it.mi, r);
+                        j.ddev = helper_id;
+                        j.dcopy = flow_helper_fail == "copy" && flow_fail_armed.exchange(false)
+                                      ? &Model::Impl::helper_copy_fail
+                                      : &Model::Impl::helper_copy;
+                        sb += flow_region(r);
+                        continue;
+                    }
                     IoQueue::Job& j = jobs[nj++];
+                    j = IoQueue::Job{};   // (a job before it in jobs may have been one of the pool's copies)
                     const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[r]];
                     j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
                     j.dfd = pk.dfds.empty() || c.buffered ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
@@ -4521,6 +4588,10 @@ struct Model::Impl {
             const size_t r = c.n_dma % R;
             if (c.n_dma >= R) CK(cudaStreamWaitEvent(c.cs, c.ring_free[r], 0));
             const Layer& l = L[(size_t) it.il];
+            if (it.hsrc != nullptr && flow_check_now) {   // (DS4_FLOW_HELPER_CHECK: this run compares every one)
+                if (!flow_helper_same(l, it, err)) return false;
+                ++c.chk_n;
+            }
             // (staging holds the member's gate / up rows only - a read's and, since #377, a copy's)
             if (!flow_copy(l, it.mi, it.src, false, c.ring + r * c.ring_stride, c.down, c.cs)) {
                 const cudaError_t e = cudaGetLastError();   // (none: the uneven split's member without its down scratch)
@@ -12903,12 +12974,13 @@ struct Model::Impl {
             c.fl_cut_r = run.cut_r;
             c.spec_k = c.spec_il = -1;
             c.wait_ms = 0;
-            c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = 0;
+            c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = c.it_helper = c.chk_n = 0;
             c.lc_il = -1;
             c.lc_used = 0;
             c.lc_first = c.lc_chk = 0;
             c.io_d0 = c.io->direct_bytes();
             c.io_b0 = c.io->buffered_bytes();
+            c.io_h0 = c.io->device_bytes();
             // (a short prompt's reads through the page cache, which keeps them for the decode after it - as the CPU
             // lane's reads in windows did: one V100, Maya-S from an NVMe, decode after 17 tokens 12.7 tokens/s read
             // past the cache, 14.0 after windows; a long one's past it, more than the cache holds - DS4_FLOW_BUFFERED,
@@ -13929,6 +14001,13 @@ struct Model::Impl {
         bool halting = false;
         eg_abort.store(false);
         if (prefetch) prefetch->start();
+        // (DS4_FLOW_HELPER_CHECK: the load's first N runs)
+        flow_check_now = flow_helper && flow_check_done < flow_check_runs;
+        if (flow_check_now) ++flow_check_done;
+        struct CheckEnd {   // (every way out, a failed run's too: the next run decides again)
+            bool& now;
+            ~CheckEnd() { now = false; }
+        } check_end_{flow_check_now};
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, &run, &errs] {
                 std::string e;
@@ -14014,6 +14093,10 @@ struct Model::Impl {
                 const double db = (double) (c.io->direct_bytes() - c.io_d0) / 1e9;
                 const double bb = (double) (c.io->buffered_bytes() - c.io_b0) / 1e9;
                 const double fb = db + bb, rb = (double) c.it_ram * (double) L[0].blob / 1e9;   // (a member: its parts)
+                char hps[96] = "";   // (DS4_FLOW_HELPER: the items out of the helper's pool)
+                if (flow_helper)
+                    std::snprintf(hps, sizeof hps, ", %llu from the helper's pool (%.1f GB)",
+                                  (unsigned long long) c.it_helper, (double) (c.io->device_bytes() - c.io_h0) / 1e9);
                 char lcs[160] = "";
                 if (c.lm)
                     std::snprintf(lcs, sizeof lcs, ", %llu again from the layer cache (layer-major, %d chunks, %.1f GB "
@@ -14021,20 +14104,31 @@ struct Model::Impl {
                 std::fprintf(stderr,
                              "ds4 prompt stream, CUDA%d: %d tokens in %.0f ms; %llu experts streamed: %llu from the files "
                              "(%.1f GB, %.2f GB/s: %.1f GB from the disk unbuffered, %.1f GB through the page cache), %llu "
-                             "from RAM (%.1f GB)%s; %llu likely ones queued early, %llu of them unpicked; the compute waited "
-                             "%.0f ms for reads\n",
-                             devs[di].id, n, ms, (unsigned long long) (c.it_file + c.it_ram + c.it_lc),
+                             "from RAM (%.1f GB)%s%s; %llu likely ones queued early, %llu of them unpicked; the "
+                             "compute waited %.0f ms for reads\n",
+                             devs[di].id, n, ms, (unsigned long long) (c.it_file + c.it_ram + c.it_lc + c.it_helper),
                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
-                             (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
+                             (unsigned long long) c.it_ram, rb, hps, lcs, (unsigned long long) c.it_spec,
                              (unsigned long long) c.it_spec_unused, c.wait_ms);
             }
         }
+        if (flow_check_now)   // (DS4_FLOW_HELPER_CHECK: each member's line, the run's every pool item compared)
+            for (size_t di = 0; di < chunks.size(); ++di) {
+                const Chunk& c = *chunks[di];
+                if (!c.flow) continue;
+                std::fprintf(stderr,
+                             "ds4 prompt stream, CUDA%d: DS4_FLOW_HELPER_CHECK: %llu of %llu items out of the helper's "
+                             "pool compared with the model's files, all bit-identical\n",
+                             devs[di].id, (unsigned long long) c.chk_n, (unsigned long long) c.it_helper);
+            }
+        flow_check_now = false;
         if (pm.on && run.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
             bool tp = false;
             for (const Layer& l : L) tp = tp || l.nm > 1;
             double picked = 0;
             for (const auto& cp : chunks)
-                if (cp != nullptr && cp->flow) picked += (double) (cp->it_file + cp->it_ram) - (double) cp->it_spec_unused;
+                if (cp != nullptr && cp->flow)
+                    picked += (double) (cp->it_file + cp->it_ram + cp->it_helper) - (double) cp->it_spec_unused;
             if (!tp) pm_learn(n, picked);
         }
         if (logits_all) n_logits = (T_last - 1) % kWin + 1;   // (sample() takes the last row of d.logits)
