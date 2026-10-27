@@ -148,6 +148,18 @@ class Config(unittest.TestCase):
         self.assertEqual(a[a.index("--vision") + 1], "off")
         self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"]), ("high", {"temperature": 0.7}, "0.0.0.0"))
 
+    def test_tp_follows_the_gpus_chosen_now(self):
+        """#436 (DeepSeek's, the same rule here): the config before's --tp only for the same GPUs"""
+        nine = {"args": ["--pack", "/old", "--max-context", "65536", "--tp", "4"], "gpu": list(range(9))}
+        a = self.write(args(), nine, gpus=9)["args"]
+        self.assertEqual(a[a.index("--tp") + 1], "4")                      # (the same GPUs: kept)
+        a = self.write(args(), nine, gpus=1)["args"]
+        self.assertNotIn("--tp", a)                                        # (one GPU: no tensor parallel)
+        a = self.write(args(), nine, gpus=5)["args"]
+        self.assertEqual(a[a.index("--tp") + 1], "4")                      # (5 GPUs: 1 + a group of 4, worked out)
+        a = self.write(args(), {"args": ["--tp", "4"], "gpu": [0, 1, 2, 3, 4]}, gpus=3)["args"]
+        self.assertEqual(a[a.index("--tp") + 1], "2")                      # (3 GPUs: 1 + a group of 2)
+
     def test_dspark_measured_as_deepseeks(self):
         """The DSpark drafter: off in the config until this PC's speed calibration (DeepSeek's tool) says it pays."""
         import calibrate_ds4 as CDS

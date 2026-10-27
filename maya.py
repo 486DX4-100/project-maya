@@ -2551,6 +2551,18 @@ def flag_value(args: list, flag: str):
     return args[args.index(flag) + 1] if flag in args[:-1] else None
 
 
+def tp_keepable(old: dict, pc: dict) -> bool:
+    """Whether the config before's --tp (tensor-parallel group size) may stay: it was written for the same GPUs as
+    chosen now (its "gpu" list), and it still fits them.  Else a setup works --tp out again from the GPUs (#436)."""
+    try:
+        now = [int(g["index"]) for g in pc.get("gpus") or []]
+        before = [int(i) for i in old.get("gpu") or []]
+        tp = int(flag_value(old.get("args") or [], "--tp") or 1)
+    except (TypeError, ValueError, KeyError):
+        return False
+    return bool(now) and before == now and 1 <= tp <= len(now)
+
+
 def add_profile(cfg: dict) -> bool:
     """A GLM config with no --expert-profile (written before setup passed one) gets the shipped profile, as a setup
     would write it: an update restarts the installed config without setting up again.  True when `cfg` changed."""
@@ -4019,9 +4031,15 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     args = ["--pack", str(pack), "--max-context", str(ctx), "--tp", str(min(2, gpus))]
     if gpus <= 1 and "--threads" not in args[:-1]:
         args += ["--threads", "on"]
-    kept = keep_args(old.get("args") or [], args, ("--tp", "--prefill-chunk", "--reserve-mib", "--vram-experts",
-                                                    "--cpu-threads", "--threads", "--dspark", "--dspark-conf",
-                                                    "--expert-profile", "--mmap-experts"))
+    # (--tp follows the GPUs chosen now: the config before's is kept only for the same GPUs - #436, two GPUs -> one
+    #  kept --tp 2 and the engine failed later)
+    same_gpus = tp_keepable(old, pc)
+    kept = keep_args(old.get("args") or [], args, (("--tp",) if same_gpus else ()) +
+                     ("--prefill-chunk", "--reserve-mib", "--vram-experts", "--cpu-threads", "--threads", "--dspark",
+                      "--dspark-conf", "--expert-profile", "--mmap-experts"))
+    if not same_gpus and flag_value(old.get("args") or [], "--tp") not in (None, flag_value(args, "--tp")):
+        ok(f"--tp {flag_value(args, '--tp')} for the GPU{'s' if gpus != 1 else ''} chosen now (the config before had "
+           f"--tp {flag_value(old['args'], '--tp')} for GPUs {old.get('gpu')})")
     if getattr(a, "mmap_experts", None):   # given now: written, and a later setup keeps it (issue #422)
         set_arg(args, "--mmap-experts", a.mmap_experts)
         ok(f"the CPU lane's experts: --mmap-experts {a.mmap_experts}")
@@ -4069,7 +4087,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                         "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
     cal = saved_calibration(cfg, any_context=True)     # --tp and the CPU threads tuned on this PC for this quant before
     if cal is not None and isinstance(cal.get("args"), dict):
-        had = [f for f in CAL4.KEYS if f in (old.get("args") or [])[:-1]]   # (the config before's own values win)
+        had = [f for f in CAL4.KEYS if f in (old.get("args") or [])[:-1] and   # (the config before's own values win,
+               (f != "--tp" or same_gpus)]                                       #  its --tp for the same GPUs only)
         new = {k: v for k, v in cal["args"].items() if k not in had}
         if new:
             cfg["args"] = CAL4.apply(cfg["args"], new)
@@ -4419,9 +4438,10 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         args += ["--profile", str(MM3_PROFILE)]
     # (a GGUF: the layer split - the EXL3 config's tensor-parallel settings not kept; pictures / drafting as its pack
     #  has them: a kept --vision on without a tower in the pack dropped)
+    # (--tp: the config before's for the same GPUs only, else worked out again below from the GPUs chosen now - #436)
     keep = ("--chunk", "--staging", "--cpu-threads", "--reserve-gb", "--resident-cap", "--kv-cache", "--kv-streaming",
-            "--kv-resident", "--dspark", "--dspark-conf", "--vision", "--vision-gpu") + (() if gguf else ("--tp",
-                                                                                                           "--cache-gb"))
+            "--kv-resident", "--dspark", "--dspark-conf", "--vision", "--vision-gpu") + \
+        (() if gguf else (("--tp",) if tp_keepable(old, pc) else ()) + ("--cache-gb",))
     kept = keep_args(old.get("args") or [], args, keep)
     if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "on" and not mm3_pack_has_vision(pack):
         i = args.index("--vision")

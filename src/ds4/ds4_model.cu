@@ -1803,11 +1803,12 @@ struct Model::Impl {
                     (void) b;   // host blobs live in one mapping per layer, unmapped below
                 }
         for (auto& m : host_maps) {
-            if (chunk > 0) cudaHostUnregister(m.first);
+            if (host_pinned) cudaHostUnregister(m.first);
             os::anon_free(m.first, m.second);
         }
     }
     std::vector<std::pair<void*, size_t>> host_maps;
+    bool host_pinned = false;   // host_maps page-locked (chunk > 0, when the OS let them all be: #521)
 
     template <class T>
     bool dalloc(Dev& d, T*& p, size_t n, std::string& err, size_t* acct = nullptr) {
@@ -3275,13 +3276,34 @@ struct Model::Impl {
         if (pk.gguf) make_pools();
         if (chunk > 0) {
             // the CPU lane's parts pinned (the chunks stream them to the GPUs by DMA), each layer's virtual slots
+            // An OS that will not lock them all keeps them unpinned (#521: Windows counts page-locked memory against its
+            // commit limit and refuses nearly all of the RAM - one layer's 4.7 GB failed with 175 GB free): the chunks
+            // copy them through the driver's staging instead, the same bytes, slower; the ones pinned before the failure
+            // are given back too, so the pinned buffers allocated after this still find room.  (DS4_TEST_PIN_FAIL=N,
+            // tests: part N's pin fails)
             const double tr = now_ms();
-            for (auto& m : host_maps)
-                if (cudaHostRegister(m.first, m.second, cudaHostRegisterPortable) != cudaSuccess) {
-                    err = "pinning the CPU lane's experts (" + std::to_string(m.second >> 20) + " MiB) failed";
-                    return false;
-                }
-            if (o.verbose) std::fprintf(stderr, "ds4: CPU lane's experts pinned in %.1f s\n", (now_ms() - tr) / 1000.0);
+            const char* tf = std::getenv("DS4_TEST_PIN_FAIL");
+            const long fail_at = tf != nullptr ? std::atol(tf) : -1;
+            size_t n_pin = 0;
+            for (; n_pin < host_maps.size(); ++n_pin)
+                if ((long) n_pin == fail_at || cudaHostRegister(host_maps[n_pin].first, host_maps[n_pin].second,
+                                                                cudaHostRegisterPortable) != cudaSuccess)
+                    break;
+            host_pinned = n_pin == host_maps.size();
+            if (!host_pinned) {
+                cudaGetLastError();
+                double gb = 0;
+                for (const auto& m : host_maps) gb += (double) m.second / 1e9;
+                for (size_t i = 0; i < n_pin; ++i) cudaHostUnregister(host_maps[i].first);
+                cudaGetLastError();
+                std::fprintf(stderr,
+                             "ds4: WARNING: pinning the CPU lane's experts in RAM failed at part %zu of %zu (%.1f GB in "
+                             "all: the OS locks no more) - they stay in RAM unpinned: the answers are the same, prompts "
+                             "copy them through the driver's staging (slower); --mmap-experts on reads them in place "
+                             "from the files instead\n",
+                             n_pin + 1, host_maps.size(), gb);
+            } else if (o.verbose)
+                std::fprintf(stderr, "ds4: CPU lane's experts pinned in %.1f s\n", (now_ms() - tr) / 1000.0);
             if (file_experts) {   // in place: each device's staging for its ring, and its readers (DS4_READERS, 8)
                 size_t mr = 0;
                 for (const Layer& l : L)
@@ -3435,6 +3457,7 @@ struct Model::Impl {
         tune_lane();   // (before calibrate_paths: its CPU-lane speed is the chosen pools')
         calibrate_paths();
         lane_setup();
+        one_gpu_plan();   // (#496: the one-GPU path kept only where something streams)
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         reset();
         return true;
@@ -5642,8 +5665,19 @@ struct Model::Impl {
         const char* v = std::getenv(name);
         return v == nullptr || v[0] == '\0' ? -1 : std::atoi(v) != 0;
     }
+    // ... and only where the CPU lane's experts actually stream from RAM (#496): it costs VRAM and decode time where
+    // nothing streams - a 48 GB L40S beside 28 Xeon threads (an expert 0.13 ms on the CPU lane against 0.77 streamed:
+    // 0 of every pick count streamed) decoded 17-19% slower with it.  At the start it is off when the pack's times file
+    // says this GPU's PCIe lane streamed nothing at an earlier start (its "lane off") or the lane is off (DS4_STREAM=0);
+    // else on until the load's plan (one_gpu_plan, after the lane's timing) finds that nothing streams
+    std::string lane_file() const {   // the PCIe lane's times file ("": none)
+        const char* cf = std::getenv("DS4_LANE_CAL");
+        return cf == nullptr ? o.pack + "/lane-times.txt" : std::string(cf) == "none" ? "" : cf;
+    }
+    bool one_auto = false;   // the one-GPU path on by default (not by DS4_STREAM_WIN / DS4_LAND): one_gpu_plan may end it
     void one_gpu_path() {
         bool one = false;
+        const char* why = "off (v1.1.27's path: not Linux + NVIDIA + one GPU)";
 #if !defined(STRATA_USE_HIP) && !defined(_WIN32)
         one = devs.size() == 1 && groups.size() == 1 && groups[0].mem.size() == 1 && helper_id < 0;
         if (one) {
@@ -5651,17 +5685,66 @@ struct Model::Impl {
             one = cudaGetDeviceProperties(&pr, devs[0].id) == cudaSuccess && pr.integrated == 0;
             if (!one) (void) cudaGetLastError();
         }
+        if (one) {
+            why = "on for now (Linux, NVIDIA, one GPU: kept if the PCIe lane's plan streams experts from RAM)";
+            const std::string lf = lane_file();
+            if (lane_env_off()) {
+                one = false;
+                why = "off (v1.1.27's path: DS4_STREAM=0, nothing streams)";
+            } else if (std::getenv("DS4_STREAM_FORCE") == nullptr && !lf.empty() &&
+                       pcie::cal_get(lf, lane_dev_key(0) + " | lane") == "off") {
+                one = false;
+                why = "off (v1.1.27's path: this GPU's PCIe lane streamed nothing at an earlier start - lane-times.txt "
+                      "in the pack; delete it to measure again)";
+            }
+        }
 #endif
         ln_one = one;
+        one_auto = one;
         const int w = env_tri("DS4_STREAM_WIN"), d = env_tri("DS4_LAND");
         ln_win = w < 0 ? one : w != 0;
         ln_land = d < 0 ? one : d != 0;
         gg::iq_cpu_iq1s_rows(one);
         if (pk.gguf)
-            std::fprintf(stderr, "ds4: the one-GPU decode path (in-place pulls, windows streamed, landings): %s%s%s\n",
-                         one ? "on (Linux, NVIDIA, one GPU)" : "off (v1.1.27's path: not Linux + NVIDIA + one GPU)",
+            std::fprintf(stderr, "ds4: the one-GPU decode path (in-place pulls, windows streamed, landings): %s%s%s\n", why,
                          w >= 0 ? (w ? ", DS4_STREAM_WIN=1" : ", DS4_STREAM_WIN=0") : "",
                          d >= 0 ? (d ? ", DS4_LAND=1" : ", DS4_LAND=0") : "");
+    }
+    // after the PCIe lane's timing (lane_setup): the one-GPU path on by default stays on only if some layer streams
+    // CPU-lane experts; else v1.1.27's path for the run - the copies' pins given back (the VRAM it placed experts
+    // around stays as placed until the next start, which the times file then starts on v1.1.27's path)
+    void one_gpu_plan() {
+        if (!one_auto) return;
+        bool streams = false;
+        for (int c : ln_layer) streams = streams || c >= 0;
+        const bool hold = lane_env() != nullptr && std::atoi(lane_env()) == 2;   // (DS4_STREAM=2, tests: as it was)
+        if (streams || hold || std::getenv("DS4_STREAM_FORCE") != nullptr) {
+            if (pk.gguf)
+                std::fprintf(stderr, "ds4: the one-GPU decode path: on - the PCIe lane streams CPU-lane experts from "
+                                     "RAM on this GPU\n");
+            return;
+        }
+        ln_one = false;
+        one_auto = false;
+        if (env_tri("DS4_STREAM_WIN") < 0) ln_win = false;
+        if (env_tri("DS4_LAND") < 0) ln_land = false;
+        gg::iq_cpu_iq1s_rows(false);
+        double gb = 0;
+        if (ln_zc && env_tri("DS4_STREAM_ZC") < 0) {   // (nothing pulls them: the RAM unlocked again)
+            for (size_t c = 0; c < zc_chunk.size() && c < ram_chunks.size(); ++c)
+                if (zc_chunk[c]) {
+                    cudaHostUnregister(ram_chunks[c]);
+                    zc_chunk[c] = 0;
+                    gb += (double) ram_chunk_bytes[c] / 1e9;
+                }
+            cudaGetLastError();
+            std::fill(zc_slot.begin(), zc_slot.end(), 0);
+            ln_zc = false;
+        }
+        if (pk.gguf)
+            std::fprintf(stderr, "ds4: the one-GPU decode path: off - the PCIe lane's plan streams nothing on this GPU "
+                                 "(its CPU lane is as fast or there is no lane); v1.1.27's path%s\n",
+                         gb > 0 ? " (the copies' pins given back)" : "");
     }
     bool zc_allowed() const {
         const char* v = std::getenv("DS4_STREAM_ZC");
@@ -9254,8 +9337,7 @@ struct Model::Impl {
     // says this GPU's split never streams (its start costs no VRAM then).
     bool lane_alloc(std::string& err) {
         if (!pk.gguf || lane_env_off() || !moe_token_path || sync_decode) return true;
-        const char* cf = std::getenv("DS4_LANE_CAL");
-        ln_file = cf == nullptr ? o.pack + "/lane-times.txt" : std::string(cf) == "none" ? "" : cf;
+        ln_file = lane_file();
         if (const char* v = std::getenv("DS4_STREAM_FORCE")) ln_force = v;
         ln_dev.assign(devs.size(), LaneDev{});
         for (size_t di = 0; di < devs.size(); ++di) {

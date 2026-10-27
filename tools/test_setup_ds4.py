@@ -203,10 +203,10 @@ class Config(unittest.TestCase):
         for p in self.patches:
             p.stop()
 
-    def write(self, a, old=None):
+    def write(self, a, old=None, n_gpus=3):
         if old is not None:
             (self.root / "maya-ds4.json").write_text(json.dumps(old))
-        pc = {"gpus": [{"index": i} for i in range(3)]}
+        pc = {"gpus": [{"index": i} for i in range(n_gpus)]}
         p = maya.write_config_ds4(a, pc, {"lib_dirs": ["/cuda/lib64"]}, Path("/m/DS/maya-ds4"), 131072,
                                   Path("/models"), Path("/m/DS"))
         return p, json.loads(p.read_text())
@@ -225,7 +225,7 @@ class Config(unittest.TestCase):
 
     def test_again_keeps_what_it_does_not_ask(self):
         old = {"args": ["--pack", "/old/maya-ds4", "--max-context", "262144", "--tp", "1", "--prefill-chunk", "4096"],
-               "reasoning_effort": "max", "sampling": {"temperature": 0.6}, "host": "0.0.0.0", "api_key": "k",
+               "gpu": [0, 1, 2], "reasoning_effort": "max", "sampling": {"temperature": 0.6}, "host": "0.0.0.0", "api_key": "k",
                "env": {"DS4_RING_MB": "800"}}
         _, c = self.write(args(no_vision=True, vram_reserve_mib=900, env=["DS4_CHUNK_MIN=256"]), old)
         a = c["args"]
@@ -254,9 +254,35 @@ class Config(unittest.TestCase):
 
     def test_the_config_befores_own_wins(self):
         self.tuned()
-        _, c = self.write(args(), {"args": ["--pack", "/old/maya-ds4", "--max-context", "131072", "--tp", "4"]})
+        _, c = self.write(args(), {"args": ["--pack", "/old/maya-ds4", "--max-context", "131072", "--tp", "3"],
+                                   "gpu": [0, 1, 2]})   # (its GPUs: as chosen now)
         a = c["args"]
-        self.assertEqual((a[a.index("--tp") + 1], a[a.index("--cpu-threads") + 1]), ("4", "33"))
+        self.assertEqual((a[a.index("--tp") + 1], a[a.index("--cpu-threads") + 1]), ("3", "33"))
+
+    def test_tp_follows_the_gpus_chosen_now(self):
+        """#436: a config for two GPUs set up again for one - --tp 2 kept made the engine fail later"""
+        two = {"args": ["--pack", "/old/maya-ds4", "--max-context", "131072", "--tp", "2", "--prefill-chunk", "4096"],
+               "gpu": [0, 1]}
+        _, c = self.write(args(), two, n_gpus=1)
+        a = c["args"]
+        self.assertEqual((a[a.index("--tp") + 1], c["gpu"]), ("1", [0]))
+        self.assertEqual(a[a.index("--threads") + 1], "on")           # (one GPU: the chunked prompt path)
+        self.assertEqual(a[a.index("--prefill-chunk") + 1], "4096")   # (the rest kept as before)
+        one = {"args": ["--pack", "/old/maya-ds4", "--max-context", "131072", "--tp", "1", "--threads", "on"],
+               "gpu": [0]}
+        _, c = self.write(args(), one, n_gpus=3)                       # (one GPU -> three)
+        self.assertEqual(c["args"][c["args"].index("--tp") + 1], "2")
+        _, c = self.write(args(), {"args": ["--tp", "4"], "gpu": [0, 1]}, n_gpus=3)   # (other GPUs, even as many)
+        self.assertEqual(c["args"][c["args"].index("--tp") + 1], "2")
+        _, c = self.write(args(), {"args": ["--tp", "4"], "gpu": [0, 1, 2]}, n_gpus=3)   # (more than the GPUs)
+        self.assertEqual(c["args"][c["args"].index("--tp") + 1], "2")
+        self.assertFalse(maya.tp_keepable({"args": ["--tp", "1"]}, {"gpus": [{"index": 0}]}))   # (no GPU list)
+        self.assertTrue(maya.tp_keepable({"args": [], "gpu": [0]}, {"gpus": [{"index": 0}]}))
+
+    def test_a_tuning_for_other_gpus_does_not_hold_the_tp(self):
+        self.tuned()                                                    # (tuned for GPUs 0-2: --tp 8)
+        _, c = self.write(args(), {"args": ["--tp", "1"], "gpu": [0]})  # (the config before: one GPU)
+        self.assertEqual(c["args"][c["args"].index("--tp") + 1], "8")
 
     def test_gguf_config(self):
         pc = {"gpus": [{"index": 0}]}

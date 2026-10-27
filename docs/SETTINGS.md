@@ -416,7 +416,11 @@ whole tokens are not at least 3% faster with it, streaming stops (kept for the n
 
 On Linux with one discrete NVIDIA GPU (a single GPU, no helper GPU - where this path was measured; Windows, AMD and
 several GPUs keep v1.1.27's path unless the settings below are set to 1, and the start's log says which path it
-took): where the CPU lane's experts are copied into RAM (`--mmap-experts auto` when they all fit, or `off`) on one
+took), and only where experts actually stream from RAM (v1.1.30, #496: the start's timing finds that streaming beats
+the CPU lane for some number of a token's experts; where the CPU lane is as fast - a large GPU beside many cores - the
+path ends after the timing, and from the next start on it is off from the beginning, its VRAM left to experts, while
+`lane-times.txt` keeps that verdict; delete the file to measure again; `DS4_STREAM_WIN=0 DS4_LAND=0 DS4_STREAM_ZC=0`
+keep v1.1.27's path anyway): where the CPU lane's experts are copied into RAM (`--mmap-experts auto` when they all fit, or `off`) on one
 NUMA node, the copies are pinned and mapped, and the GPU pulls a streamed expert straight from
 its copy: it is no longer read into the pinned staging first, so it crosses the RAM once instead of three times and
 takes none of the CPU's cores. With DSpark, most of the answer is decoded in verify windows of several tokens; their
@@ -429,10 +433,10 @@ windows. The stream lane's time is measured on the GPU itself. On an RTX 3090 + 
 | --- | --- | --- |
 | `MAYA_DS4_STREAM` | on (1) | `0`: every expert VRAM does not hold on the CPU, as before |
 | `DS4_STREAM_TOKEN_AB` | on (1) | `0`: the per-layer check alone decides, as in v1.1.24 |
-| `DS4_STREAM_ZC` | on with one NVIDIA GPU on Linux | `0`: copied experts pass the pinned staging, as before (the GPU does not pull them in place) |
-| `DS4_STREAM_WIN` | on with one NVIDIA GPU on Linux | `0`: verify windows do not stream (a single token's experts only, as before) |
+| `DS4_STREAM_ZC` | on with one NVIDIA GPU on Linux where experts stream | `0`: copied experts pass the pinned staging, as before (the GPU does not pull them in place) |
+| `DS4_STREAM_WIN` | on with one NVIDIA GPU on Linux where experts stream | `0`: verify windows do not stream (a single token's experts only, as before) |
 | `DS4_STREAM_SLOTS` | 16 | a verify window's streamed experts at most, a layer (1-16) |
-| `DS4_LAND` | on with one NVIDIA GPU on Linux | `0`: a streamed expert does not stay in VRAM, and a GGUF gets no recent slots |
+| `DS4_LAND` | on with one NVIDIA GPU on Linux where experts stream | `0`: a streamed expert does not stay in VRAM, and a GGUF gets no recent slots |
 | `DS4_RECENT` | 32 (a GGUF: with `DS4_LAND`) | the recent slots a layer (VRAM slots taken from the profile's coldest experts) |
 | `MAYA_DS4_PIN_BY_NEED` | off (0) | where the system cannot lock every expert copied into RAM for the GPU (Windows locks about half the RAM): `1` pins them a layer at a time, the layers whose copies the routing profile uses most first, until a pin fails or `MAYA_DS4_PIN_GB` is reached; the GPU pulls those in place, the rest go through the staging. Without it a pin that fails leaves every copy to the staging (an RTX 3090, Maya-XS, 101 GB of copies held to 50 GB pinned: decode 16.3 -> 20.3 tokens/s; all of them pinned: 29.0). A GPU that does not address registered memory at its host address (Windows' WDDM) takes its mapped address, with one GPU |
 | `MAYA_DS4_PIN_GB` | 0 (no cap) | with `MAYA_DS4_PIN_BY_NEED`: pin at most this many GB of the copies |

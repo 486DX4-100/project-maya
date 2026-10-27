@@ -691,8 +691,17 @@ void test_mixed(int cb) {
         for (int e = 0, r = 0; e < 3; ++e)
             for (int j = 0; j < counts[e]; ++j, ++r)
                 expert(e, x.data() + (size_t) row_tok[(size_t) r] * E, true, ref.data() + (size_t) r * E);
-        close(("set mixed cb" + std::to_string(cb) + " (3 experts, 112 rows)").c_str(), host_copy(d_out, ref.size()),
-              ref, 3e-3);
+        const std::vector<float> got = host_copy(d_out, ref.size());
+        close(("set mixed cb" + std::to_string(cb) + " (3 experts, 112 rows)").c_str(), got, ref, 3e-3);
+        {   // (the outputs' bits, FNV-1a: a build before and after a change to set_mix_kernel compare them - #479)
+            uint64_t hb = 1469598103934665603ull;
+            const std::vector<uint16_t> h16 = host_copy(d_h, (size_t) rows * F);
+            const uint8_t* ob = (const uint8_t*) got.data();
+            const uint8_t* hbp = (const uint8_t*) h16.data();
+            for (size_t i = 0; i < got.size() * 4; ++i) hb = (hb ^ ob[i]) * 1099511628211ull;
+            for (size_t i = 0; i < h16.size() * 2; ++i) hb = (hb ^ hbp[i]) * 1099511628211ull;
+            std::printf("  set mixed cb%d bits %016llx\n", cb, (unsigned long long) hb);
+        }
         cudaFree(d_eptr);
         cudaFree(d_x);
         cudaFree(d_bounds);

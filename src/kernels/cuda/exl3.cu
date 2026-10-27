@@ -1428,9 +1428,22 @@ __global__ void __launch_bounds__(kThreads) hip_set_kernel(SetArgs a, const floa
     }
 }
 
+// set_mix_kernel's share of SetArgs: the fields it reads.  The whole SetArgs (its MixedLayouts ~3.9 KB) beside KMix
+// made 5.8 KB of kernel parameters - over the 4 KB Pascal (sm_6x) allows, so a Pascal build stopped there (#479;
+// Volta and newer take 32 KB).  The same values, the same arithmetic: the same bits everywhere.
+struct KSetMix {
+    const unsigned long long* eptr;
+    const int* bounds;
+    int row0, n_embd, n_ff;
+    float limit;
+};
+static KSetMix ksetmix(const SetArgs& a) { return KSetMix{a.eptr, a.bounds, a.row0, a.n_embd, a.n_ff, a.limit}; }
+static_assert(sizeof(KSetMix) + sizeof(KMix) + 6 * sizeof(void*) + 3 * sizeof(int) <= 4096,
+              "set_mix_kernel's parameters must fit the 4 KB Pascal (sm_6x) allows");
+
 // hip_set_kernel for a mixed-precision layer: expert e's blob at a.eptr[e], each part at its class's K
 template <int cb, bool gate_up>
-__global__ void __launch_bounds__(kThreads) set_mix_kernel(SetArgs a, KMix mx, const float* x, int ldx,
+__global__ void __launch_bounds__(kThreads) set_mix_kernel(const KSetMix a, KMix mx, const float* x, int ldx,
                                                         const int* idx, uint16_t* h, int ldh,
                                                         float* y, int ldy) {
     __shared__ __align__(16) MixSmem sm;
@@ -2425,7 +2438,7 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
         mix_launch(sa.mix, [&](auto cb) {
             set_mix_kernel<decltype(cb)::value, true>
                 <<<dim3((sa.max_rows + kTok - 1) / kTok, sa.n_ff / kCols, sa.n_exp), kThreads, 0, s>>>(
-                    sa, k, x, ldx, row_idx, h16, ldh, nullptr, 0);
+                    ksetmix(sa), k, x, ldx, row_idx, h16, ldh, nullptr, 0);
         });
         launch_check("set_gate_up (mixed)");
         return;
@@ -2513,7 +2526,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
         mix_launch(sa.mix, [&](auto cb) {
             set_mix_kernel<decltype(cb)::value, false>
                 <<<dim3((sa.max_rows + kTok - 1) / kTok, sa.n_embd / kCols, sa.n_exp), kThreads, 0, s>>>(
-                    sa, k, nullptr, 0, nullptr, const_cast<uint16_t*>(h16), ldh, y, ldy);
+                    ksetmix(sa), k, nullptr, 0, nullptr, const_cast<uint16_t*>(h16), ldh, y, ldy);
         });
         launch_check("set_down (mixed)");
         return;

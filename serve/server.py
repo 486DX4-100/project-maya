@@ -132,6 +132,9 @@ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean s
 # A request that waited this long in the FIFO gets a line in the server window when its turn comes: with nothing else
 # logged, a queue that had stopped moving (and requests piling up behind it) was indistinguishable from a busy server.
 QUEUE_LOG_S = 5.0
+# A queued request's keep-alive while it waits for its first turn (#483): often enough for any stream-idle timeout,
+# seldom enough to cost nothing (queue_ping_seconds: STRATA_QUEUE_PING_S sets another).
+QUEUE_PING_S = 2.0
 # The queue watchdog (Service.start_queue_watch): how often it looks, the age at which the first waiter means the
 # queue has stopped moving, and how often it says so again while it stays that way.
 QUEUE_TICK_S = 15.0
@@ -290,6 +293,14 @@ class FairLock:
         self.release()
 
 
+def queue_ping_seconds() -> float:
+    """STRATA_QUEUE_PING_S: how often a request waiting for its first turn sends a keep-alive (QUEUE_PING_S)."""
+    try:
+        return max(0.01, float(os.environ.get("STRATA_QUEUE_PING_S", "") or QUEUE_PING_S))
+    except ValueError:
+        return QUEUE_PING_S
+
+
 def fair_slice_seconds() -> float:
     """STRATA_FAIR_SLICE_S: a request that has been answering this long while others wait gives the engine to the next
     one and queues again behind them (0, the default: it keeps the engine to the end, as before)."""
@@ -301,6 +312,21 @@ def fair_slice_seconds() -> float:
 
 class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
+
+
+class ContextOverflow(ValueError):
+    """A request too long for the context (rejected, never truncated): a 400 with OpenAI's error code and wording -
+    "maximum context length is N tokens" - which OpenAI-compatible clients (opencode, pi-ai, OpenClaw) recognise as a
+    context overflow and answer by compacting the conversation (#432)."""
+    code = "context_length_exceeded"
+
+
+def error_body(e: Exception, kind: str = "invalid_request_error") -> dict:
+    """An error response's body: OpenAI's shape, with the exception's `code` when it has one (ContextOverflow)."""
+    err = {"type": kind, "message": str(e)}
+    if getattr(e, "code", None):
+        err["code"] = e.code
+    return {"error": err}
 
 
 # the engine's ERR when a route met a NaN or an infinity (Glm5Model::route_ok): it has dropped that conversation's state
@@ -2437,13 +2463,15 @@ class Service:
         room = self.engine.max_context - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
-                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({self.engine.max_context}); requests are never truncated")
+                raise ContextOverflow(f"maximum context length is {self.engine.max_context} tokens; prompt "
+                                      f"({len(ids)} tokens) leaves no room to answer in the context; requests are "
+                                      "never truncated")
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
-                raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({self.engine.max_context}); requests are never truncated")
+                raise ContextOverflow(f"maximum context length is {self.engine.max_context} tokens; prompt "
+                                      f"({len(ids)} tokens) + max tokens ({max_new}) exceeds the context; requests "
+                                      "are never truncated")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
@@ -2522,7 +2550,9 @@ class Service:
         waiting - left it in the line for ever, and every request behind it waited for a turn nothing would take."""
         place = None
         try:
-            if cancel is None:
+            if hold[0]:
+                pass                                    # (the turn taken already: _queue_wait's, with keep-alives)
+            elif cancel is None:
                 self.fifo.acquire(units=units)
                 hold[0] = True
             else:
@@ -2538,6 +2568,29 @@ class Service:
             if hold[0]:
                 hold[0] = False
                 self.fifo.release(units=units)
+
+    def _queue_wait(self, hold, cancel, units=1) -> Iterator[tuple[str, object]]:
+        """A request's wait in the FIFO for its first turn, as ("ping", None) every QUEUE_PING_S - the streams write
+        them as SSE comments (": keep-alive"), which every client's parser ignores (#483: a request queued behind a
+        long answer sent nothing at all, and a client with a stream-idle timeout gave up on a turn that was only
+        waiting).  hold[0] is True once the turn is this request's (_turn then holds it and gives it back); a client
+        that goes away meanwhile - the GeneratorExit at a ping - gives its place back here."""
+        if cancel is None:                              # (no way to leave the line: _turn waits as before)
+            return
+        every = queue_ping_seconds()
+        place = self.fifo.enqueue(units=units)
+        try:
+            last = time.monotonic()
+            while not cancel.is_set():
+                if self.fifo.wait_turn(place, timeout=0.05):
+                    hold[0] = True
+                    return
+                if time.monotonic() - last >= every:
+                    last = time.monotonic()
+                    yield "ping", None
+        finally:
+            if not hold[0]:
+                self.fifo.leave(place)
 
     def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat) -> Iterator[int | None]:
         """engine.generate(), in fair slices (STRATA_FAIR_SLICE_S): once this answer has been decoding that long and
@@ -2670,6 +2723,7 @@ class Service:
         hold = [False, False]                           # holds the FIFO (fair slices let go of it); counts as active
         asked = time.monotonic()
         try:
+            yield from self._queue_wait(hold, cancel)   # (#483: keep-alives while queued; the turn taken there)
             with self._turn(hold, cancel):
                 with self.status_lock:
                     self.status["queued"] -= 1
@@ -3801,8 +3855,8 @@ def make_handler(svc: Service):
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except (JobError, StoreBusy) as e:
                 self._json(getattr(e, "status", 503), {"error": {"type": "server_error", "message": str(e)}})
-            except ValueError as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except ValueError as e:                          # (a ContextOverflow with its code: #432)
+                self._json(400, error_body(e))
             except EngineDied as e:                          # before the answer started (not streamed)
                 self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
             except (KeyError, TypeError, AttributeError, IndexError) as e:

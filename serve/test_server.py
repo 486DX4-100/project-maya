@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -183,6 +184,11 @@ class MaxTokens(unittest.TestCase):
                 s, b, _, _ = self.call(api, max_tokens=CTX)
                 self.assertEqual(s, 400)
                 self.assertIn("exceeds the context", b["error"]["message"])
+                # #432: the shape OpenAI-compatible clients take for a context overflow (they compact and retry)
+                self.assertEqual(b["error"]["code"], "context_length_exceeded")
+                self.assertEqual(b["error"]["type"], "invalid_request_error")
+                self.assertIn(f"maximum context length is {CTX} tokens", b["error"]["message"])
+                self.assertIn(f"max tokens ({CTX})", b["error"]["message"])   # (the counts kept)
 
     def test_unset_budget_with_a_near_full_prompt(self):
         _, _, pt0, _ = self.call("openai", max_tokens=1)
@@ -201,6 +207,8 @@ class MaxTokens(unittest.TestCase):
                 s, b, _, _ = self.call(api, text=text)
                 self.assertEqual(s, 400, b)
                 self.assertIn("no room to answer", b["error"]["message"])
+                self.assertEqual(b["error"]["code"], "context_length_exceeded")      # (#432)
+                self.assertIn(f"maximum context length is {CTX} tokens", b["error"]["message"])
 
     def test_debug_log_shows_the_resolved_budget(self):
         import contextlib
@@ -2009,6 +2017,70 @@ class GoneClients(unittest.TestCase):
         self.assertIn(b"200 OK", first.recv(65536))   # (the request that kept its client answers as before)
         first.close()
         self.assertEqual(self.engine.calls, 1)         # (neither gone request reached the engine)
+
+
+class QueuedKeepAlives(GoneClients):
+    """#483: a streamed request waiting in the queue for its first turn sends SSE keep-alive comments (every
+    STRATA_QUEUE_PING_S) - before, nothing at all, and a client with a stream-idle timeout gave up on a turn that was
+    only waiting.  The answer after the wait is the same; the OpenAI and Anthropic streams alike."""
+
+    def setUp(self):
+        self.env = unittest.mock.patch.dict(os.environ, {"STRATA_QUEUE_PING_S": "0.1"})
+        self.env.start()
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown()
+        self.env.stop()
+
+    def send_to(self, path, body):
+        import socket
+        b = json.dumps(body).encode()
+        s = socket.create_connection(("127.0.0.1", self.port))
+        s.sendall(b"POST " + path.encode() + b" HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: " + str(len(b)).encode() + b"\r\n\r\n" + b)
+        return s
+
+    @staticmethod
+    def read_for(s, seconds, until=None):
+        got, end = b"", time.time() + seconds
+        s.settimeout(0.2)
+        while time.time() < end and not (until and until in got):
+            try:
+                c = s.recv(65536)
+            except OSError:   # (socket.timeout)
+                continue
+            if not c:
+                break
+            got += c
+        return got
+
+    def test_keep_alives_while_queued(self):
+        first = self.send(False)
+        self.assertTrue(self.engine.held.wait(5))
+        msg = [{"role": "user", "content": "hi"}]
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            body = {"model": "m", "max_tokens": 8, "stream": True, "messages": msg}
+            s = self.send_to(path, body)
+            self.assertTrue(self.wait(lambda: self.queued() == 1), path)
+            waited = self.read_for(s, 1.0)
+            self.assertGreaterEqual(waited.count(b": keep-alive"), 3, (path, waited[-300:]))
+            self.assertNotIn(b"hello", waited)                         # (still queued: nothing answered yet)
+            s.close()
+            self.assertTrue(self.wait(lambda: self.queued() == 0), path)   # (gone while queued: left the line)
+        # the answer after a wait: unchanged
+        s = self.send_to("/v1/chat/completions", {"model": "m", "max_tokens": 64, "stream": True, "messages": msg})
+        self.assertTrue(self.wait(lambda: self.queued() == 1))
+        self.assertIn(b": keep-alive", self.read_for(s, 0.5))
+        self.engine.release.set()
+        rest = self.read_for(s, 10, b"data: [DONE]")
+        s.close()
+        text = "".join(json.loads(line[6:])["choices"][0]["delta"].get("content") or ""
+                       for line in rest.decode().splitlines() if line.startswith("data: {"))
+        self.assertIn("hello", text)
+        first.settimeout(10)
+        self.assertIn(b"200 OK", first.recv(65536))
+        first.close()
 
 
 @unittest.skipIf(os.name == "nt", "a shell script stands in for the engine")
