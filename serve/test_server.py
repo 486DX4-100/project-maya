@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, Service, StrataEngine, parse_cors_origins, request_timings, serve  # noqa: E402
+from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, RequestStat, Service, StrataEngine, parse_cors_origins, request_timings, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -999,9 +999,12 @@ class LiveRateBursts(unittest.TestCase):
         true_rate = n / (t - 1000.0)
         reads = []
         for now in (1004.0, 1006.0, 1008.0, 1010.0, 1012.0):
-            svc.status.update(busy=True, first_token=1000.0, generated=n)
-            svc.rate.clear()
-            svc.rate.extend(s for s in samples if s[0] <= now)
+            svc.status.update(busy=True, generated=n)
+            st = RequestStat()
+            for t, k in samples:
+                if t <= now:
+                    st.note(t, k)
+            svc.current_requests = {st}
             orig = srv.time.time
             srv.time.time = lambda: now
             try:
@@ -1010,6 +1013,69 @@ class LiveRateBursts(unittest.TestCase):
                 srv.time.time = orig
         for r in reads:
             self.assertLess(abs(r - true_rate) / true_rate, 0.15, (reads, true_rate))
+
+
+    def read_at(self, svc, now):
+        import serve.server as srv
+        orig = srv.time.time
+        srv.time.time = lambda: now
+        try:
+            return svc._tok_s()
+        finally:
+            srv.time.time = orig
+
+    def test_concurrent_requests_do_not_mix_their_counts(self):
+        """Two answers decoding at once (READY multi=<n>), each at 40 tok/s, one 800 tokens in and one just started:
+        the live rate is their sum (~80), not the difference of their counts over a fraction of a second (~1600)."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.status.update(busy=True)
+        import serve.server as srv
+        orig, a, b = srv.time.time, RequestStat(), RequestStat()
+        try:
+            for i in range(400):                    # 10 s, the two requests' tokens interleaved
+                t = 1000.0 + i * 0.025
+                srv.time.time = lambda t=t: t
+                svc._note(800 + i, [], a)
+                if t >= 1008.0:                     # the second one starts 8 s in
+                    svc._note(1 + int((t - 1008.0) * 40), [], b)
+        finally:
+            srv.time.time = orig
+        r = self.read_at(svc, 1010.0)
+        self.assertLess(abs(r - 80.0), 8.0, r)
+
+    def test_a_burst_after_a_quiet_stretch_is_not_read_as_its_size_over_an_instant(self):
+        """40 tok/s for 3 s, 10 s of nothing, 300 tokens at once, one more 0.3 s later: ~29 tok/s over the 10.3 s the
+        301 tokens took, not 300 / 0.3 s = 1000."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.status.update(busy=True)
+        samples = [(1000.0 + i * 0.025, i + 1) for i in range(120)]
+        samples += [(1013.0, 121 + i) for i in range(300)] + [(1013.3, 421)]
+        st = RequestStat()
+        for t, k in samples:
+            st.note(t, k)
+        svc.current_requests = {st}
+        r = self.read_at(svc, 1013.3)
+        self.assertLess(r, 40.0, r)
+        self.assertGreater(r, 20.0, r)
+
+    def test_writing_counts_only_the_requests_past_their_prompt(self):
+        """live.writing: of the active requests, those writing (the ones the decode total adds up), not one still
+        reading its prompt."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.status.update(busy=True)
+        svc.current_requests, svc.latest_request, svc.active = {RequestStat(), RequestStat()}, RequestStat(), 3
+        live = svc.metrics()["live"]
+        self.assertEqual((live["active"], live["writing"]), (3, 2))
+
+    def test_no_rate_once_a_request_has_left(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.status.update(busy=True)
+        svc.current_requests = set()
+        self.assertEqual(self.read_at(svc, 1001.0), 0.0)
 
 
 class LiveRate(unittest.TestCase):
@@ -1055,11 +1121,14 @@ class LiveRate(unittest.TestCase):
         self.assertEqual(engine.progress, (10000, 12000, 0, 2000.0))
         self.assertEqual(engine.prefill_tok_s_mean, 1000.0)
         self.svc.engine = engine
-        self.svc.status.update(busy=True, first_token=None)
+        self.svc.status.update(busy=True)
+        self.svc.latest_request = RequestStat()     # it has the engine; no answer token yet
         self.assertEqual(self.metrics()["live"]["prefill_tok_s_mean"], 1000.0)
         self.assertNotIn("prefill_tok_s", self.metrics()["live"])
         self.assertEqual(self.svc._prefill_tok_s_mean(), 1000.0)
-        self.svc.status.update(first_token=time.time(), generated=1)
+        self.svc.latest_request.first_token = time.time()
+        self.svc.current_requests.add(self.svc.latest_request)
+        self.svc.status.update(generated=1)
         self.assertEqual(self.svc._prefill_tok_s_mean(), 0.0)
         self.assertEqual(list(gen), [])
         timings = request_timings(12000, 1, engine.last)
@@ -1104,6 +1173,7 @@ class LiveRate(unittest.TestCase):
                         f"for a {true_rate:.1f} tok/s engine")
         self.assertEqual(self.metrics()["live"]["state"], "idle")
         self.assertIsNone(self.metrics()["live"]["tok_s"])
+        self.assertEqual(self.svc.current_requests, set(), "a finished request left its live-rate samples behind")
 
     def test_a_request_without_a_done_keeps_no_engine_counters(self):
         """An engine that dies mid-answer: the previous request's `last` must not become this row's decode rate."""
@@ -1134,6 +1204,7 @@ class LiveRate(unittest.TestCase):
             self.assertEqual(row["output_tokens"], 3)
             self.assertIsNone(row["decode_tok_s"], "the previous request's counters were recorded as this one's")
             self.assertIsNone(row["engine_generated"])
+            self.assertEqual(svc.current_requests, set(), "a request the engine died in left its live-rate samples behind")
         finally:
             httpd.shutdown()
             httpd.server_close()

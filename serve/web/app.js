@@ -693,9 +693,11 @@ function renderBanners(m) {
 // the Monitor's hero: the speed (now, else the last request), its sparkline and four headline numbers
 function renderHero(live, h, last, eng, tiers, totals) {
   const gen = live.state === "generating";
-  const speed = gen ? live.tok_s : last ? last.decode_tok_s : null;
+  const many = live.active > 1;                  // several running: their total, the graph's newest point
+  const speed = many ? (h.tok_s || []).at(-1) : gen ? live.tok_s : last ? last.decode_tok_s : null;
   $("hero-speed").textContent = speed == null ? "–" : fmt(speed, 1);
-  $("hero-speed-sub").textContent = "decode · " + (gen ? "writing now" : live.state === "reading" ? "reading the prompt"
+  $("hero-speed-sub").textContent = "decode · " + (many ? `${live.writing} writing` : gen ? "writing now"
+                                    : live.state === "reading" ? "reading the prompt"
                                     : last ? "last request" : "waiting for a request");
   // prefill: the engine's rate over the tokens it read (not the reused prefix), live while a request runs
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean

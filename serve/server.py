@@ -1608,6 +1608,42 @@ class Detokenizer:
         return delta
 
 
+class RequestStat:
+    """One request's live figures: when its first answer token came (None while it reads the prompt) and its
+    (time, generated) samples over RATE_WINDOW_S for the live decode rate."""
+
+    def __init__(self):
+        self.first_token = None
+        self.base = None                                # (time, generated) at the window's start: the rate counts from it
+        self.samples = collections.deque(maxlen=4096)   # the samples inside the window, oldest first
+
+    def clear(self):
+        self.base = None
+        self.samples.clear()
+
+    def _slide(self, now):
+        while self.samples and self.samples[0][0] <= now - RATE_WINDOW_S:
+            self.base = self.samples.popleft()
+
+    def note(self, now, n):
+        self.samples.append((now, n))
+        self._slide(now)
+
+    def tok_s(self, now) -> float:
+        """From `base` (the last sample at or before now - RATE_WINDOW_S) to the newest.  Measuring from the first
+        sample INSIDE the window read a burst after a long quiet stretch (tokens held up, then sent at once) as its size
+        over a fraction of a second - a 300-token burst and a token 0.3 s later read ~1000 tok/s.  Younger than
+        RATE_MIN_SPAN_S: the mean so far, span floored."""
+        self._slide(now)
+        start = self.base or (self.samples[0] if self.samples else None)
+        if start is None:
+            return 0.0
+        t1, n1 = self.samples[-1] if self.samples else self.base
+        if t1 - start[0] >= RATE_MIN_SPAN_S:
+            return max(0.0, (n1 - start[1]) / (t1 - start[0]))
+        return (n1 - start[1] + 1) / max(RATE_MIN_SPAN_S, now - start[0])
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -1630,9 +1666,8 @@ class Service:
         self.cors_origins: list[str] = []
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
         self.active = 0                                 # requests with the engine now (several: READY multi=<n>)
-        # (time, generated) samples for the live tok/s window: enough for all of RATE_WINDOW_S at any speed (32 held
-        # well under a second at 40 tok/s, and the rate then followed the last few bursts of drafted tokens)
-        self.rate = collections.deque(maxlen=4096)
+        self.current_requests: set[RequestStat] = set()  # the requests decoding now: first token to the end of run()
+        self.latest_request: RequestStat | None = None  # the request that last got the engine
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
@@ -2082,31 +2117,26 @@ class Service:
         return any(isinstance(u, (int, float)) and u > STALL_GPU_BUSY for u in utils)
 
     def _tok_s(self):
-        """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating."""
+        """tok/s over the last RATE_WINDOW_S seconds, summed over the requests decoding now.  0.0 while none is."""
         with self.status_lock:
-            s = dict(self.status)
-            rate = list(self.rate)
-        if not s.get("busy") or not s.get("first_token"):
-            return 0.0
-        now = time.time()
-        newest = rate[-1] if rate else None
-        oldest = next(((t, g) for t, g in rate if now - t <= RATE_WINDOW_S), None)
-        if newest and oldest and newest[0] - oldest[0] >= RATE_MIN_SPAN_S:
-            return max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]))
-        return s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
+            if not self.status.get("busy"):
+                return 0.0
+            now = time.time()
+            return sum(r.tok_s(now) for r in self.current_requests)
 
     def _tok_s_mean(self):
         """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
         with self.status_lock:
             s = dict(self.status)
-        if not s.get("busy") or not s.get("first_token"):
+            r = self.latest_request if self.latest_request in self.current_requests else None
+        if not s.get("busy") or r is None:
             return 0.0
-        return s["generated"] / max(1e-6, time.time() - s["first_token"])
+        return s["generated"] / max(1e-6, time.time() - r.first_token)
 
     def _prefill_tok_s_mean(self):
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""
         with self.status_lock:
-            reading = self.status.get("busy") and self.status.get("first_token") is None
+            reading = self.status.get("busy") and self.latest_request not in self.current_requests
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
     def metrics(self, all_requests=False) -> dict:
@@ -2114,18 +2144,21 @@ class Service:
         the hardware (with a minute of history per series)."""
         with self.status_lock:
             s = dict(self.status)
+            answering = self.latest_request in self.current_requests
             hist = list(self.history)
             totals = dict(self.totals)
             active = self.active
+            writing = len(self.current_requests)        # (of the active ones, those past their prompt)
         now = time.time()
         progress = getattr(self.engine, "progress", None)
-        if s.get("busy") and s.get("first_token") is None:
+        if s.get("busy") and not answering:
             state = "reading"
         elif s.get("busy"):
             state = "generating"
         else:
             state = "unloaded" if self.unloaded else "idle"
         live = {"state": state, "queued": s.get("queued", 0), "active": active,   # (answering at once: --parallel)
+                "writing": writing,
                 "phase": s.get("phase") if s.get("busy") else None,
                 "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
@@ -2431,13 +2464,15 @@ class Service:
         return {"tokens": len(self.render_ids(messages, tools, kw)), "images": len(media),
                 "approximate": bool(media), "max_context": self.engine.max_context}
 
-    def _note(self, n, evs):
+    def _note(self, n, evs, stat):
         with self.status_lock:
             s = self.status
             s["generated"] = n
-            if s.get("first_token") is None:
-                s["first_token"] = time.time()
-            self.rate.append((time.time(), n))          # the live rate's window over the last RATE_WINDOW_S
+            now = time.time()
+            if stat.first_token is None:
+                stat.first_token = now
+                self.current_requests.add(stat)
+            stat.note(now, n)                           # this request's window over the last RATE_WINDOW_S
             for ev in evs:
                 if ev.kind == "reasoning":
                     s["phase"] = "thinking"
@@ -2456,13 +2491,14 @@ class Service:
             return last_print
         with self.status_lock:
             s = dict(self.status)
+            r = self.latest_request if self.latest_request in self.current_requests else None
         el = now - s.get("started", now)
-        if s.get("first_token") is None:
+        if r is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
             print(f"[maya] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
-            rate = s["generated"] / max(1e-6, now - s["first_token"])
+            rate = s["generated"] / max(1e-6, now - r.first_token)
             print(f"[maya] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
@@ -2491,7 +2527,7 @@ class Service:
                 hold[0] = False
                 self.fifo.release(units=units)
 
-    def _sliced(self, ids, max_new, sampling, cancel, emb, hold) -> Iterator[int | None]:
+    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat) -> Iterator[int | None]:
         """engine.generate(), in fair slices (STRATA_FAIR_SLICE_S): once this answer has been decoding that long and
         another request waits for the engine, the engine stops here, the FIFO goes to the next request and this one
         queues behind it.  Back in turn, it goes on with prompt + what it already wrote as the new prompt: the
@@ -2537,6 +2573,7 @@ class Service:
                 break
             with self.status_lock:
                 mine = dict(self.status)
+                stat.clear()                            # queued again: not decoding, so no part of the live rate
                 self.active -= 1
                 hold[1] = False
                 self.status["busy"] = self.active > 0
@@ -2561,10 +2598,9 @@ class Service:
             with self.status_lock:
                 self.active += 1
                 hold[1] = True
-                self.status.update({k: mine[k] for k in ("busy", "phase", "prompt_tokens", "started", "first_token",
-                                                         "tool", "tail", "max_tokens") if k in mine},
+                self.status.update({k: mine[k] for k in ("busy", "phase", "prompt_tokens", "started", "tool", "tail",
+                                                         "max_tokens") if k in mine},
                                    generated=len(produced))
-                self.rate.clear()
             if self.stopping or cancel.is_set():
                 break
             if hasattr(self.engine, "alive") and not self.engine.alive():   # it died in the request in between
@@ -2615,6 +2651,7 @@ class Service:
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
         counted, my_started, my_first, queued = False, time.time(), None, False
+        stat = RequestStat()                            # this request's live figures
         with self.status_lock:
             self.status["queued"] += 1
             queued = True                               # counted as waiting until its turn comes (below, or in finally)
@@ -2639,12 +2676,12 @@ class Service:
                 self.ensure_engine()   # after an idle unload, or issue #27: it died in an earlier request
                 with self.status_lock:
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
-                                       started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
+                                       started=time.time(), tool=None, tail="", max_tokens=max_new)
+                    self.latest_request = stat
                     self.active += 1
                     counted = hold[1] = True
                     my_started = self.status["started"]
                     self.last_request_at = time.time()
-                    self.rate.clear()               # the previous request's samples must not leak into this one
                 before = getattr(self.engine, "last", None)
                 last_print = time.time()
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
@@ -2668,7 +2705,7 @@ class Service:
                     engine's ERR says "non-finite") before the first token, the engine has dropped that conversation's
                     state and the request runs once more, its prompt read from token 0."""
                     for again in (False, True):
-                        sliced, got = self._sliced(ids, max_new, sampling, cancel, emb, hold), 0
+                        sliced, got = self._sliced(ids, max_new, sampling, cancel, emb, hold, stat), 0
                         try:
                             for t in sliced:
                                 got += t is not None
@@ -2721,7 +2758,7 @@ class Service:
                                          if held.endswith(s[:j])), default=0)
                                 text, held = held[:len(held) - k], held[len(held) - k:]
                         evs = parser.feed(text)
-                        self._note(n, evs)
+                        self._note(n, evs, stat)
                         last_print = self._progress(last_print)
                         for ev in evs:
                             yield "event", ev
@@ -2770,6 +2807,7 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
             with self.status_lock:
+                self.current_requests.discard(stat)
                 if counted:
                     # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
                     last = dict(getattr(self.engine, "last", {}) or {}) \
@@ -2804,8 +2842,11 @@ class Service:
                     self.last_request_at = time.time()
                     now = time.time()
                     el = now - my_started
-                    ft = my_first or (self.status.get("first_token") if self.active <= 1 else None)
-                    rate = n / max(1e-6, now - ft) if ft else 0.0
+                    ft = my_first
+                    # the engine's decode clock when there is one (the Monitor's row); else the tokens after the first
+                    # over the time since it - `n / span` read a one-token answer as thousands of tok/s
+                    rate = last["generated"] / (last["decode_ms"] / 1000) if n and last.get("generated") and \
+                        last.get("decode_ms") else (n - 1) / (now - ft) if ft and n > 1 and now > ft else 0.0
                     hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                     print(f"[maya] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                           f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
@@ -3651,14 +3692,14 @@ def make_handler(svc: Service):
             elif path == "/status":
                 with svc.status_lock:
                     s = dict(svc.status)
+                    answering = svc.latest_request in svc.current_requests
                 now = time.time()
                 if s.get("busy"):
                     s["elapsed_s"] = round(now - s["started"], 1)
-                    if s.get("first_token"):
+                    if answering:
                         s["tokens_per_s"] = round(svc._tok_s(), 1)
                         s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
-                for k in ("started", "first_token"):
-                    s.pop(k, None)
+                s.pop("started", None)
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
