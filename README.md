@@ -1,6 +1,6 @@
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>GLM-5.3-Flash (321 B) and DeepSeek-V4.1-Flash-1017 (748 B) on your own GPU</b><br>
+<p align="center"><b>GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B) and MiniMax-M3.1-Flash (428 B) on your own GPU</b><br>
 private and fast · one NVIDIA GPU or up to 16 · AMD and Windows (experimental) · chat, pictures, OpenAI- and
 Anthropic-compatible API · several requests at once</p>
 
@@ -8,6 +8,7 @@ Anthropic-compatible API · several requests at once</p>
 <a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fhuggingface.co%2Fapi%2Fmodels%2Fpeasantsmith%2FGLM-5.3-Flash-Maya-GGUF%3Fexpand%3DdownloadsAllTime&amp;query=%24.downloadsAllTime&amp;label=GLM-5.3-Flash%20Maya%20downloads" alt="GLM-5.3-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fhuggingface.co%2Fapi%2Fmodels%2Fpeasantsmith%2FGLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF%3Fexpand%3DdownloadsAllTime&amp;query=%24.downloadsAllTime&amp;label=Maya-M-Derisked%20downloads" alt="Maya-M-Derisked downloads"></a>
 <a href="https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fhuggingface.co%2Fapi%2Fmodels%2Fpeasantsmith%2FDeepSeek-V4.1-Flash-1017-Maya-GGUF%3Fexpand%3DdownloadsAllTime&amp;query=%24.downloadsAllTime&amp;label=DeepSeek-V4.1-Flash%20Maya%20downloads" alt="DeepSeek-V4.1-Flash Maya downloads"></a>
+<a href="https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fhuggingface.co%2Fapi%2Fmodels%2Fpeasantsmith%2FMiniMax-M3.1-Flash-Maya-GGUF%3Fexpand%3DdownloadsAllTime&amp;query=%24.downloadsAllTime&amp;label=MiniMax-M3.1-Flash%20Maya%20downloads" alt="MiniMax-M3.1-Flash Maya downloads"></a>
 </p>
 
 <p align="center">Created and led by <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>), co-maintained
@@ -19,14 +20,16 @@ with <b><a href="https://github.com/needmorevram">@needmorevram</a></b></p>
 Models this size usually need a datacenter. Maya runs **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)**
 (zai-org, MIT license; 321 B parameters, about 18 B active per token, a context of up to 1 M tokens) and
 **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)** (DeepSeek, MIT license;
-748 B parameters) on the hardware you already have. Each model has an engine built for it. It keeps the experts your
+748 B parameters) and **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)** (MiniMax, MiniMax
+Community License; 428 B parameters, 23 B active per token, up to 1 M tokens) on the hardware you already have. Each model has an engine built for it. It keeps the experts your
 conversation uses most on the GPU, the next ones in RAM and the rest on your NVMe SSD, and moves them as you chat. It
 measures your GPUs, CPU, RAM and SSD and tunes itself to them. Nothing leaves your machine.
 
 - **Fast:** up to 124 tokens/s on two H100s, 118 on four RTX 4090s, 81 on one RTX PRO 6000, 30+ on a single RTX 5090. Real numbers from
   real users below.
 - **Close to the original:** Maya's own quants of GLM-5.3-Flash keep 97.7-99.2% of the FP8 model's zero-shot
-  accuracy; DeepSeek V4.1 · Maya-S picks the same next token as the original 92.6% of the time.
+  accuracy; DeepSeek V4.1 · Maya-S picks the same next token as the original 92.6% of the time, MiniMax M3.1 · Maya-S 87.6%
+  (the average over its categories).
 - **Plugs into your tools:** OpenAI- and Anthropic-compatible API with tool calls, ready for coding agents.
 - **Several requests at once:** up to 8 answered together - for agents that run several sessions, or several people
   on one PC.
@@ -88,7 +91,7 @@ results. See [the prompt format notes](docs/deepseek-prompt-format.md) for API d
   setup asks for a page file big enough to keep every expert on the GPU and says the size
   ([docs/AMD_MAYA.md](docs/AMD_MAYA.md)).
 
-### MiniMax-M3.1-Flash (new, experimental)
+### MiniMax-M3.1-Flash (new)
 
 The setup also offers **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)** (MiniMax; 428 B
 parameters, 23 B active per token; the [MiniMax Community License](LICENSE.minimax-m31): free for non-commercial use,
@@ -102,7 +105,7 @@ commercial use has conditions) on an engine of its own (`maya-mm3`, contributed 
 | Mia-AiLab's [EXL3 3.5 bpw](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw), with MiniMax's DSpark drafter and vision tower | 197 GB | NVIDIA V100 / RTX 20 and newer, Linux and Windows |
 
 With Maya's quants the setup fetches the vision tower and the DSpark drafter from the EXL3 repo (about 4 GB) for
-pictures and drafting on NVIDIA; on AMD they read text.
+pictures and drafting, on NVIDIA and AMD alike.
 
 - **Set up for your PC:** the experts that do not fit in VRAM are computed on the CPU from RAM; the context (up to the
   model's 1M) is recommended by your memory; tensor parallel where the GPUs form groups; and the DSpark drafter only
