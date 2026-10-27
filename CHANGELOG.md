@@ -14,8 +14,7 @@ DeepSeek and MiniMax answer several requests at once, fixes for one-GPU and tens
   agents that run several sessions, or several people on one PC. Each conversation keeps its own state; two at once
   write about 1.6x the tokens per second of one after another on a V100 with most of DeepSeek Maya-XS's experts in
   RAM. MiniMax keeps every conversation's cache in VRAM, so KV streaming and its drafter
-  are off while more than one runs, and the setup recommends a context that leaves them room. Thanks to
-  @mrsirg97-rgb for the comparison in #557.
+  are off while more than one runs, and the setup recommends a context that leaves them room.
 - **DeepSeek on one GPU with every expert in RAM** (#551, @talisp): the one-GPU decode path now turns itself off where
   nothing would ever stream from the disk (`--mmap-experts off`, or auto with all of them copied); it cost 4-9% of
   decode on the reporter's L40S, and decode was 2.2x faster without it on a V100 test PC. Nothing to set.
