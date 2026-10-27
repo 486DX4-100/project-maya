@@ -390,6 +390,86 @@ __global__ void hc_post_kernel(const float* __restrict__ y, const float* __restr
     out[(size_t) t * hc * dim + i] = a;
 }
 
+// (DS4_HC_FUSE) hc_split_pre_norm: block 0 is hc_pre_norm_kernel's block 0, its code and its 1024 threads as they
+// are, then (q set) each warp rounds the 32-blocks of x it stored as gguf's q8_quant_block does (warp w holds x[1024 n
+// + 32 w + lane]: whole blocks, every lane of a warp in or past dim together); block 1 is hc_split_kernel's warp for
+// hc 4, its other warps returning at once (no barrier there).  The old kernels stay as they are: hc_fuse_check
+// (ds4_model.cu) compares the two paths byte for byte
+__global__ void __launch_bounds__(1024) hc_split_pre_norm_kernel(const HcFuse a) {
+    const size_t t = blockIdx.y;   // (a window's row t: the old kernels' strides; row 0 as before)
+    if (blockIdx.x == 0) {
+        const int dim = a.dim, hc = a.hc;
+        const float* mix = a.mix + 8 * t;
+        const float* h = a.h + t * (size_t) hc * dim;
+        float* x = a.x + t * (size_t) dim;
+        int8_t* q = a.q != nullptr ? a.q + t * (size_t) dim : nullptr;
+        float* qd = a.qd != nullptr ? a.qd + t * (size_t) (dim / 32) : nullptr;
+        float r[8];
+        float ss = 0.0f;
+        int n = 0;
+        for (int e = threadIdx.x; e < dim; e += blockDim.x, ++n) {
+            float v = 0.0f;
+            for (int s = 0; s < hc; ++s) v += mix[s] * h[(size_t) s * dim + e];
+            r[n] = v;
+            ss += v * v;
+        }
+        const float inv = rsqrtf(block_sum(ss) / (float) dim + a.eps);
+        n = 0;
+        for (int e = threadIdx.x; e < dim; e += blockDim.x, ++n) {
+            const float v = a.w != nullptr ? r[n] * inv * a.w[e] : r[n];
+            x[e] = v;
+            if (q == nullptr) continue;
+            float am = fabsf(v);   // (q8_quant_block's ops on the value stored, from the warp's own registers)
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+            const float sc = am / 127.0f;
+            q[e] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+            if ((threadIdx.x & 31) == 0) qd[e / 32] = sc;
+        }
+        return;
+    }
+    if (threadIdx.x >= 32) return;
+    const int lane = threadIdx.x, hc = a.hc;
+    const float* mx = a.mixes + 32 * t;
+    float* pre = a.pre + 8 * t;
+    float* post = a.post + 8 * t;
+    float* comb = a.comb + 64 * t;
+    float* pre_copy = a.pre_copy != nullptr ? a.pre_copy + 8 * t : nullptr;
+    const float eps = a.hc_eps;
+    float pv = 0.0f;
+    if (lane < hc) {
+        pv = 1.0f / (1.0f + expf(-(mx[lane] * a.scale[0] + a.base[lane]))) + eps;
+        pre[lane] = pv;
+        post[lane] = 2.0f / (1.0f + expf(-(mx[hc + lane] * a.scale[1] + a.base[hc + lane])));
+    }
+    if (pre_copy != nullptr && lane < 8) {   // (the layer's copy of the 8 slots: the rest are pre's own bits)
+        if (lane < hc) pre_copy[lane] = pv;
+        else ((uint32_t*) pre_copy)[lane] = ((const uint32_t*) pre)[lane];
+    }
+    // rows are the 4-lane groups (j = lane / 4), columns the lanes 4 apart (k = lane % 4)
+    const bool on = lane < 16;
+    float c = on ? mx[8 + lane] * a.scale[2] + a.base[8 + lane] : -FLT_MAX;
+    auto row_sum = [&](float v) {
+        v += __shfl_xor_sync(0xffffffffu, v, 1);
+        return v + __shfl_xor_sync(0xffffffffu, v, 2);
+    };
+    auto col_sum = [&](float v) {
+        v += __shfl_xor_sync(0xffffffffu, v, 4);
+        return v + __shfl_xor_sync(0xffffffffu, v, 8);
+    };
+    float m = fmaxf(c, __shfl_xor_sync(0xffffffffu, c, 1));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+    c = on ? expf(c - m) : 0.0f;
+    c = c / row_sum(c) + eps;                       // softmax over each row, + eps
+    c = on ? c : 0.0f;
+    c = c / (col_sum(c) + eps);                     // each destination column over its sources
+    for (int it = 1; it < a.iters; ++it) {
+        c = c / (row_sum(c) + eps);
+        c = c / (col_sum(c) + eps);
+    }
+    if (on) comb[lane] = c;
+}
+
 // ---------------------------------------------------------------- gemv over F16 weights, a warp a row
 __global__ void __launch_bounds__(kThreads) gemv_f16_kernel(const uint16_t* __restrict__ W, const float* __restrict__ x,
                                                             int n, int k, float alpha, float* __restrict__ y) {
@@ -475,6 +555,35 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
     acc = warp_sum(acc);
     if (lane == 0) y[(size_t) t * ldy + row] = acc;
 }
+// (DS4_ROUTE_FUSE, a decoded token: T 1) two gemv_f32_kernel launches in one grid - its first cdiv(n0, 8) blocks are
+// W0's rows into y0, the rest W1's into y1 - each row gemv_f32_kernel's code (a warp a row, a lane's float4s c = lane +
+// 32 j in order, fmaf, the warp's sum), so each row's bits.  The old kernel stays as it is: route_fuse_check
+// (ds4_model.cu) compares the two
+__global__ void __launch_bounds__(kThreads) gemv_f32_pair_kernel(const float* __restrict__ W0, int n0,
+                                                                 float* __restrict__ y0, const float* __restrict__ W1,
+                                                                 int n1, float* __restrict__ y1,
+                                                                 const float* __restrict__ x, int k) {
+    const int b0 = (n0 + kThreads / 32 - 1) / (kThreads / 32);
+    const bool second = (int) blockIdx.x >= b0;
+    const float* W = second ? W1 : W0;
+    const int n = second ? n1 : n0;
+    float* y = second ? y1 : y0;
+    const int row = ((int) blockIdx.x - (second ? b0 : 0)) * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= n) return;
+    const float4* w = (const float4*) (W + (size_t) row * k);
+    const float4* xv = (const float4*) x;
+    float acc = 0.0f;
+    for (int c = lane; c < k / 4; c += 32) {
+        const float4 a = w[c], b = xv[c];
+        acc = fmaf(a.x, b.x, acc);
+        acc = fmaf(a.y, b.y, acc);
+        acc = fmaf(a.z, b.z, acc);
+        acc = fmaf(a.w, b.w, acc);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
 // ... a prompt's rows: a block 8 rows of W for kGemvT tokens, their inputs kGemvK float4s at a time in shared memory.
 // Each (token, row) sums as the one-token kernel does (a lane's float4s c = lane + 32 j in order, then the warp's sum),
 // so the prompt's router logits keep the token path's bits - with W read once per kGemvT tokens, not once a token (a 4K
@@ -485,6 +594,56 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const float* __
                                                                  int n, int k, int T, float* __restrict__ y, int ldy) {
     __shared__ float4 xs[kGemvT][kGemvK];
     const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t0 = blockIdx.y * kGemvT, nt = min(kGemvT, T - t0), k4 = k / 4;
+    const float4* w = (const float4*) (W + (size_t) min(row, n - 1) * k);
+    float acc[kGemvT];
+#pragma unroll
+    for (int t = 0; t < kGemvT; ++t) acc[t] = 0.0f;
+    for (int c0 = 0; c0 < k4; c0 += kGemvK) {
+        const int nc = min(kGemvK, k4 - c0);
+        __syncthreads();
+        for (int i = (int) threadIdx.x; i < kGemvT * kGemvK; i += kThreads) {
+            const int t = i / kGemvK, c = i % kGemvK;
+            if (t < nt && c < nc) xs[t][c] = ((const float4*) (x + (size_t) (t0 + t) * k))[c0 + c];
+        }
+        __syncthreads();
+        for (int c = lane; c < nc; c += 32) {
+            const float4 a = w[c0 + c];
+#pragma unroll
+            for (int t = 0; t < kGemvT; ++t) {
+                const float4 b = xs[t][c];
+                acc[t] = fmaf(a.x, b.x, acc[t]);
+                acc[t] = fmaf(a.y, b.y, acc[t]);
+                acc[t] = fmaf(a.z, b.z, acc[t]);
+                acc[t] = fmaf(a.w, b.w, acc[t]);
+            }
+        }
+    }
+    if (row >= n) return;
+#pragma unroll
+    for (int t = 0; t < kGemvT; ++t)
+        if (t < nt) {
+            const float s = warp_sum(acc[t]);
+            if (lane == 0) y[(size_t) (t0 + t) * ldy + row] = s;
+        }
+}
+// (DS4_ROUTE_FUSE=2, a decode window: T 2 .. kWin) two gemv_f32_rows_kernel launches in one grid - its first
+// cdiv(n0, 8) blocks are W0's rows into y0, the rest W1's into y1, each block gemv_f32_rows_kernel's code for its
+// kGemvT tokens (blockIdx.y) - so each (token, row) the rows kernel's bits, the one-token kernel's.  The old kernel
+// stays as it is: route_fuse_check (ds4_model.cu) compares the two
+__global__ void __launch_bounds__(kThreads) gemv_f32_pair_rows_kernel(const float* __restrict__ W0, int n0,
+                                                                      float* __restrict__ y0,
+                                                                      const float* __restrict__ W1, int n1,
+                                                                      float* __restrict__ y1,
+                                                                      const float* __restrict__ x, int k, int T,
+                                                                      int ldy) {
+    __shared__ float4 xs[kGemvT][kGemvK];
+    const int b0 = (n0 + kThreads / 32 - 1) / (kThreads / 32);
+    const bool second = (int) blockIdx.x >= b0;
+    const float* W = second ? W1 : W0;
+    const int n = second ? n1 : n0;
+    float* y = second ? y1 : y0;
+    const int row = ((int) blockIdx.x - (second ? b0 : 0)) * (kThreads / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31, t0 = blockIdx.y * kGemvT, nt = min(kGemvT, T - t0), k4 = k / 4;
     const float4* w = (const float4*) (W + (size_t) min(row, n - 1) * k);
     float acc[kGemvT];
@@ -2345,6 +2504,112 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     }
 }
 
+// (DS4_ROUTE_FUSE, a decoded token: T 1) route_publish_kernel and route_ahead_kernel as the two blocks of one launch -
+// block 0 the first's code for token 0 (ids / w / x of the request, idx / w / plan_ptr), block 1 the second's
+// (ahead[0][off ..)): disjoint writes, read the same way; publish_kernel follows in a launch of its own, as
+// route_publish launches it.  (=2, a window's T rows: the pair a row, t = blockIdx.y, both logits rows 1024 apart as
+// the old kernels read them.)  The old kernels stay as they are: route_fuse_check (ds4_model.cu) compares the two
+__global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
+    if (blockIdx.x == 0) {
+        __shared__ float sc[1024], bs[1024];
+        __shared__ float bv[32];
+        __shared__ int bi[32];
+        __shared__ int pick[16];
+        __shared__ int on_cpu;
+        const int t = blockIdx.y, n = a.n, k = a.k;
+        const float* logits = a.logits + (size_t) t * 1024;
+        const float* bias = a.bias;
+        if (a.bias_vl != nullptr && ((a.vl >> t) & 1u)) bias = a.bias_vl;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const float l = logits[i];
+            const float sp = l > 20.0f ? l : log1pf(expf(l));
+            sc[i] = sqrtf(sp);
+            bs[i] = sc[i] + bias[i];
+        }
+        __syncthreads();
+        const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+        for (int r = 0; r < k; ++r) {
+            float best = -FLT_MAX;
+            int bix = 0x7fffffff;
+            for (int i = threadIdx.x; i < n; i += blockDim.x)
+                if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+                if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+            }
+            if (lane == 0) bv[wp] = best, bi[wp] = bix;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float b = -FLT_MAX;
+                int ix = 0x7fffffff;
+                for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
+                    if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+                pick[r] = ix;
+                bs[ix] = -FLT_MAX;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            float s = 0.0f;
+            for (int r = 0; r < k; ++r) s += sc[pick[r]];
+            int cpu = 0;
+            for (int r = 0; r < k; ++r) {
+                const float wv = sc[pick[r]] / (s + 1e-20f) * a.route_scale;
+                a.idx[(size_t) t * kPicks + r] = pick[r];
+                a.w[(size_t) t * kPicks + r] = wv;
+                a.plan_ptr[(size_t) t * kPicks + r] = a.vram[pick[r]];
+                cpu |= a.vram[pick[r]] == 0ull;
+                if (a.req != nullptr) {
+                    a.req->ids[t][r] = pick[r];
+                    a.req->w[t][r] = wv;
+                }
+            }
+            on_cpu = cpu;
+        }
+        __syncthreads();
+        if (a.req != nullptr && on_cpu)
+            for (int i = threadIdx.x; i < a.dim; i += blockDim.x) a.req->x[t][i] = a.x[(size_t) t * a.dim + i];
+        return;
+    }
+    __shared__ float bs[1024];
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    const int t = blockIdx.y, n = a.a_n, m = a.m, off = a.off;
+    const float* logits = a.a_logits + (size_t) t * 1024;
+    const float* bias = a.a_bias;
+    Req* req = a.req;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float l = logits[i];
+        const float sp = l > 20.0f ? l : log1pf(expf(l));
+        bs[i] = sqrtf(sp) + bias[i];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    for (int r = 0; r < m; ++r) {
+        float best = -FLT_MAX;
+        int bix = 0x7fffffff;
+        for (int i = threadIdx.x; i < n; i += blockDim.x)
+            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+        }
+        if (lane == 0) bv[wp] = best, bi[wp] = bix;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float b = -FLT_MAX;
+            int ix = 0x7fffffff;
+            for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
+                if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            req->ahead[t][off + r] = ix < n ? ix : -1;
+            if (ix < n) bs[ix] = -FLT_MAX;
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1) {
     __threadfence_system();
     req->na[0] = na0;
@@ -2812,6 +3077,15 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
     if (req != nullptr && m > 0 && T > 0 && n <= 1024 && off + m <= kAhead)
         route_ahead_kernel<<<T, 512, 0, s>>>(logits, bias, n, m, req, off);
 }
+bool route_pair(const RoutePair& a, cudaStream_t s) {
+    if (a.req == nullptr || a.n < 1 || a.n > 1024 || a.k < 1 || a.k > kPicks || a.a_n < 1 || a.a_n > 1024 || a.m < 1 ||
+        a.off < 0 || a.off + a.m > kAhead || a.dim < 1 || a.dim > kMaxDim || a.T < 1 || a.T > kWin)
+        return false;
+    route_pair_kernel<<<dim3(2, (unsigned) a.T), 512, 0, s>>>(a);
+    if (cudaGetLastError() != cudaSuccess) return false;   // (a routing that did not go in is never published)
+    publish_kernel<<<1, 1, 0, s>>>(a.req, a.T, a.seq, a.na0, a.na1);
+    return cudaGetLastError() == cudaSuccess;
+}
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }
 void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
                  unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s) {
@@ -2863,6 +3137,9 @@ void hc_post_inplace(const float* y, float* h, const float* post, const float* c
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
     hc_mix_scale_kernel<<<T, kThreads, 0, s>>>(h, hcdim, n_mix, eps, mixes);
 }
+void hc_split_pre_norm(const HcFuse& a, cudaStream_t s, int T) {
+    hc_split_pre_norm_kernel<<<dim3(2, (unsigned) std::max(1, T)), 1024, 0, s>>>(a);
+}
 void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s, int fmt) {
     if (T > 0) engram_dequant_tok_kernel<<<T * cols, kThreads, 0, s>>>(src, per, cols, hd, out, fmt);
 }
@@ -2887,6 +3164,17 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
                                                                                                y, ldy);
 }
 
+bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
+                   cudaStream_t s, int T, int ldy) {
+    if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1)))
+        return false;
+    const int b0 = (int) cdiv(n0, kThreads / 32), b1 = (int) cdiv(n1, kThreads / 32);
+    if (T == 1) gemv_f32_pair_kernel<<<b0 + b1, kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k);
+    else   // (=2, a window's rows)
+        gemv_f32_pair_rows_kernel<<<dim3(b0 + b1, cdiv(T, kGemvT)), kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k, T,
+                                                                                      ldy);
+    return cudaGetLastError() == cudaSuccess;
+}
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
     if (T == 1 || (T > 0 && std::getenv("DS4_ROUTER_ROWS") != nullptr && std::atoi(std::getenv("DS4_ROUTER_ROWS")) == 0))
         gemv_f32_kernel<<<dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s>>>(W, x, n, k, y, ldy);

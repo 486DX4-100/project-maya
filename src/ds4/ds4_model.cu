@@ -574,6 +574,8 @@ struct Dev {
     uint8_t* eg_rows = nullptr;
     uint16_t *emb_rows = nullptr, *ext = nullptr;   // the window's embedding rows; the window attention's rows
     AttnScratch attn_scr;   // a few queries' selected compressed rows decoded (sparse_attn)
+    int8_t* xq8 = nullptr;   // (DS4_HC_FUSE: a decoded token's attention input rounded to int8, its scales)
+    float* xd8 = nullptr;
     // the hand-off to the next device through pinned host memory (these cards copy peer to peer only through the
     // driver's staging, ~1.7 ms a copy): h | pre | topk | cand
     uint8_t* bounce = nullptr;
@@ -1139,6 +1141,28 @@ struct Model::Impl {
     // they go (splitb, the odd blocks going round the members layer by layer) instead of only even shares
     bool tp_uneven = false;
     int tp_blk = 0;
+    // DS4_HC_FUSE=1: a decoded token's (T 1) hc_split and hc_pre_norm in one launch (hc_split_pre_norm), the attention
+    // input's int8 rounding there, the layer's copy of the pre slots by its FFN split - checked at load (hc_fuse_check)
+    bool hc_fuse = false;
+    // DS4_HC_FUSE=2: the same for a decode window's rows too (T up to kWin: a DSpark verify window's), the attention
+    // input's rows rounded there for its GEMVs (PreQ8::rows); and the FFN's split rounds its input too, for the shared
+    // expert's w1 / w3 - checked at load on 1 and kWin rows (hc_fuse_check's T, ffn_q8)
+    bool hc_fuse_win = false;
+    // DS4_ROUTE_FUSE=1: a decoded token's (T 1) router stage on a group's lead with a next layer to guess
+    // (route_fusable) - its gate and the next layer's in one launch (gemv_f32_pair), the routing and the guesses in
+    // another (route_pair), publish as before - checked at load (route_fuse_check).  The load refuses it with
+    // DS4_AHEAD other than 1; every other case (no guess, the other members, windows, the drafter) keeps the old path
+    bool route_fuse = false;
+    // DS4_ROUTE_FUSE=2: the same for a decode window's rows too (T up to kWin): the two gates' rows in one launch
+    // (gemv_f32_pair's rows form), the routing and the guesses a row in another - checked at load on 1, 3 and kWin rows
+    bool route_fuse_win = false;
+    // (DS4_ROUTE_FUSE) whether a decoded token's router stage on this lead fuses: every bound gemv_f32_pair and
+    // route_pair refuse, checked before anything is enqueued - an incompatible layer or next layer takes the old path
+    static bool route_fusable(const Layer& l, const Layer* nx, int m, int D) {
+        return nx != nullptr && l.gate_w != nullptr && nx->gate_w != nullptr && l.n_exp >= 1 && l.n_exp <= 1024 &&
+               nx->n_exp >= 1 && nx->n_exp <= 1024 && l.k_exp >= 1 && l.k_exp <= kPicks && m >= 1 && m <= kAhead &&
+               D >= 4 && D % 4 == 0 && D <= kMaxDim;
+    }
     static constexpr uint64_t kRamMargin = 8ull << 30;   // RAM left to the rest (the system, the page cache's churn)
     static constexpr uint64_t kAutoCopyRoom = 8ull << 30;   // --mmap-experts auto copies only with this much more spare
                                                             // (the Engram rows' page cache, other programs)
@@ -2513,6 +2537,54 @@ struct Model::Impl {
                     if (!gg::q8_batch_check(id, err)) return false;
             }
         }
+        if (const char* v = ds4_env("DS4_HC_FUSE")) {   // (MAYA_DS4_HC_FUSE)
+            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "2") != 0 && std::strcmp(v, "0") != 0) {
+                err = std::string("DS4_HC_FUSE=") + v + ": 2, 1 or 0";
+                return false;
+            }
+            hc_fuse = std::strcmp(v, "1") == 0 || std::strcmp(v, "2") == 0;
+            hc_fuse_win = std::strcmp(v, "2") == 0;
+#ifdef STRATA_HIP_WAVE64
+            if (hc_fuse) {   // (its warp roundings are a 32-lane warp's)
+                err = std::string("DS4_HC_FUSE=") + v + " on a wave64 build";
+                return false;
+            }
+#endif
+            if (hc_fuse && (!pk.gguf || g.hc != 4 || g.dim % 32 != 0 || g.dim > 8 * 1024 || g.sinkhorn < 1)) {
+                err = std::string("DS4_HC_FUSE=") + v +
+                      ": not this model's shapes (a GGUF, 4 streams, dim a multiple of 32 up to 8192)";
+                return false;
+            }
+            if (hc_fuse)
+                std::fprintf(stderr, "ds4: a decoded token's HC split and norm in one launch, its attention input "
+                                     "rounded to int8 there, the layer's pre copy by its FFN split (DS4_HC_FUSE)%s\n",
+                             hc_fuse_win ? "; a decode window's rows too, the FFN input rounded for the shared expert "
+                                           "(DS4_HC_FUSE=2)"
+                                         : "");
+        }
+        if (const char* v = ds4_env("DS4_ROUTE_FUSE")) {   // (MAYA_DS4_ROUTE_FUSE)
+            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "2") != 0 && std::strcmp(v, "0") != 0) {
+                err = std::string("DS4_ROUTE_FUSE=") + v + ": 2, 1 or 0";
+                return false;
+            }
+            route_fuse = std::strcmp(v, "1") == 0 || std::strcmp(v, "2") == 0;
+            route_fuse_win = std::strcmp(v, "2") == 0;
+#ifdef STRATA_HIP_WAVE64
+            if (route_fuse) {   // (its warp reductions are a 32-lane warp's)
+                err = std::string("DS4_ROUTE_FUSE=") + v + " on a wave64 build";
+                return false;
+            }
+#endif
+            if (route_fuse && ahead_mode != 1) {   // (no other lookahead mode changes under it)
+                err = std::string("DS4_ROUTE_FUSE=") + v + " takes one layer of lookahead (DS4_AHEAD 1), not " +
+                      std::to_string(ahead_mode);
+                return false;
+            }
+            if (route_fuse)
+                std::fprintf(stderr, "ds4: a decoded token's router stage on the lead in two launches: its gate and "
+                                     "the next layer's, then the routing and the guesses (DS4_ROUTE_FUSE)%s\n",
+                             route_fuse_win ? "; a decode window's rows too (DS4_ROUTE_FUSE=2)" : "");
+        }
         if (helper_id >= 0 && !helper_open(err)) return false;
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
@@ -2947,6 +3019,9 @@ struct Model::Impl {
             d.attn_scr.cap = (int) topk_stride();
             if (!dalloc(d, d.attn_scr.rows, (size_t) kAttnScratchT * topk_stride() * g.hd, err)) return false;
             d.tks.T = (int) kTksRows, d.tks.P = (int) tks_p(), d.tks.K = g.ix_topk;
+            if (hc_fuse && !(dalloc(d, d.xq8, (size_t) (hc_fuse_win ? kWin : 1) * D, err) &&   // (=2: a window's rows)
+                             dalloc(d, d.xd8, (size_t) (hc_fuse_win ? kWin : 1) * D / 32, err)))
+                return false;
             if (!g.eg_layers.empty()) {
                 const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
                 ok = dalloc(d, d.eg_rows, W * cols * (pk.eg_hd + pk.eg_hd / 32), err) &&
@@ -3410,6 +3485,12 @@ struct Model::Impl {
             ahead_fl.assign(L.size() * 1024, 0);
             ahead_rank.assign(L.size() * 1024, 0);
             ahead_for.assign(L.size(), 0);
+            if (hc_fuse && !hc_fuse_win && !hc_fuse_check(err)) return false;   // (no request yet)
+            if (hc_fuse_win && !(hc_fuse_check(err, 1, true) && hc_fuse_check(err, kWin, true)))   // (=2: a window too)
+                return false;
+            if (route_fuse && !route_fuse_check(err)) return false;   // (no request yet)
+            if (route_fuse_win && !(route_fuse_check(err, 3) && route_fuse_check(err, kWin)))   // (=2: windows too)
+                return false;
             if (tp_uneven && (std::getenv("STRATA_DS4_TP_CHECK") != nullptr || std::getenv("DS4_TP_CHECK") != nullptr) &&
                 !tp_check(err))
                 return false;   // (MAYA_DS4_TP_CHECK=1: at load, no request yet)
@@ -8437,6 +8518,560 @@ struct Model::Impl {
         std::fflush(stdout);
         std::_Exit(kExitUnknown);
     }
+    // DS4_HC_FUSE=1 (at load, before any request), on every device with layers: hc_split_pre_norm against what it
+    // replaces - hc_split, hc_pre_norm, gguf mv's own int8 rounding of the input (q8_round) and its GEMVs, the layer's
+    // copy of the pre slots - for layers the device holds: the first of each kind of attention input (2 GEMVs; 3 with
+    // the compressed KV; 4 with its gate too; a kind held and not run fails) and the last, each layer's attention (its
+    // split weights and norm, x's int8 rounding, its input GEMVs through the rounding given) and its FFN (the pre
+    // copy), on three inputs: random; edges (x's 32-blocks of zeros, negative zeros, tiny and large magnitudes and a
+    // lone maximum, mixes past expf's range, a zero and a negative lagged weight); and ties (the lagged mix 1 0 0 0, h
+    // +-8 - the norm's scale 1 / 8, past eps - and a synthetic norm of 127 or 254 and k + 0.5 a block: int8 rounding
+    // at its halves).  Every output region starts 0xA5 between guards, the pre buffers' 8 slots as sentinels (slots
+    // 4..7 a NaN payload, -0, a denormal, -123.5); both paths' bytes must be equal - every output, slot and guard, the
+    // guards untouched - the written values finite and the int8 scales written (>= 0).  On d.st, each run's end waited
+    // for (10 s): a CUDA error or a mismatch after a clean end fails the load (everything freed); no clean end ends the
+    // process at once (hc_unknown - what the run may still touch is the model's).  T rows (DS4_HC_FUSE=2: kWin, a
+    // decode window's): every input and output T rows at the decode buffers' strides, each row its own inputs, x's int8
+    // rows by q8_round a row and the GEMVs on T columns (the fused path's PreQ8 rows T); T 1 is the check above.
+    // ffn_q8 (DS4_HC_FUSE=2): the FFN's split rounds x too, checked as the attention's is, with the shared expert's
+    // w1 / w3 GEMVs on it (the decode's other FFN GEMVs take x as F32 or round it their own way)
+    [[noreturn]] static void hc_unknown(int dev, int il, bool ffn, const char* why) {
+        std::fprintf(stderr, "ds4: HC fuse check: CUDA%d (layer %d, %s): %s - the device's state unknown; the process "
+                             "ends without teardown (exit %d)\n",
+                     dev, il, ffn ? "FFN" : "attention", why, kExitUnknown);
+        std::fflush(stderr);
+        std::fflush(stdout);
+        std::_Exit(kExitUnknown);
+    }
+    bool hc_fuse_check(std::string& err, int T = 1, bool ffn_q8 = false) {
+        const int D = g.dim, HD = g.hd, QL = g.q_lora, FF = g.ff;
+        constexpr size_t kGuard = 64;
+        static constexpr uint32_t kSent[8] = {0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u,
+                                              0x7fc0beefu, 0x80000000u, 0x00000001u, 0xc2f70000u};
+        // one set of outputs: [guard | region]... | guard, in bytes
+        enum { kPre, kPost, kComb, kCopy, kX, kQ, kQd, kQr, kKvr, kCkr, kCgr, kS1, kS3, kRegions };
+        const size_t rb1[kRegions] = {32, 32, 256, 32, (size_t) D * 4, (size_t) D, (size_t) D / 32 * 4, (size_t) QL * 4,
+                                      (size_t) HD * 4, (size_t) HD * 4, (size_t) HD * 4, (size_t) FF * 4,
+                                      (size_t) FF * 4};   // (a row's)
+        size_t rb[kRegions], at[kRegions], set_bytes = 0;
+        for (int r = 0; r < kRegions; ++r) {
+            rb[r] = rb1[r] * (size_t) T;
+            at[r] = set_bytes + kGuard;
+            set_bytes = (at[r] + rb[r] + 255) / 256 * 256;
+        }
+        set_bytes += kGuard;
+        // h | mixes | the lagged mix (T rows each) | a synthetic norm
+        const size_t n_in = (size_t) T * (4 * (size_t) D + 32 + 8) + (size_t) D;
+        const std::string rows = T > 1 ? " (" + std::to_string(T) + " rows)" : "";
+        uint32_t st = 0x2545f491u;
+        auto rnd = [&]() {
+            st = st * 1664525u + 1013904223u;
+            return (float) (int) (st % 2001u - 1000u) / 250.0f;   // -4 .. 4
+        };
+        for (size_t di = 0; di < devs.size(); ++di) {
+            Dev& d = devs[di];
+            std::vector<const Layer*> ls;   // (the first of each kind, then the last)
+            const Layer* last = nullptr;
+            bool kind_held[5] = {}, kind_run[5] = {};   // (by the attention's GEMVs: 2, 3 or 4)
+            for (const Layer& l0 : L)
+                if (!l0.mtp)
+                    for (int m = 0; m < l0.nm; ++m)
+                        if (member(l0, m).dev == (int) di) {
+                            const Layer& x = member(l0, m);
+                            const int nk = 2 + (x.kv_src ? 1 : 0) + (x.kv_src && x.ratio > 1 ? 1 : 0);
+                            if (!kind_held[nk]) ls.push_back(&x);
+                            kind_held[nk] = true;
+                            last = &x;
+                        }
+            if (ls.empty()) continue;
+            if (std::find(ls.begin(), ls.end(), last) == ls.end()) ls.push_back(last);
+            auto fail_at = [&](const std::string& why) {
+                err = "HC fuse check" + rows + " on CUDA" + std::to_string(d.id) + ": " + why;
+                std::fprintf(stderr, "ds4: CUDA%d HC fuse check%s FAILED: %s\n", d.id, rows.c_str(), why.c_str());
+                return false;
+            };
+            if (cudaSetDevice(d.id) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return fail_at("cudaSetDevice failed");
+            }
+            const cudaStream_t s = d.st;
+            float* in = nullptr;
+            uint8_t *out = nullptr, *back = nullptr;
+            cudaEvent_t ev = nullptr;
+            if (cudaMalloc((void**) &in, n_in * 4) != cudaSuccess ||
+                cudaMalloc((void**) &out, 2 * set_bytes) != cudaSuccess ||
+                cudaMallocHost((void**) &back, 2 * set_bytes) != cudaSuccess ||
+                cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                if (in != nullptr) cudaFree(in);
+                if (out != nullptr) cudaFree(out);
+                if (back != nullptr) cudaFreeHost(back);
+                if (ev != nullptr) cudaEventDestroy(ev);
+                return fail_at("its buffers");
+            }
+            float *h = in, *mixes = in + (size_t) T * 4 * D, *lag = mixes + 32 * T, *wsyn = lag + 8 * T;
+            std::vector<float> hin(n_in);   // (the host's inputs: written again only after the run before has ended)
+            int runs = 0;
+            std::string bad;
+            for (const Layer* lp : ls)
+                for (int kind = 0; kind < 3 && bad.empty(); ++kind)
+                    for (int ffn = 0; ffn < 2 && bad.empty(); ++ffn) {
+                        const Layer& l = *lp;
+                        const bool q8 = !ffn || ffn_q8;   // (x's int8 rows: the attention's; the FFN's with ffn_q8)
+                        float *hh = hin.data(), *hm = hh + (size_t) T * 4 * D, *hl = hm + 32 * T, *hw = hl + 8 * T;
+                        for (int t = 0; t < T; ++t)
+                            for (int e = 0; e < D; ++e) {
+                                const int blk = e / 32, lane = e % 32;
+                                for (int k = 0; k < 4; ++k) {
+                                    float v = rnd() * (float) (1 + k);
+                                    if (kind == 1)
+                                        switch (blk % 8) {
+                                            case 0: v = 0.0f; break;
+                                            case 1: v = -0.0f; break;
+                                            case 2: v = rnd() * 1e-20f; break;
+                                            case 3: v = rnd() * 1e15f; break;
+                                            case 4: v = lane == 5 ? 1000.0f : rnd(); break;
+                                            default: break;
+                                        }
+                                    if (kind == 2) v = k == 0 ? (blk % 2 ? -8.0f : 8.0f) : 7.0f;
+                                    hh[((size_t) t * 4 + k) * D + e] = v;
+                                }
+                                hw[e] = (lane == 0 ? 127.0f : (float) (lane - 16) + 0.5f) * (blk % 2 ? 2.0f : 1.0f);
+                            }
+                        for (int t = 0; t < T; ++t)
+                            for (int i = 0; i < 32; ++i)   // (edges: every third mix +-80, expf past its range)
+                                hm[32 * t + i] = i < 24 ? rnd() * (kind == 1 && i % 3 == 0 ? 20.0f : 1.0f) : 0.0f;
+                        const float lag_k[3][4] = {{0.4f, 0.9f, 0.6f, 1.2f}, {1.5f, 0.0f, -0.75f, 0.25f}, {1, 0, 0, 0}};
+                        for (int t = 0; t < T; ++t)
+                            for (int i = 0; i < 8; ++i) {
+                                if (i < 4) hl[8 * t + i] = lag_k[kind][i];
+                                else std::memcpy(&hl[8 * t + i], &kSent[i], 4);
+                            }
+                        const float* w = kind == 2 ? wsyn : ffn ? l.ffn_norm : l.attn_norm;
+                        uint8_t* set[2] = {out, out + set_bytes};   // the old path's, the fused one's
+                        auto F = [&](int b, int r) { return (float*) (set[b] + at[r]); };
+                        bool ok = cudaMemcpyAsync(in, hin.data(), n_in * 4, cudaMemcpyHostToDevice, s) == cudaSuccess &&
+                                  cudaMemsetAsync(out, 0xA5, 2 * set_bytes, s) == cudaSuccess;
+                        for (int b = 0; b < 2; ++b)
+                            for (int t = 0; ok && t < T; ++t)
+                                ok = cudaMemcpyAsync(set[b] + at[kPre] + 32 * t, kSent, 32, cudaMemcpyHostToDevice,
+                                                     s) == cudaSuccess;
+                        x3::MvJob j[4];
+                        int nj = 0;
+                        auto ffn_jobs = [&](float* x, float* y1, float* y3) {   // (the shared expert's w1 / w3 on x)
+                            j[0] = job(l.s1, x, y1, T, D, FF);
+                            j[1] = job(l.s3, x, y3, T, D, FF);
+                            return 2;
+                        };
+                        if (ok) {   // the old path
+                            hc_split(mixes, ffn ? l.hcf_scale : l.hca_scale, ffn ? l.hcf_base : l.hca_base, g.hc,
+                                     g.sinkhorn, g.hc_eps, T, F(0, kPre), F(0, kPost), F(0, kComb), s);
+                            hc_pre_norm(h, lag, w, D, g.hc, T, g.eps, F(0, kX), s);
+                            if (ffn)
+                                ok = cudaMemcpyAsync(F(0, kCopy), F(0, kPre), (size_t) 32 * T, cudaMemcpyDeviceToDevice,
+                                                     s) == cudaSuccess;
+                            if (ok && q8) {
+                                for (int t = 0; t < T; ++t)
+                                    gg::q8_round(F(0, kX) + (size_t) t * D, D,
+                                                 (int8_t*) (set[0] + at[kQ]) + (size_t) t * D,
+                                                 F(0, kQd) + (size_t) t * (D / 32), s);
+                                nj = ffn ? ffn_jobs(F(0, kX), F(0, kS1), F(0, kS3))
+                                         : attn_in_jobs(l, F(0, kX), F(0, kQr), F(0, kKvr), F(0, kCkr), F(0, kCgr), T,
+                                                        j);
+                                ok = mv_any(j, nj, s);
+                            }
+                        }
+                        if (ok) {   // the fused one
+                            HcFuse a = hc_args(l, ffn != 0, mixes, h, lag, F(1, kX),
+                                               q8 ? (int8_t*) (set[1] + at[kQ]) : nullptr, q8 ? F(1, kQd) : nullptr,
+                                               F(1, kPre), F(1, kPost), F(1, kComb), ffn ? F(1, kCopy) : nullptr);
+                            a.w = w;
+                            hc_split_pre_norm(a, s, T);
+                            if (q8) {
+                                gg::PreQ8 pq;
+                                pq.x = F(1, kX);
+                                pq.q = (const int8_t*) (set[1] + at[kQ]);
+                                pq.d = F(1, kQd);
+                                pq.k = D;
+                                pq.rows = T;
+                                nj = ffn ? ffn_jobs(F(1, kX), F(1, kS1), F(1, kS3))
+                                         : attn_in_jobs(l, F(1, kX), F(1, kQr), F(1, kKvr), F(1, kCkr), F(1, kCgr), T,
+                                                        j);
+                                ok = mv_any(j, nj, s, &pq);
+                                if (!ffn) kind_run[nj] = true;
+                            }
+                        }
+                        ok = ok && cudaGetLastError() == cudaSuccess &&
+                             cudaMemcpyAsync(back, out, 2 * set_bytes, cudaMemcpyDeviceToHost, s) == cudaSuccess;
+                        // (the end of whatever went in: its event, else the stream itself - bounded)
+                        const bool recorded = ok && cudaEventRecord(ev, s) == cudaSuccess;
+                        const auto t0 = std::chrono::steady_clock::now();
+                        cudaError_t q;
+                        while ((q = recorded ? cudaEventQuery(ev) : cudaStreamQuery(s)) == cudaErrorNotReady &&
+                               std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+                            std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        if (q != cudaSuccess)
+                            hc_unknown(d.id, l.il, ffn != 0,
+                                       q == cudaErrorNotReady ? "no end in time" : "an error at its end");
+                        if (!recorded) {   // (a CUDA error before the end, which was clean)
+                            (void) cudaGetLastError();
+                            bad = "a launch refused or a CUDA error";
+                            break;
+                        }
+                        ++runs;
+                        const char* what[3] = {"random", "edges", "ties"};
+                        auto where = [&](const std::string& r, size_t o) {
+                            return "layer " + std::to_string(l.il) + (ffn ? " FFN, " : " attention, ") + what[kind] +
+                                   ": " + r + " byte " + std::to_string(o);
+                        };
+                        const uint8_t *A = back, *B = back + set_bytes;
+                        for (size_t o = 0; o < set_bytes && bad.empty(); ++o)
+                            if (A[o] != B[o]) bad = where("an output", o);
+                        const char* rname[kRegions] = {"pre",       "post",        "comb",
+                                                       "the pre copy", "x",        "int8",
+                                                       "scale",     "q's GEMV",    "the KV GEMV",
+                                                       "the compressed KV GEMV",   "its gate GEMV",
+                                                       "the shared expert's w1 GEMV", "its w3 GEMV"};
+                        for (int r = 0; r < kRegions && bad.empty(); ++r) {   // (A == B now: A's guards and values)
+                            const size_t lo = r == 0 ? 0 : (at[r - 1] + rb[r - 1]);
+                            for (size_t o = lo; o < at[r] && bad.empty(); ++o)
+                                if (A[o] != 0xA5) bad = where(std::string("a guard before ") + rname[r], o);
+                            const bool written = r == kX || r == kPre || r == kPost || r == kComb ||
+                                                 (ffn && r == kCopy) || (q8 && r == kQd) ||
+                                                 (!ffn && r >= kQr && r <= kCgr && r - kQr < nj) ||
+                                                 (ffn && q8 && (r == kS1 || r == kS3));
+                            if (!written || r == kQ) continue;
+                            const size_t n = r == kPre || r == kPost || r == kCopy ? 4
+                                             : r == kComb                          ? 16
+                                             : r >= kS1                            ? (size_t) j[r - kS1].m->n
+                                             : r >= kQr                            ? (size_t) j[r - kQr].m->n
+                                                                                   : rb1[r] / 4;   // (a row's)
+                            for (int t = 0; t < T; ++t)
+                                for (size_t i = 0; i < n && bad.empty(); ++i) {
+                                    const size_t o = rb1[r] * t + 4 * i;
+                                    float v;
+                                    std::memcpy(&v, A + at[r] + o, 4);
+                                    if (!std::isfinite(v) || (r == kQd && !(v >= 0.0f))) bad = where(rname[r], o);
+                                }
+                        }
+                        for (size_t o = at[kRegions - 1] + rb[kRegions - 1]; o < set_bytes && bad.empty(); ++o)
+                            if (A[o] != 0xA5) bad = where("the last guard", o);
+                    }
+            cudaFree(in);   // (every run ended cleanly)
+            cudaFree(out);
+            cudaFreeHost(back);
+            cudaEventDestroy(ev);
+            if (!bad.empty()) return fail_at(bad);
+            std::string kinds;
+            for (int k = 2; k <= 4; ++k) {
+                if (kind_held[k] && !kind_run[k])
+                    return fail_at("the attention's " + std::to_string(k) + "-GEMV input not checked");
+                if (kind_run[k]) kinds += (kinds.empty() ? "" : ", ") + std::to_string(k);
+            }
+            std::string ids;
+            for (const Layer* lp : ls) ids += (ids.empty() ? "" : " ") + std::to_string(lp->il);
+            std::fprintf(stderr,
+                         "ds4: CUDA%d HC fuse check%s: %d runs (layers %s; attention inputs of %s GEMVs; attention and "
+                         "FFN; random / edges / ties): pre, post, comb, the pre copy, x, its int8 rounding and the "
+                         "attention GEMVs%s the old kernels' bit for bit, all finite, every guard intact "
+                         "(DS4_HC_FUSE%s)\n",
+                         d.id, rows.c_str(), runs, ids.c_str(), kinds.c_str(),
+                         ffn_q8 ? ", the FFN's int8 rounding and the shared expert's w1 / w3 GEMVs" : "",
+                         ffn_q8 ? "=2" : "");
+        }
+        return true;
+    }
+
+    // DS4_ROUTE_FUSE=1 (at load, before any request), on every device with layers: gemv_f32_pair and route_pair (with
+    // its publish) against what they replace - two gemv_f32 launches; route_ahead, then route_publish with its publish.
+    // The GEMVs: the device's first and last pair of a layer and its next (and the first layer with an image-token
+    // bias), their real gates on a random and an edge x (zeros, negative zeros, tiny and large magnitudes), plus rows
+    // not a whole block (300 and 13 of the first gate's).  The routing: the real logits, real gates' biases and VRAM
+    // table; tied logits, logits past the softplus's 20 and negative, the request's x copied (a pick on the CPU lane)
+    // and not (every pick in VRAM), no image bias / its bit on / its pointer given and its bit off, n 257 (not a whole
+    // block), m 1, k and 16.  Every output (both logits, idx / w / plan_ptr, the whole request) starts 0xA5 between
+    // guards; both paths' bytes must be equal - every value, untouched byte and guard - and the weights finite.  On
+    // d.st, each run's end waited for (10 s): a mismatch or an error after a clean end fails the load (everything
+    // freed); no clean end ends the process at once (route_unknown).  T rows (DS4_ROUTE_FUSE=2: 3 and kWin, a decode
+    // window's - 3 a part of gemv_f32_rows_kernel's 8 tokens a block, kWin two whole ones): x, both logits, the picks,
+    // weights and plan T rows at the decode buffers' strides, the old path's gemv_f32 / route_ahead / route_publish
+    // on T rows, the image bit on row 0 or 1; T 1 is the check above
+    [[noreturn]] static void route_unknown(int dev, int il, const char* what, const char* why) {
+        std::fprintf(stderr, "ds4: route fuse check: CUDA%d (layer %d, %s): %s - the device's state unknown; the "
+                             "process ends without teardown (exit %d)\n",
+                     dev, il, what, why, kExitUnknown);
+        std::fflush(stderr);
+        std::fflush(stdout);
+        std::_Exit(kExitUnknown);
+    }
+    bool route_fuse_check(std::string& err, int T = 1) {
+        const int D = g.dim;
+        constexpr size_t kGuard = 64;
+        // one set of outputs: [guard | region]... | guard, in bytes (T rows each, the decode buffers' strides)
+        enum { kLog, kLogA, kIdx, kW, kPlan, kReq, kRegions };
+        const size_t rb[kRegions] = {(size_t) T * 1024 * 4,   (size_t) T * 1024 * 4,   (size_t) T * kPicks * 4,
+                                     (size_t) T * kPicks * 4, (size_t) T * kPicks * 8, sizeof(Req)};
+        size_t at[kRegions], set_bytes = 0;
+        for (int r = 0; r < kRegions; ++r) {
+            at[r] = set_bytes + kGuard;
+            set_bytes = (at[r] + rb[r] + 255) / 256 * 256;
+        }
+        set_bytes += kGuard;
+        // inputs: x | synthetic logits, the guesses' logits (T rows each) | biases (routing, image, guesses) | a VRAM
+        // table
+        const size_t n_in = (size_t) T * (D + 2 * 1024) + 1024 * 3;
+        const std::string rows = T > 1 ? " (" + std::to_string(T) + " rows)" : "";
+        uint32_t st = 0x7f4a7c15u;
+        auto rnd = [&]() {
+            st = st * 1664525u + 1013904223u;
+            return (float) (int) (st % 2001u - 1000u) / 250.0f;   // -4 .. 4
+        };
+        for (size_t di = 0; di < devs.size(); ++di) {
+            Dev& d = devs[(size_t) di];
+            // (a layer, its next layer: both this device's member of the trunk's consecutive layers)
+            std::vector<std::pair<const Layer*, const Layer*>> pairs, all;
+            for (size_t j = 0; j + 1 < L.size(); ++j) {
+                const Layer &a0 = L[j], &b0 = L[j + 1];
+                if (a0.mtp || b0.mtp) continue;
+                for (int m = 0; m < a0.nm && m < b0.nm; ++m)
+                    if (member(a0, m).dev == (int) di && member(b0, m).dev == (int) di &&
+                        member(a0, m).gate_w != nullptr && member(b0, m).gate_w != nullptr &&
+                        member(a0, m).n_exp <= 1024 && member(b0, m).n_exp <= 1024)
+                        all.push_back({&member(a0, m), &member(b0, m)});
+            }
+            if (all.empty()) continue;
+            pairs.push_back(all.front());
+            if (all.size() > 1) pairs.push_back(all.back());
+            for (const auto& p : all)
+                if (p.first->gate_bias_vl != nullptr) {
+                    if (std::find(pairs.begin(), pairs.end(), p) == pairs.end()) pairs.push_back(p);
+                    break;
+                }
+            auto fail_at = [&](const std::string& why) {
+                err = "route fuse check" + rows + " on CUDA" + std::to_string(d.id) + ": " + why;
+                std::fprintf(stderr, "ds4: CUDA%d route fuse check%s FAILED: %s\n", d.id, rows.c_str(), why.c_str());
+                return false;
+            };
+            if (cudaSetDevice(d.id) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return fail_at("cudaSetDevice failed");
+            }
+            const cudaStream_t s = d.st;
+            float* in = nullptr;
+            uint8_t *out = nullptr, *back = nullptr;
+            cudaEvent_t ev = nullptr;
+            if (cudaMalloc((void**) &in, n_in * 4) != cudaSuccess ||
+                cudaMalloc((void**) &out, 2 * set_bytes) != cudaSuccess ||
+                cudaMallocHost((void**) &back, 2 * set_bytes) != cudaSuccess ||
+                cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                if (in != nullptr) cudaFree(in);
+                if (out != nullptr) cudaFree(out);
+                if (back != nullptr) cudaFreeHost(back);
+                if (ev != nullptr) cudaEventDestroy(ev);
+                return fail_at("its buffers");
+            }
+            float *x = in, *lg = in + (size_t) D * T, *lga = lg + 1024 * T, *bias = lga + 1024 * T,
+                  *bias_vl = bias + 1024;
+            unsigned long long* vram = (unsigned long long*) (bias_vl + 1024);   // (1024 floats: 512 entries)
+            std::vector<float> hin(n_in);   // (the host's inputs: written again only after the run before has ended)
+            uint8_t* set[2] = {out, out + set_bytes};   // the old path's, the fused one's
+            auto F = [&](int b, int r) { return (float*) (set[b] + at[r]); };
+            int runs = 0;
+            std::string bad;
+            // one run: the inputs up, both sets filled, the old path (b 0) then the fused one (b 1), the readback, its
+            // end; then every byte compared
+            auto run = [&](const char* what, int il, auto&& old_path, auto&& new_path, size_t n_log, size_t n_loga,
+                           int k) {
+                bool ok = cudaMemcpyAsync(in, hin.data(), n_in * 4, cudaMemcpyHostToDevice, s) == cudaSuccess &&
+                          cudaMemsetAsync(out, 0xA5, 2 * set_bytes, s) == cudaSuccess;
+                ok = ok && old_path() && new_path();
+                ok = ok && cudaGetLastError() == cudaSuccess &&
+                     cudaMemcpyAsync(back, out, 2 * set_bytes, cudaMemcpyDeviceToHost, s) == cudaSuccess;
+                const bool recorded = ok && cudaEventRecord(ev, s) == cudaSuccess;
+                const auto t0 = std::chrono::steady_clock::now();
+                cudaError_t q;
+                while ((q = recorded ? cudaEventQuery(ev) : cudaStreamQuery(s)) == cudaErrorNotReady &&
+                       std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                if (q != cudaSuccess)
+                    route_unknown(d.id, il, what, q == cudaErrorNotReady ? "no end in time" : "an error at its end");
+                if (!recorded) {   // (a CUDA error or a refused launch before the end, which was clean)
+                    (void) cudaGetLastError();
+                    bad = std::string(what) + ", layer " + std::to_string(il) + ": a launch refused or a CUDA error";
+                    return;
+                }
+                ++runs;
+                const uint8_t *A = back, *B = back + set_bytes;
+                for (size_t o = 0; o < set_bytes && bad.empty(); ++o)
+                    if (A[o] != B[o])
+                        bad = std::string(what) + ", layer " + std::to_string(il) + ": an output byte " +
+                              std::to_string(o);
+                size_t prev = 0;   // (A == B now: A's guards and values)
+                for (int r = 0; r < kRegions && bad.empty(); ++r) {
+                    for (size_t o = prev; o < at[r] && bad.empty(); ++o)
+                        if (A[o] != 0xA5) bad = std::string(what) + ": a guard byte " + std::to_string(o);
+                    prev = at[r] + rb[r];
+                }
+                for (size_t o = prev; o < set_bytes && bad.empty(); ++o)
+                    if (A[o] != 0xA5) bad = std::string(what) + ": the last guard byte " + std::to_string(o);
+                const size_t nf[3] = {n_log, n_loga, (size_t) k};   // (the logits written, then the weights: a row's)
+                const int rf[3] = {kLog, kLogA, kW};
+                const size_t rs[3] = {1024, 1024, kPicks};   // (rows apart)
+                for (int q2 = 0; q2 < 3 && bad.empty(); ++q2)
+                    for (int t = 0; t < T; ++t)
+                        for (size_t i = 0; i < nf[q2] && bad.empty(); ++i) {
+                            float v;
+                            std::memcpy(&v, A + at[rf[q2]] + 4 * (rs[q2] * t + i), 4);
+                            if (!std::isfinite(v)) bad = std::string(what) + ": a value not finite";
+                        }
+            };
+            for (const auto& pr : pairs) {
+                const Layer &l = *pr.first, &nx = *pr.second;
+                for (int kind = 0; kind < 2 && bad.empty(); ++kind) {   // the GEMVs: random, edges
+                    for (size_t e = 0; e < (size_t) D * T; ++e) {
+                        float v = rnd();
+                        if (kind == 1)
+                            switch ((e % (size_t) D / 32) % 6) {
+                                case 0: v = 0.0f; break;
+                                case 1: v = -0.0f; break;
+                                case 2: v *= 1e-20f; break;
+                                case 3: v *= 1e15f; break;
+                                default: break;
+                            }
+                        hin[(size_t) e] = v;
+                    }
+                    run(kind ? "the gates, edges" : "the gates, random", l.il,
+                        [&] {
+                            gemv_f32(l.gate_w, x, l.n_exp, D, T, F(0, kLog), 1024, s);
+                            gemv_f32(nx.gate_w, x, nx.n_exp, D, T, F(0, kLogA), 1024, s);
+                            return true;
+                        },
+                        [&] {
+                            return gemv_f32_pair(l.gate_w, l.n_exp, F(1, kLog), nx.gate_w, nx.n_exp, F(1, kLogA), x, D,
+                                                 s, T, 1024);
+                        },
+                        (size_t) l.n_exp, (size_t) nx.n_exp, 0);
+                }
+            }
+            const Layer &l = *pairs.front().first, &nx = *pairs.front().second;
+            if (bad.empty())   // (rows not a whole block: 300 and 13 of the first gate's)
+                run("the gates, 300 and 13 rows", l.il,
+                    [&] {
+                        gemv_f32(l.gate_w, x, std::min(300, l.n_exp), D, T, F(0, kLog), 1024, s);
+                        gemv_f32(nx.gate_w, x, std::min(13, nx.n_exp), D, T, F(0, kLogA), 1024, s);
+                        return true;
+                    },
+                    [&] {
+                        return gemv_f32_pair(l.gate_w, std::min(300, l.n_exp), F(1, kLog), nx.gate_w,
+                                             std::min(13, nx.n_exp), F(1, kLogA), x, D, s, T, 1024);
+                    },
+                    (size_t) std::min(300, l.n_exp), (size_t) std::min(13, nx.n_exp), 0);
+            // the routing: logits kind (0 real - the first gates' on a random x, 1 ties, 2 past 20 and negative, 3
+            // random), VRAM (0 the layer's, 1 every pick in VRAM, 2 none, 3 mixed), image bias (0 none, 1 its bit on,
+            // 2 its pointer and its bit off), n (0 the layer's, 1 257), m
+            struct Case {
+                int logits, vram, vl, n257, m;
+            };
+            const Case cases[] = {{0, 0, 0, 0, l.k_exp}, {1, 1, 0, 0, kAhead1}, {1, 2, 1, 0, 1}, {2, 3, 2, 0, l.k_exp},
+                                  {3, 3, 0, 1, kAhead1}, {0, 2, l.gate_bias_vl != nullptr ? 1 : 0, 0, l.k_exp}};
+            for (const Case& c : cases) {
+                if (!bad.empty()) break;
+                const int n = c.n257 ? std::min(257, l.n_exp) : l.n_exp;
+                const int an = c.n257 ? std::min(257, nx.n_exp) : nx.n_exp;
+                for (size_t e = 0; e < (size_t) D * T; ++e) hin[e] = rnd();
+                float *hl = hin.data() + (size_t) D * T, *hla = hl + 1024 * T, *hb = hla + 1024 * T, *hbv = hb + 1024;
+                for (int t = 0; t < T; ++t)
+                    for (int i = 0; i < 1024; ++i) {
+                        float v = rnd(), va = rnd();
+                        if (c.logits == 1) v = (float) (i % 5) * 0.5f, va = (float) (i % 3);          // ties
+                        if (c.logits == 2) v = i % 2 ? 20.0f + (float) (i % 7) : -v * 10.0f, va = -va * 5.0f;
+                        hl[1024 * t + i] = v;
+                        hla[1024 * t + i] = va;
+                        if (t > 0) continue;   // (the biases: one set)
+                        hb[i] = c.logits == 1 ? 0.0f : 0.05f * rnd();
+                        hbv[i] = 0.05f * rnd();
+                    }
+                unsigned long long* hv = (unsigned long long*) (hbv + 1024);
+                for (int i = 0; i < 512; ++i)   // (every pick in VRAM, none, or two in three)
+                    hv[i] = c.vram == 1   ? 0x1000ull + (unsigned long long) i * 64
+                            : c.vram == 2 ? 0ull
+                                          : (i % 3 ? 0x2000ull + (unsigned long long) i : 0ull);
+                const unsigned vl = c.vl == 1 ? 1u : c.vl == 2 ? 2u : 0u;
+                const float* bv = c.vl == 0                                    ? nullptr
+                                  : c.logits == 0 && l.gate_bias_vl != nullptr ? l.gate_bias_vl
+                                                                               : bias_vl;
+                const float* rb0 = c.logits == 0 ? l.gate_bias : bias;
+                const float* rba = c.logits == 0 ? nx.gate_bias : bias;
+                const unsigned long long* vt = c.vram == 0 ? l.vram_tab : vram;
+                if (c.vram == 0 && vt == nullptr) continue;   // (no VRAM table on this member: nothing to compare)
+                if (c.vram != 0 && n > 512) continue;
+                const unsigned seq = 0x51u + (unsigned) runs;
+                run("the routing", l.il,
+                    [&] {
+                        if (c.logits == 0) {   // (the logits: the first gates' on this x, the same in both sets)
+                            gemv_f32(l.gate_w, x, n, D, T, F(0, kLog), 1024, s);
+                            gemv_f32(nx.gate_w, x, an, D, T, F(0, kLogA), 1024, s);
+                            gemv_f32(l.gate_w, x, n, D, T, F(1, kLog), 1024, s);
+                            gemv_f32(nx.gate_w, x, an, D, T, F(1, kLogA), 1024, s);
+                        } else {
+                            for (int b = 0; b < 2; ++b)
+                                if (cudaMemcpyAsync(F(b, kLog), lg, (size_t) T * 1024 * 4, cudaMemcpyDeviceToDevice,
+                                                    s) != cudaSuccess ||
+                                    cudaMemcpyAsync(F(b, kLogA), lga, (size_t) T * 1024 * 4, cudaMemcpyDeviceToDevice,
+                                                    s) != cudaSuccess)
+                                    return false;
+                        }
+                        Req* rq = (Req*) (set[0] + at[kReq]);
+                        route_ahead(F(0, kLogA), rba, an, c.m, T, rq, 0, s);
+                        route_publish(F(0, kLog), rb0, n, l.k_exp, T, g.route_scale, vt, x, D, (int*) F(0, kIdx),
+                                      F(0, kW), (unsigned long long*) F(0, kPlan), rq, seq, s, bv, vl, c.m, 0);
+                        return true;
+                    },
+                    [&] {
+                        RoutePair a;
+                        a.logits = F(1, kLog);
+                        a.bias = rb0;
+                        a.n = n;
+                        a.k = l.k_exp;
+                        a.route_scale = g.route_scale;
+                        a.vram = vt;
+                        a.x = x;
+                        a.dim = D;
+                        a.idx = (int*) F(1, kIdx);
+                        a.w = F(1, kW);
+                        a.plan_ptr = (unsigned long long*) F(1, kPlan);
+                        a.req = (Req*) (set[1] + at[kReq]);
+                        a.vl = vl;
+                        a.bias_vl = vl != 0 ? bv : nullptr;
+                        a.seq = seq;
+                        a.na0 = c.m;
+                        a.a_logits = F(1, kLogA);
+                        a.a_bias = rba;
+                        a.a_n = an;
+                        a.m = c.m;
+                        a.T = T;
+                        return route_pair(a, s);
+                    },
+                    c.logits == 0 ? (size_t) n : 1024, c.logits == 0 ? (size_t) an : 1024, l.k_exp);
+            }
+            cudaFree(in);   // (every run ended cleanly)
+            cudaFree(out);
+            cudaFreeHost(back);
+            cudaEventDestroy(ev);
+            if (!bad.empty()) return fail_at(bad);
+            std::string ids;
+            for (const auto& p : pairs) ids += (ids.empty() ? "" : " ") + std::to_string(p.first->il);
+            std::fprintf(stderr,
+                         "ds4: CUDA%d route fuse check%s: %d runs (gates of layers %s and their next; the routing: "
+                         "real, tied, past 20 and negative logits, the request's x copied and not, the image bias off "
+                         "/ on / given and off, n 257, m 1 .. 16): both logits, the picks, weights, plan and the whole "
+                         "request the old launches' bit for bit, all finite, every guard intact (DS4_ROUTE_FUSE%s)\n",
+                         d.id, rows.c_str(), runs, ids.c_str(), T > 1 ? "=2" : "");
+        }
+        return true;
+    }
+
     // DS4_TP_CHECK=1 (DS4_TP_GGUF_UNEVEN, at load, before any request): for each expert format and each rotation of the
     // split layers (which member takes the odd block) - every one they have - one token through every member's parts
     // (tp_check_member: three experts the layer holds in VRAM, weights 0.5 / 0.3 / 0.2, and the shared expert), the
@@ -10422,10 +11057,10 @@ struct Model::Impl {
     }
 
     // a GGUF's matrices (BF16 / MXFP4) to its own kernels, EXL3 ones to x3's
-    static bool mv_any(const x3::MvJob* j, int n, cudaStream_t s) {
+    static bool mv_any(const x3::MvJob* j, int n, cudaStream_t s, const gg::PreQ8* pre = nullptr) {
         bool g = false;
         for (int i = 0; i < n; ++i) g = g || j[i].m->fmt != 0;
-        return g ? gg::mv(j, n, s) : x3::mv(j, n, s);
+        return g ? (pre != nullptr ? gg::mv(j, n, s, pre) : gg::mv(j, n, s)) : x3::mv(j, n, s);
     }
     bool mv(Dev& d, std::initializer_list<x3::MvJob> jobs, std::string& err) {
         x3::MvJob j[x3::kMaxMvJobs];
@@ -10437,9 +11072,9 @@ struct Model::Impl {
         }
         return true;
     }
-    bool mv_n(Dev& d, x3::MvJob* j, int n, std::string& err) {
+    bool mv_n(Dev& d, x3::MvJob* j, int n, std::string& err, const gg::PreQ8* pre = nullptr) {
         for (int a = 0; a < n; a += x3::kMaxMvJobs)
-            if (!mv_any(j + a, std::min(x3::kMaxMvJobs, n - a), d.st)) {
+            if (!mv_any(j + a, std::min(x3::kMaxMvJobs, n - a), d.st, pre)) {
                 err = "exl3 mv failed";
                 return false;
             }
@@ -10457,6 +11092,43 @@ struct Model::Impl {
         j.xf_cs = x_cs;
         j.y_cs = y_cs;
         return j;
+    }
+    // the attention's input GEMVs of layer l on x: q's low rank, the KV row, and the compressed KV and its gate where
+    // the layer has them
+    int attn_in_jobs(const Layer& l, const float* x, float* qr, float* kvr, float* ckr, float* cgr, int T,
+                     x3::MvJob* j) const {
+        const int D = g.dim, HD = g.hd;
+        int nj = 0;
+        j[nj++] = job(l.wq_a, x, qr, T, D, g.q_lora);
+        j[nj++] = job(l.wkv, x, kvr, T, D, HD);
+        if (l.kv_src) j[nj++] = job(l.c_wkv, x, ckr, T, D, HD);
+        if (l.kv_src && l.ratio > 1) j[nj++] = job(l.c_wgate, x, cgr, T, D, HD);
+        return nj;
+    }
+    // (DS4_HC_FUSE) hc_split_pre_norm's arguments for layer l's attention (ffn false) or FFN: its split weights and
+    // norm, the model's constants, these buffers (a decoded token's)
+    HcFuse hc_args(const Layer& l, bool ffn, const float* mixes, const float* h, const float* mix, float* x, int8_t* q,
+                   float* qd, float* pre, float* post, float* comb, float* pre_copy) const {
+        HcFuse a;
+        a.mixes = mixes;
+        a.scale = ffn ? l.hcf_scale : l.hca_scale;
+        a.base = ffn ? l.hcf_base : l.hca_base;
+        a.hc = g.hc;
+        a.iters = g.sinkhorn;
+        a.hc_eps = g.hc_eps;
+        a.pre = pre;
+        a.post = post;
+        a.comb = comb;
+        a.pre_copy = pre_copy;
+        a.h = h;
+        a.mix = mix;
+        a.w = ffn ? l.ffn_norm : l.attn_norm;
+        a.dim = g.dim;
+        a.eps = g.eps;
+        a.x = x;
+        a.q = q;
+        a.qd = qd;
+        return a;
     }
 
     // ---- the DSpark drafter (DeepSeek's DSparkBlock / forward_spec).  Its blocks' rings hold the trunk's main KV:
@@ -13225,7 +13897,10 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
         const int nm = L0.nm;
-        const bool hs = hc_side();   // (the mixes on st2)
+        // (DS4_HC_FUSE: a decoded token's split and norm in one launch on st, so its mixes are not beside it; =2 a
+        // window's rows too)
+        const bool fuse = hc_fuse && !l.mtp && (T == 1 || (hc_fuse_win && T <= kWin));
+        const bool hs = hc_side() && !fuse;   // (the mixes on st2)
         cudaStream_t hcs = hs ? d.st2 : s;
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
@@ -13256,17 +13931,24 @@ struct Model::Impl {
             CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
         }
         hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
-        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, hcs);
-        if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
-        hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
+        gg::PreQ8 xq8;
+        if (fuse) {
+            hc_split_pre_norm(
+                hc_args(l, false, d.mix, d.h, d.pre, d.x, d.xq8, d.xd8, d.a_pre, d.a_post, d.a_comb, nullptr), s, T);
+            xq8.x = d.x;
+            xq8.q = d.xq8;
+            xq8.d = d.xd8;
+            xq8.k = D;
+            xq8.rows = T;
+        } else {
+            hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, hcs);
+            if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
+            hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
+        }
         {
             x3::MvJob j[4];
-            int nj = 0;
-            j[nj++] = job(l.wq_a, d.x, d.qr, T, D, g.q_lora);
-            j[nj++] = job(l.wkv, d.x, d.kvr, T, D, HD);
-            if (l.kv_src) j[nj++] = job(l.c_wkv, d.x, d.ckr, T, D, HD);
-            if (l.kv_src && l.ratio > 1) j[nj++] = job(l.c_wgate, d.x, d.cgr, T, D, HD);
-            if (!mv_n(d, j, nj, err)) return false;
+            const int nj = attn_in_jobs(l, d.x, d.qr, d.kvr, d.ckr, d.cgr, T, j);
+            if (!mv_n(d, j, nj, err, fuse ? &xq8 : nullptr)) return false;
         }
         Finish fq;
         fq.w = l.q_norm;
@@ -13499,32 +14181,84 @@ struct Model::Impl {
             CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
         }
         hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
-        hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, hcs);
-        if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
-        hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+        if (fuse)   // (d.pre's copy of f_pre now: nothing here reads d.pre before the layer's end)
+            hc_split_pre_norm(
+                hc_args(l, true, d.mix, d.h, d.a_pre, d.x, hc_fuse_win ? d.xq8 : nullptr, hc_fuse_win ? d.xd8 : nullptr,
+                        d.f_pre, d.f_post, d.f_comb, d.pre),
+                s, T);   // (=2: x rounded for the shared expert's w1 / w3 - xq8 now the FFN's)
+        else {
+            hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, hcs);
+            if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
+            hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+        }
+        const gg::PreQ8* ffn_q8 = fuse && hc_fuse_win ? &xq8 : nullptr;   // (the shared expert's w1 / w3 input)
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
             // router made), and waits for the answer only before the experts' sum
-            gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0 && sq != 0;   // (sq 0: a host-free layer - no mailbox, no wait)
-            int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
-            for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
-                const Layer* nx = ahead_layer(L0, a);
-                if (nx == nullptr) break;
-                const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
-                float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
-                gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
-                                                                         // weights instead: the same hit rate)
-                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
-                na[a - 1] = m;
+            // (DS4_ROUTE_FUSE: a decoded token's lead with one layer of lookahead and a next layer to guess - the two
+            //  gates in one launch, the routing and the guesses in another; =2 a window's rows too; every other case as
+            //  before)
+            const bool rf_t = T == 1 || (route_fuse_win && T <= kWin);
+            const Layer* nx1 = route_fuse && rf_t && !l.mtp && lead && ahead_mode == 1 ? ahead_layer(L0, 1) : nullptr;
+            const int m1 = nx1 != nullptr ? std::max(1, std::min(kAhead1, nx1->k_exp + ahead_extra)) : 0;
+            RoutePair rp;
+            if (nx1 != nullptr) {
+                rp.logits = d.glog;
+                rp.bias = l.gate_bias;
+                rp.n = l.n_exp;
+                rp.k = l.k_exp;
+                rp.route_scale = g.route_scale;
+                rp.vram = l.vram_tab;
+                rp.x = d.x;
+                rp.dim = D;
+                rp.idx = d.ridx;
+                rp.w = d.rw;
+                rp.plan_ptr = d.plan_ptr;
+                rp.req = reqs + slot;
+                rp.vl = wp.vl;
+                rp.bias_vl = rp.vl != 0 ? l.gate_bias_vl : nullptr;
+                rp.seq = sq;
+                rp.na0 = m1;
+                rp.a_logits = d.glog_a;
+                rp.a_bias = nx1->gate_bias;
+                rp.a_n = nx1->n_exp;
+                rp.m = m1;
+                rp.T = T;
             }
-            route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
-                          d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1]);
-            if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
+            if (route_fusable(l, nx1, m1, D)) {   // (a GEMV not gone in reaches no routing; a routing, no publish)
+                if (!gemv_f32_pair(l.gate_w, l.n_exp, d.glog, nx1->gate_w, nx1->n_exp, d.glog_a, d.x, D, s, T,
+                                   1024) ||
+                    !route_pair(rp, s)) {
+                    err = "the fused router stage: a launch did not go in";
+                    return false;
+                }
+            } else {
+                gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
+                // lookahead: the next layers' guesses (their gate on this FFN input), published below
+                int na[2] = {0, 0};
+                for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
+                    const Layer* nx = ahead_layer(L0, a);
+                    if (nx == nullptr) break;
+                    const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra))
+                                         : std::min(kPicks, nx->k_exp);
+                    float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
+                    gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
+                                                                             // weights instead: the same hit rate)
+                    route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                    na[a - 1] = m;
+                }
+                route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
+                              d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl,
+                              na[0], na[1]);
+            }
+            {
+                x3::MvJob js[2] = {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)};
+                if (!mv_n(d, js, 2, err, ffn_q8)) return false;
+            }
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
             prof_mark(d, 2);
@@ -13619,7 +14353,7 @@ struct Model::Impl {
             if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
-            CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
+            if (!fuse) CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             prof_mark(d, 5);
             return true;
         }
@@ -13638,7 +14372,10 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(h_x, d.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaEventRecord(d.ev, s));
         // the shared expert while the host looks at the picks
-        if (!mv(d, {job(l.s1, d.x, d.sg, T, D, g.ff), job(l.s3, d.x, d.su, T, D, g.ff)}, err)) return false;
+        {
+            x3::MvJob js[2] = {job(l.s1, d.x, d.sg, T, D, g.ff), job(l.s3, d.x, d.su, T, D, g.ff)};
+            if (!mv_n(d, js, 2, err, ffn_q8)) return false;
+        }
         swiglu(d.sg, d.su, T * g.ff, g.lim, d.sh, s);
         if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, g.ff, D)}, err)) return false;
         const double tw = now_ms();
@@ -13738,7 +14475,7 @@ struct Model::Impl {
         if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
-        CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
+        if (!fuse) CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         // (h_part / h_x are written again only after the next layer's route has synchronized, which follows these)
         return true;
     }

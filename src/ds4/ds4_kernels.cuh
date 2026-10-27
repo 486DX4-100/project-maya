@@ -78,6 +78,26 @@ void hc_post(const float* y, const float* res, const float* post, const float* c
 /// hc_post with out = res (h), the same arithmetic: a chunk keeps one copy of its streams.
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s);
+/// (DS4_HC_FUSE) a decoded token's hc_split and hc_pre_norm (T 1, hc 4) in one launch - they share nothing, the norm
+/// reading the lagged mix (the split before this one's) - each block its old kernel's code: the split of mixes into
+/// pre / post / comb (pre_copy set: the 8 pre slots there too, the values for k < hc and pre's own bits for the rest,
+/// as the layer's copy of them did), and x = rmsnorm(sum_s mix[s] h[s]) * w (q set: x's int8 rounding too, gguf mv's
+/// for a Q8_0 job's input - q [dim], qd [dim / 32]).  dim % 32 == 0, dim <= 8192; pre_copy not mix.
+struct HcFuse {
+    const float *mixes = nullptr, *scale = nullptr, *base = nullptr;
+    int hc = 4, iters = 1;
+    float hc_eps = 0.0f;
+    float *pre = nullptr, *post = nullptr, *comb = nullptr, *pre_copy = nullptr;
+    const float *h = nullptr, *mix = nullptr, *w = nullptr;
+    int dim = 0;
+    float eps = 0.0f;
+    float* x = nullptr;
+    int8_t* q = nullptr;
+    float* qd = nullptr;
+};
+/// T rows (DS4_HC_FUSE=2: a decode window's): row t's at hc_split's / hc_pre_norm's / q8's strides - mixes + 32 t,
+/// pre / post / pre_copy + 8 t, comb + 64 t, h + hc dim t, mix + 8 t, x / q + dim t, qd + dim / 32 t
+void hc_split_pre_norm(const HcFuse& a, cudaStream_t s, int T = 1);
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);
@@ -92,6 +112,11 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 /// inference computes them (linear(x.float(), weight.float())) - a warp a row, the same summing order for any T, so
 /// the token, window and chunk paths get the same bits.
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
+/// (DS4_ROUTE_FUSE) gemv_f32 for one token (T 1) of two matrices on the same x in one launch: y0 = x W0 (n0 rows), y1 =
+/// x W1 (n1 rows), each row gemv_f32's bits.  k a multiple of 4, else false and nothing launched; false too when the
+/// launch did not go in.  (=2) T up to kWin tokens: x's rows k apart, y0's and y1's ldy apart (ldy >= n0, n1).
+bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
+                   cudaStream_t s, int T = 1, int ldy = 0);
 
 /// The router, row t: scores = sqrt(softplus(logits[t])) (n experts, rows 1024 apart), the top `k` of scores + bias;
 /// weights from the unbiased scores, normalized to sum 1 (+1e-20) and times route_scale -> idx[t][i], w[t][i] (rows
@@ -274,6 +299,32 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
+/// (DS4_ROUTE_FUSE) a decoded token's (T 1) route_publish and route_ahead in one launch of two blocks, each its old
+/// kernel's code (disjoint request fields), then publish_kernel as route_publish launches it (na0 / na1, T 1, seq).
+/// (=2) T up to kWin: the two blocks a row (both logits rows 1024 apart), the publish with T.
+/// The caller passes bias_vl only when vl != 0, as route_publish does.  false, nothing launched: no request, n or a_n
+/// not 1 .. 1024, k not 1 .. kPicks, m < 1 or off + m past kAhead, dim not 1 .. kMaxDim, T not 1 .. kWin; false,
+/// nothing published: the routing's launch did not go in; false: the publish's launch did not go in.
+struct RoutePair {
+    const float *logits = nullptr, *bias = nullptr;   // route_publish's
+    int n = 0, k = 0;
+    float route_scale = 1.0f;
+    const unsigned long long* vram = nullptr;
+    const float* x = nullptr;
+    int dim = 0;
+    int* idx = nullptr;
+    float* w = nullptr;
+    unsigned long long* plan_ptr = nullptr;
+    Req* req = nullptr;
+    const float* bias_vl = nullptr;
+    unsigned vl = 0;
+    unsigned seq = 0;
+    int na0 = 0, na1 = 0;
+    const float *a_logits = nullptr, *a_bias = nullptr;   // route_ahead's
+    int a_n = 0, m = 0, off = 0;
+    int T = 1;   // (=2: a window's rows, 1 .. kWin)
+};
+bool route_pair(const RoutePair& a, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
 /// The helper GPU's share of request seq (DS4_HELPER): waits on the device until req holds it - or a later one, or
