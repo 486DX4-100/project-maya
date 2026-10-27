@@ -107,6 +107,16 @@ __device__ __forceinline__ void load_tab(uint32_t* tab) {
     }
 }
 
+// (#529) DS4_IQ_STRICT_FP: on RDNA 4 (gfx1200 / gfx1201) ROCm's clang contracted the token kernels' (NE 1) and the
+// window kernels' (NE 4) multiply-adds differently, so their sums differed in the last bits (ds4_gguf_test there):
+// there every rounding is explicit (no contraction, barriers the compiler cannot fold through) and IQ4_XS's rows load
+// in 16-bit halves.  Elsewhere - gfx11 and the other AMD GPUs, CUDA - the kernels compile as before (the same bits and
+// speed as v1.1.30: the barriers cost a Strix Halo ~7% of its decode).
+#if defined(STRATA_USE_HIP) && defined(__clang__) && (defined(__gfx1200__) || defined(__gfx1201__))
+#define DS4_IQ_STRICT_FP 1
+#else
+#define DS4_IQ_STRICT_FP 0
+#endif
 __device__ __forceinline__ uint32_t ld2(const uint8_t* p) {   // 4 bytes from a 2-byte aligned address
     const uint16_t* q = (const uint16_t*) p;
     return (uint32_t) q[0] | ((uint32_t) q[1] << 16);
@@ -307,7 +317,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         const uint8_t* qs = b + 8 + 16 * ib;
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
-            const int2 v = tab16(ld2(qs + 4 * t), tab);
+            const int2 v = tab16(DS4_IQ_STRICT_FP ? ld2(qs + 4 * t) : ld4(qs + 4 * t), tab);
             s.q[t] = v.x;
             s.q[4 + t] = v.y;
         }
@@ -323,7 +333,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.s0 = s.s1 = sc;
         s.d = h2f(b);
         float m0 = h2f(b + 2) * (float) m;
-#if defined(STRATA_USE_HIP) && defined(__clang__)   // (#529: AMD clang only - "v" is a VGPR)
+#if DS4_IQ_STRICT_FP
         asm volatile("" : "+v"(m0));
 #endif
         s.m0 = s.m1 = m0;
@@ -338,7 +348,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.s0 = s.s1 = sc;
         s.d = h2f(b);
         float m0 = h2f(b + 2) * (float) m;
-#if defined(STRATA_USE_HIP) && defined(__clang__)   // (#529: AMD clang only - "v" is a VGPR)
+#if DS4_IQ_STRICT_FP
         asm volatile("" : "+v"(m0));
 #endif
         s.m0 = s.m1 = m0;
@@ -353,7 +363,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.s1 = c1 & 15;
         s.d = h2f(b + 80);
         float m0 = dmin * (float) (c0 >> 4), m1 = dmin * (float) (c1 >> 4);
-#if defined(STRATA_USE_HIP) && defined(__clang__)   // (#529: AMD clang only - "v" is a VGPR)
+#if DS4_IQ_STRICT_FP
         asm volatile("" : "+v"(m0), "+v"(m1));
 #endif
         s.m0 = m0;
@@ -401,7 +411,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
     }
 }
 __device__ __forceinline__ float fadd_no_fma(float a, float b) {
-#if defined(STRATA_USE_HIP) && defined(__clang__)   // (#529: AMD clang only - "v" is a VGPR)
+#if DS4_IQ_STRICT_FP
 #pragma clang fp contract(off)
     float r = a + b;
     asm volatile("" : "+v"(r));
@@ -411,7 +421,7 @@ __device__ __forceinline__ float fadd_no_fma(float a, float b) {
 #endif
 }
 __device__ __forceinline__ float fsub_no_fma(float a, float b) {
-#if defined(STRATA_USE_HIP) && defined(__clang__)   // (#529: AMD clang only - "v" is a VGPR)
+#if DS4_IQ_STRICT_FP
 #pragma clang fp contract(off)
     float r = a - b;
     asm volatile("" : "+v"(r));
@@ -421,7 +431,7 @@ __device__ __forceinline__ float fsub_no_fma(float a, float b) {
 #endif
 }
 __device__ __forceinline__ float fmul_no_fma(float a, float b) {
-#if defined(STRATA_USE_HIP) && defined(__clang__)   // (#529: AMD clang only - "v" is a VGPR)
+#if DS4_IQ_STRICT_FP
 #pragma clang fp contract(off)
     float r = a * b;
     asm volatile("" : "+v"(r));
@@ -431,14 +441,14 @@ __device__ __forceinline__ float fmul_no_fma(float a, float b) {
 #endif
 }
 __device__ __forceinline__ float fma_no_contract(float a, float b, float c) {
-#if defined(STRATA_USE_HIP) && defined(__clang__)   // (#529: AMD clang only - "v" is a VGPR)
+#if DS4_IQ_STRICT_FP
 #pragma clang fp contract(off)
     asm volatile("" : "+v"(a), "+v"(b), "+v"(c));
     float r = __builtin_fmaf(a, b, c);
     asm volatile("" : "+v"(r));
     return r;
 #else
-    return __fmaf_rn(a, b, c);
+    return fmaf(a, b, c);
 #endif
 }
 
@@ -604,7 +614,11 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
+#if DS4_IQ_STRICT_FP
     for (int o = 16; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
+#else
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+#endif
     return v;
 }
 __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // (ds4_gguf.cu's)
@@ -656,7 +670,11 @@ __device__ __forceinline__ bool group(const Args& a, int grp, const uint8_t*& bl
 template <int RW>
 __device__ __forceinline__ float lanes_sum(float v) {
 #pragma unroll
+#if DS4_IQ_STRICT_FP
     for (int o = 16 / RW; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
+#else
+    for (int o = 16 / RW; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+#endif
     return v;
 }
 constexpr int kGuRW = 1, kDnRW = 2;   // rows a warp: gate / up (n_embd 5120: 10 sub-blocks a lane), down (2304: 9)
@@ -683,7 +701,7 @@ struct Ahead {
 // (each sub-block decoded once for them) -> h = the clamped swiglu (EPI: act_out's)
 template <int T, int NE, int RP = 1, bool AH = false, int RW = kGuRW, int EPI = 0>
 __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
-#if defined(STRATA_USE_HIP) && defined(__clang__)   // (#529: AMD clang only - "v" is a VGPR)
+#if DS4_IQ_STRICT_FP
 #pragma clang fp contract(off)
 #endif
     pdl_wait();
@@ -762,7 +780,7 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
 // part
 template <int T, int NE, int RP = 1, bool AH = false, int RW = kDnRW>
 __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
-#if defined(STRATA_USE_HIP) && defined(__clang__)   // (#529: AMD clang only - "v" is a VGPR)
+#if DS4_IQ_STRICT_FP
 #pragma clang fp contract(off)
 #endif
     pdl_wait();
