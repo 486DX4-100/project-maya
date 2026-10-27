@@ -483,10 +483,15 @@ private:
             if (fds[(size_t) file] == os::kBadFd) {
                 fds[(size_t) file] = os::open_ro(paths_[(size_t) file]);
 #if !defined(_WIN32)
-                // (strata-ab, gfx906 box with 62 GiB: a row is ~1-2 KB at a hashed offset, so the kernel's readahead
-                //  window of a buffered read is ~all waste that pushes the CPU lane's experts out of the page cache -
-                //  no readahead on this reader's descriptors; DS4_EG_RANDOM=0: as before)
-                static const bool eg_random = std::getenv("DS4_EG_RANDOM") == nullptr || std::atoi(std::getenv("DS4_EG_RANDOM")) != 0;
+                // MAYA_DS4_EG_RANDOM=1 (opt-in; read as STRATA_DS4_EG_RANDOM, DS4_EG_RANDOM too): no readahead on this
+                // reader's descriptors.  A row is ~1-2 KB at a hashed offset, so a buffered read's readahead window is
+                // mostly waste that can push the CPU lane's experts out of the page cache (a 2x MI50 box with 62 GiB,
+                // #505); on a V100 with 61 GB it made 2K-8K prompts 3-4% slower, so it stays off unless asked for
+                static const bool eg_random = [] {
+                    const char* v = std::getenv("STRATA_DS4_EG_RANDOM");
+                    if (v == nullptr) v = std::getenv("DS4_EG_RANDOM");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
                 if (eg_random && fds[(size_t) file] != os::kBadFd) (void) posix_fadvise(fds[(size_t) file], 0, 0, POSIX_FADV_RANDOM);
 #endif
             }

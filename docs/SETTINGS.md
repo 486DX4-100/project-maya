@@ -960,6 +960,7 @@ unit cannot fit the estimate, the ordinary read path is used instead.
 | --- | --- | --- |
 | `DS4_ENGRAM_PREFETCH` | `0` | `1`: enable one-GPU prompt read-ahead; `0`: the existing prompt/decode behavior |
 | `DS4_ENGRAM_PREFETCH_CHUNKS` | `-1` | `-1`: automatic cache-budgeted whole/bounded planning; `0`: explicit whole-prompt look-ahead, allowed up to actual row capacity; a positive value fixes look-ahead to that many compute chunks |
+| `MAYA_DS4_EG_RANDOM` | off (0) | Linux: `1` turns the kernel's readahead off on the Engram reader's files (its rows are small reads at hashed offsets, so a readahead window is mostly bytes no one asked for, which can push the CPU lane's experts out of the page cache on a PC short of RAM). Off by default: where the page cache has room it made prompts a few percent slower |
 | `DS4_EG_ZONE_KB` | `0` | maximum read-zone span in KiB (capped at 64 MiB); `0`: ordinary row reads. `4096` was validated on Windows with an NVMe Engram file; other storage may prefer another value |
 
 `DS4_EG_SORT_MODE=std` forces the portable sort, and `DS4_EG_DEDUP=0` disables post-sort deduplication; both exist as
