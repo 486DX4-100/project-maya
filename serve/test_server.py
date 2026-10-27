@@ -713,7 +713,9 @@ class PrometheusMetrics(unittest.TestCase):
     def test_text_and_key(self):
         tok = ByteTokenizer()
         eng = MockEngine(tok, "</think>\n\nok", max_context=CTX)
-        eng.stat = {"tok_s": 21.5, "vram_hit": 0.95, "promo": "x", "time": 1.0}
+        eng.stat = {"tok_s": 21.5, "vram_hit": 0.95, "promo": "x", "time": 1.0,
+                    "eg_cache_rows": 10, "eg_cache_cap": 100, "eg_cache_row_bytes": 264,
+                    "eg_lookup_rows": 20, "eg_lookup_hits": 15, "eg_lookup_reads": 5}
         svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -732,6 +734,12 @@ class PrometheusMetrics(unittest.TestCase):
             self.assertEqual(lines["llamacpp:requests_deferred"], "0")
             self.assertEqual((lines["maya:engine_tok_s"], lines["maya:engine_vram_hit"]), ("21.5", "0.95"))
             self.assertNotIn("maya:engine_promo", lines)          # not a number: left out
+            self.assertEqual((lines["maya:engine_eg_cache_rows"], lines["maya:engine_eg_cache_cap"],
+                              lines["maya:engine_eg_cache_row_bytes"]), ("10", "100", "264"))
+            for key in ("eg_lookup_rows", "eg_lookup_hits", "eg_lookup_reads"):
+                self.assertIn(f"# TYPE maya:engine_{key} counter", text)
+            for key in ("eg_cache_rows", "eg_cache_cap", "eg_cache_row_bytes"):
+                self.assertIn(f"# TYPE maya:engine_{key} gauge", text)
             self.assertIn("# TYPE llamacpp:prompt_tokens_total counter", text)
             svc.api_key = "k1"
             with self.assertRaises(urllib.error.HTTPError) as cm:

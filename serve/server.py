@@ -2215,8 +2215,15 @@ class Service:
                  "cpu": "Experts a token computed on the CPU lane (DeepSeek)",
                  "disk_mb": "MB a token the storage read (DeepSeek, Linux)",
                  "engram_ms": "The n-gram memory's (Engram) read time a token, ms (DeepSeek)",
+                 "eg_cache_rows": "Engram rows held in the host cache",
+                 "eg_cache_cap": "Engram host cache capacity, rows",
+                 "eg_cache_row_bytes": "Engram host cache payload bytes per row",
+                 "eg_lookup_rows": "Consumer Engram row lookups since engine start",
+                 "eg_lookup_hits": "Consumer Engram row lookups served without a file read since engine start",
+                 "eg_lookup_reads": "Consumer Engram on-demand file reads since engine start (prefetch reads are separate)",
                  "vram_used": "Expert slots in use in VRAM", "vram_slots": "Expert slots in VRAM",
                  "ram_used": "Expert slots in use in RAM", "ram_slots": "Expert slots in RAM"}
+    PROM_STAT_COUNTERS = {"eg_lookup_rows", "eg_lookup_hits", "eg_lookup_reads"}
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -2244,7 +2251,8 @@ class Service:
             ("maya:engine_alive", "gauge", "1 while the engine process runs",
              int(self.engine.alive()) if hasattr(self.engine, "alive") else 1),
         ]
-        rows += [(f"maya:engine_{k}", "gauge", h, stat[k]) for k, h in self.PROM_STAT.items()
+        rows += [(f"maya:engine_{k}", "counter" if k in self.PROM_STAT_COUNTERS else "gauge", h, stat[k])
+                 for k, h in self.PROM_STAT.items()
                  if isinstance(stat.get(k), (int, float)) and not isinstance(stat.get(k), bool)]
         for category, values in (("cache", self.responses.stats()), ("jobs", self.response_jobs.stats())):
             gauges = {"entries", "blocks", "bytes", "inflight_bytes", "peak_inflight_bytes", "max_entries",

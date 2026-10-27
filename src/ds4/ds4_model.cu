@@ -6841,6 +6841,7 @@ struct Model::Impl {
         std::lock_guard<std::mutex> lk(eg_cache_mu);
         st.eg_cached = (int64_t) eg_cache.size();
         st.eg_cache_cap = (int64_t) eg_cache.capacity();
+        st.eg_cache_row_bytes = (int64_t) eg_cache.row_bytes();
     }
     // the chunked prompt path: rows of Engram layer `only` into dst, now (a helper thread, a chunk ahead)
     void engram_rows(int64_t p0, int T, int only, uint8_t* dst) {

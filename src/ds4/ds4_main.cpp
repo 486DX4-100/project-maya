@@ -982,6 +982,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::snprintf(b, sizeof b, " vram_used=%d ram_used=%d cpu_n=%d vram_gb=%.2f ram_gb=%.2f", tr.vram,
                           tr.ram, tr.cpu, tr.vram_gb, tr.ram_gb);
             out += b;
+            std::snprintf(b, sizeof b, " eg_cache_rows=%lld eg_cache_cap=%lld eg_cache_row_bytes=%lld eg_lookup_rows=%lld",
+                          (long long) s.eg_cached, (long long) s.eg_cache_cap, (long long) s.eg_cache_row_bytes,
+                          (long long) s.eg_rows);
+            out += b;
+            std::snprintf(b, sizeof b, " eg_lookup_hits=%lld eg_lookup_reads=%lld", (long long) s.eg_hits,
+                          (long long) s.eg_reads);
+            out += b;
             if (io >= 0 && io_dec >= 0) {
                 const double disk = tr.cpu_blob > 0 ? std::min(cx / fed, (double) (io - io_dec) / tr.cpu_blob / fed) : 0.0;
                 std::snprintf(b, sizeof b, " disk_mb=%.3f disk=%.3f ram_fetch=%.3f", (double) (io - io_dec) / 1e6 / fed,
