@@ -2651,12 +2651,15 @@ class Service:
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
                 in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
                 # never let the reasoning use the whole output: a request whose max_tokens is reached while still
-                # thinking ends with no answer at all.  The budget is clamped to leave a quarter of max_tokens (at
-                # least 1024 tokens) for the answer; STRATA_GLM_THINK_RESERVE=<tokens> sets that floor
+                # thinking ends with no answer at all. Reserve a quarter for the answer, with a preferred floor
+                # of 1024 (STRATA_GLM_THINK_RESERVE). The floor cannot take more than half of a small output limit:
+                # the old unconditional floor reduced every limit <=1024 to ONE reasoning token. The forced
+                # </think> also consumes one token of max_new, so account for it before assigning the budget.
                 think_budget = self.think_budget
                 if in_think and max_new:
-                    reserve = max(int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024), int(max_new) // 4)
-                    think_budget = max(1, min(think_budget, int(max_new) - reserve))
+                    reserve_floor = max(0, int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024))
+                    reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
+                    think_budget = max(1, min(think_budget, int(max_new) - reserve - 1))
                 if in_think:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
 
@@ -4105,7 +4108,7 @@ class Server(ThreadingHTTPServer):
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
               "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
-              "STRATA_SERVER_LOG") + RESPONSE_ENV_KEYS
+              "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE") + RESPONSE_ENV_KEYS
 
 
 def apply_server_env(cfg: dict) -> None:

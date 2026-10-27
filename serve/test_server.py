@@ -29,6 +29,95 @@ class RecordingEngine(MockEngine):
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
+class ThinkingBudget(unittest.TestCase):
+    """Real HTTP adapters must leave room for reasoning and a final answer at small output limits."""
+
+    @classmethod
+    def setUpClass(cls):
+        class Tok(ByteTokenizer):
+            SPECIALS = ByteTokenizer.SPECIALS + ["<think>", "</think>"]
+
+        class Sampled(RecordingEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                self.last_sampling = dict(sampling or {})
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        tok = Tok()
+        cls.engine = Sampled(tok, "</think>8", max_context=32768)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.svc.think_budget = 32768
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, path, body):
+        return MaxTokens.post(self, path, body)
+
+    def call(self, api, limit, effort="low"):
+        messages = [{"role": "user", "content": "What is 3 + 5?"}]
+        if api == "responses":
+            path, body = "/v1/responses", {"input": "What is 3 + 5?", "max_output_tokens": limit,
+                                           "reasoning": {"effort": effort}}
+        elif api == "anthropic":
+            path, body = "/v1/messages", {"messages": messages, "max_tokens": limit,
+                                          "thinking": {"type": "disabled"} if effort == "none" else
+                                                      {"type": "enabled", "budget_tokens": 2048}}
+        else:
+            path, body = "/v1/chat/completions", {"messages": messages, "max_tokens": limit,
+                                                  "reasoning_effort": effort}
+        status, response = self.post(path, dict(body, model="m"))
+        self.assertEqual(status, 200, response)
+        self.assertEqual(self.engine.last_max_new, limit)
+        return self.engine.last_sampling
+
+    def test_small_limits_leave_reasoning_and_answer_room(self):
+        for api in ("openai", "anthropic", "responses"):
+            for limit in (128, 512, 1024, 2048, 8192):
+                with self.subTest(api=api, limit=limit):
+                    sampling = self.call(api, limit)
+                    budget = sampling["_think_budget"]
+                    self.assertGreaterEqual(budget, limit // 2 - 1)
+                    # The forced closing marker is an output token too.
+                    self.assertLessEqual(budget + 1, limit - limit // 4)
+
+    def test_configured_budget_and_thinking_off(self):
+        old = self.svc.think_budget
+        try:
+            for api in ("openai", "anthropic", "responses"):
+                self.svc.think_budget = 64
+                self.assertEqual(self.call(api, 512)["_think_budget"], 64)
+                self.assertNotIn("_think_budget", self.call(api, 512, "none"))
+                self.svc.think_budget = 0
+                self.assertNotIn("_think_budget", self.call(api, 512))
+        finally:
+            self.svc.think_budget = old
+
+    def test_reserve_override_cannot_consume_small_limit(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"STRATA_GLM_THINK_RESERVE": "4096"}):
+            self.assertGreaterEqual(self.call("openai", 512)["_think_budget"], 255)
+        with patch.dict(os.environ, {"STRATA_GLM_THINK_RESERVE": "16"}):
+            self.assertEqual(self.call("openai", 512)["_think_budget"], 383)
+
+    def test_tiny_limits_still_honour_total_output(self):
+        for api in ("openai", "anthropic", "responses"):
+            for limit in (1, 2, 3):
+                with self.subTest(api=api, limit=limit):
+                    sampling = self.call(api, limit)
+                    self.assertGreaterEqual(sampling["_think_budget"], 1)
+
+    def test_reserve_from_run_config_reaches_http_requests(self):
+        from unittest.mock import patch
+        from serve.server import apply_server_env
+        with patch.dict(os.environ):
+            apply_server_env({"env": {"STRATA_GLM_THINK_RESERVE": "16"}})
+            self.assertEqual(self.call("openai", 512)["_think_budget"], 383)
+
+
 class MaxTokens(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
