@@ -77,6 +77,13 @@ else()
 endif()
 
 enable_language(HIP)
+# A first configure that failed half way (Windows, an incomplete HIP toolchain) can leave CMAKE_HIP_FLAGS_RELEASE cached
+# empty, and the later successful configure keeps it: the Release kernels are then built unoptimised (#575).
+string(STRIP "${CMAKE_HIP_FLAGS_RELEASE}" _strata_hip_rel)
+if(_strata_hip_rel STREQUAL "")
+  set(CMAKE_HIP_FLAGS_RELEASE "-O3 -DNDEBUG")
+  message(STATUS "Maya: CMAKE_HIP_FLAGS_RELEASE was empty; using -O3 -DNDEBUG")
+endif()
 find_package(hip CONFIG REQUIRED)
 find_package(hipblas CONFIG REQUIRED)
 find_package(hipblaslt CONFIG QUIET)
