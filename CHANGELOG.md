@@ -4,6 +4,49 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.36 - 2026-10-28
+
+DeepSeek drafting now works with `--parallel` (#611), MiniMax keeps its experts once in RAM instead of twice, the same
+DeepSeek text whatever ran before, and a round of fixes from reports and pull requests.
+
+- **DeepSeek `--parallel` with the drafter** (#611, @needmorevram): with two or more requests running, each request's
+  DSpark drafter now proposes its tokens inside the shared step, and every request's token and drafts are checked in one
+  pass, with a rollback of only that request's rejected rows; two or three requests' drafts share one drafter pass. One
+  request alone is unchanged, token for token. Our fixes are part of it: on several GPUs a batched verify window of many rows
+  took a different rounding path, and one pinned buffer was shared between requests' cache rows (a later request could
+  overwrite rows another GPU had not copied yet), so answers could drift from the same request alone; both are fixed, and
+  answers at `--parallel` 2 and 4 are the same as alone. With four requests the drafters do not fit one pass, so each
+  round drafts only where they do and otherwise decodes a plain token of each as before. On three V100s two requests at
+  once finished about 1.1x faster in all and four at the speed of before; on one V100 the gain is smaller.
+- **MiniMax keeps its experts once in RAM** (#568, #578; reported by @talisp and @noahark): after an expert is copied
+  to the pinned pool or a GPU, its pages in the mapped model files are dropped (Linux: `madvise`, Windows:
+  `VirtualUnlock`). Resident memory after load went from 95 GB to 13 GB on a 3-GPU test with identical answers; the
+  Windows pool is no longer under-sized by pages that were not "available". `MM3_LOAD_DROP_PAGES=0` keeps the old
+  behaviour.
+- **MiniMax single-conversation server reads prompts in the calibrated chunk** (#602, @talisp): `prefill-tune.txt`
+  was applied to the model but the server kept the command line's chunk.
+- **DeepSeek: the same text whatever ran before** (#608, @SeriousRising): windows of 9-16 rows (prompt lookup) took
+  another rounding path than windows of 1-8, so a temperature-0 answer could change with earlier requests. All
+  window sizes now use one path (`DS4_ASYNC_T` default 16). Logits of 48 prompt positions are bit-identical
+  between window sizes 2 and 12; decode and prefill times unchanged or slightly better.
+- **DeepSeek: a warning when `--dspark on` finds no drafter** in the pack (#590, @handmade0octopus), instead of
+  silently decoding with prompt lookup only.
+- **Windows AMD build** (#575, @sakugetu): a failed first configure no longer leaves the HIP Release flags empty
+  (unoptimised kernels).
+- **Server: a malformed tool call is logged whole** (#613, @NenadSteric), so the cut-off call can be seen; the call
+  is carried on the error.
+- **DeepSeek CPU lane** (@SeriousRising, #618, #619, #620): the worker pool fences its generation store before the
+  sleeper load, so a batch could no longer be left unrun (#618); a sampler CUDA error ends the request instead of
+  sending token -1 (#619); a pack whose layer the CPU lane cannot compute is refused at load instead of answering
+  zeros (#620; every shipped pack loads as before).
+- **CPU lane small calls** (#561, @Cass67): the down jobs read each token's activations from a stack copy
+  (`DS4_ACT_COPY=0` is the old way); decode times unchanged here, the reported gain is on 2-socket machines.
+- **Linux NUMA** (#562, @Cass67): maya-ds4 stays out of the kernel's NUMA balancing, and a failed `mbind` is said
+  once (`DS4_NUMA_BALANCE=1` as before; an existing memory policy is left alone).
+- **Windows** (#601, @pschaub): Ctrl+C and Ctrl+Break make the engine wait for QUIT, so stopping keeps the
+  conversation.
+- **Tests** (#526, @DailyDisco): the HIP report tests work with a home-local `TMPDIR`.
+
 ## v1.1.35 - 2026-10-28
 
 GLM keeps every expert in VRAM on NVIDIA where they fit, tuned speed settings are measured again after a driver
