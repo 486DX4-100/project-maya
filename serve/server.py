@@ -336,6 +336,10 @@ NONFINITE = "non-finite"
 
 # what Service._sliced yields when the loop guard ends an answer (a loop that came back): run() ends it, "stop"
 LOOP_STOP = object()
+# ... and the answer it gets when that happens before any answer text (never a silent end after the thinking)
+LOOP_STOP_NOTE = "(The answer was stopped: the model kept repeating itself.)"
+# a request's max_tokens lowers the thinking budget only at or below this (Service.run)
+THINK_TINY_LIMIT = 1024
 
 
 def loop_guard_setting(cfg: dict | None, env=None) -> bool:
@@ -2793,9 +2797,9 @@ class Service:
         whether this request holds the FIFO now.  Not for image prompts: their state is never kept in a slot.
 
         With the loop guard (`guard`, serve/loop_guard.py) every id goes through it and the caller gets only what
-        lies before the tail it holds back (what could still be a loop's repeats).  A loop restarts the engine the
-        same way, at once and still holding the FIFO: prompt + what is kept (the repeats dropped; after a second
-        loop in the thinking, the model's end-of-thinking token too) with a short repetition penalty, which a call
+        lies before the short tail it holds back (what could still be a loop's repeats, at most HOLD_MAX tokens).  A
+        loop restarts the engine the same way, at once and still holding the FIFO: prompt + what is kept (the repeats
+        not sent yet dropped; after a third loop in the thinking, the model's end-of-thinking token too) with a short repetition penalty, which a call
         of its own ends and the request's own sampling follows; or the answer ends there (LOOP_STOP).  Until then the
         engine calls and their sampling are the ones without it."""
         produced, cur, left, smp = [], list(ids), max_new, sampling
@@ -2846,7 +2850,7 @@ class Service:
                 if fresh is not None and fresh is not last0:
                     segments.append(fresh)
             if act is not None:                         # a loop: what is kept, then on from there - or the end
-                del produced[max(sent, len(produced) - act.drop):]   # (what was sent stays: the hold-back covers it)
+                del produced[max(sent, len(produced) - act.drop):]   # (what was sent stays sent: only the held tail goes)
                 if act.kind == loop_guard.CLOSE_THINKING:
                     produced.append(guard.think_end)
                 guard.resume(produced, act)
@@ -2984,13 +2988,15 @@ class Service:
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
                 in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
-                # never let the reasoning use the whole output: a request whose max_tokens is reached while still
-                # thinking ends with no answer at all. Reserve a quarter for the answer, with a preferred floor
-                # of 1024 (STRATA_GLM_THINK_RESERVE). The floor cannot take more than half of a small output limit:
-                # the old unconditional floor reduced every limit <=1024 to ONE reasoning token. The forced
-                # </think> also consumes one token of max_new, so account for it before assigning the budget.
+                # The thinking budget is the config's ("thinking_budget"); a request's max_tokens (or the context
+                # left) lowers it only when that output limit is tiny, THINK_TINY_LIMIT (1024) tokens or fewer - a
+                # side request such as a title, which must still get an answer: a reserve is kept for it (a quarter,
+                # with a preferred floor of MAYA_GLM_THINK_RESERVE, 1024, capped at half the limit). A larger
+                # limit is the client's cap on the whole output and leaves the budget alone: a chat client's
+                # max_tokens=4096 used to cut the thinking to ~3K tokens and close it while the model was still
+                # reasoning. The forced </think> also consumes one token of max_new, so account for it.
                 think_budget = self.think_budget
-                if in_think and max_new:
+                if in_think and max_new and int(max_new) <= THINK_TINY_LIMIT:
                     reserve_floor = max(0, int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024))
                     reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
                     think_budget = max(1, min(think_budget, int(max_new) - reserve - 1))
@@ -3020,6 +3026,7 @@ class Service:
                             sliced.close()
                 guard_on = self._loop_guard_on(sampling)
                 gen = attempts()
+                said = bool(pre_events)                 # any answer (text or a call) went out yet
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
                 try:
@@ -3032,6 +3039,13 @@ class Service:
                             continue
                         if t is LOOP_STOP:              # the loop guard ended the answer (a loop that persisted)
                             finish = "stop"
+                            if held:
+                                for ev in parser.feed(held):
+                                    said = said or ev.kind != "reasoning"
+                                    yield "event", ev
+                                held = ""
+                            if not said:                # (a model with no end-of-thinking token, still thinking)
+                                yield "event", Event("content", LOOP_STOP_NOTE)
                             break
                         n += 1
                         if my_first is None:
@@ -3065,6 +3079,7 @@ class Service:
                         self._note(n, evs, stat)
                         last_print = self._progress(last_print)
                         for ev in evs:
+                            said = said or ev.kind != "reasoning"
                             yield "event", ev
                             if single_tool and ev.kind == "tool_call" and ev.complete:
                                 stopped = True
