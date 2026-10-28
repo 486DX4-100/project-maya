@@ -56,6 +56,7 @@
 #include "mm3_os.hpp"
 #include "mm3_pack.hpp"
 #include "mm3_sample.hpp"
+#include "mm3_slots.hpp"
 #include "mm3_vision.hpp"
 #if defined(_WIN32)
 #include <timeapi.h>
@@ -935,11 +936,14 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
             return refuse("the prompt (" + std::to_string(r.ids.size()) + " tokens) and max_new " +
                           std::to_string(r.max_new) + " are more than the context " + std::to_string(m.max_ctx()));
         // the sequence: idle, the longest shared start (the last token always read again: its logits are this
-        // request's first; a picture before it in either must be in both, at the same place), else least recently used
-        int best = -1;
-        size_t bfrom = 0;
+        // request's first; a picture before it in either must be in both, at the same place), else least recently
+        // used - a short shared start never takes a longer conversation's cache while one drops nothing (pick_slot)
+        std::vector<mm3::SlotView> views((size_t) N);
         for (int s = 0; s < N; ++s) {
             const Seq& S = seqs[(size_t) s];
+            views[(size_t) s].busy = S.busy;
+            views[(size_t) s].size = S.state.size();
+            views[(size_t) s].used = S.used;
             if (S.busy) continue;
             size_t from = 0;
             while (from < S.state.size() && from + 1 < r.ids.size() && S.state[from] == r.ids[from]) ++from;
@@ -953,11 +957,10 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
                         return x.start == q.start && x.hash == q.hash;
                     }))
                     from = (size_t) x.start;
-            if (best < 0 || from > bfrom || (from == bfrom && S.used < seqs[(size_t) best].used)) {
-                best = s;
-                bfrom = from;
-            }
+            views[(size_t) s].from = from;
         }
+        const int best = mm3::pick_slot(views);
+        const size_t bfrom = best >= 0 ? views[(size_t) best].from : 0;
         if (best < 0) {   // (every sequence busy - the server sends at most n at once: after one ends)
             waiting.push_back(line);
             return;
