@@ -65,6 +65,13 @@ class GlmCalls(unittest.TestCase):
             with self.assertRaises(ValueError, msg=body):
                 parse_tool_call(body)
 
+    def test_malformed_carries_the_whole_body(self):   # (#613: the log shows all of it, the message 80 characters)
+        body = "f<arg_key>a<arg_value>" + "x" * 300
+        with self.assertRaises(ValueError) as cm:
+            parse_tool_call(body)
+        self.assertEqual(cm.exception.body, body)
+        self.assertLess(len(str(cm.exception)), 120)
+
     def test_streamed_as_whole(self):
         for pieces in (None, 1, 3, 7):
             ev = run("Checking the weather.\n\n" + GLM, pieces)

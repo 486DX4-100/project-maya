@@ -3099,6 +3099,8 @@ class Service:
                     else:
                         finish = "error"
                         print(f"[maya] the engine reported an error: {e}", flush=True)
+                        if getattr(e, "body", None):                    # (a malformed tool call: the whole of it, #613)
+                            print(f"[maya] the malformed tool call, whole ({len(e.body)} characters): {e.body!r}", flush=True)
                         raise
                 finally:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the

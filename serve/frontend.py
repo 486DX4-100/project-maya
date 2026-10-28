@@ -675,6 +675,15 @@ def call_name(body: str) -> str:
     return body.split("<", 1)[0].strip()
 
 
+class MalformedToolCall(ValueError):
+    """A call body that does not parse.  The message (what the client sees) keeps its first 80 characters; `body` is the
+    whole of it, for the server's log: a thinking budget that cuts a call off mid-way is read from the end (#613)."""
+
+    def __init__(self, body: str):
+        super().__init__("malformed tool call: " + body[:80])
+        self.body = body
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """A call body -> ToolCall, in GLM's form (`NAME<arg_key>K</arg_key><arg_value>V</arg_value>...`, what GLM-5.x
     writes: issue #5) or Qwen's (`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>`).  Values are
@@ -686,17 +695,17 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         name = call_name(body)
         rest = body[len(body.split("<", 1)[0]):]
         if not name or not (rest == "" or rest.lstrip().startswith(ARG_KEY)):
-            raise ValueError("malformed tool call: " + body[:80])
+            raise MalformedToolCall(body)
         args = {}
         while ARG_KEY in rest:
             rest = rest[rest.index(ARG_KEY) + len(ARG_KEY):]
             end = rest.find(ARG_KEY_END)
             if end < 0:
-                raise ValueError("malformed tool call: " + body[:80])
+                raise MalformedToolCall(body)
             key, rest = rest[:end].strip(), rest[end + len(ARG_KEY_END):]
             v0 = rest.find(ARG_VAL)
             if v0 < 0 or rest[:v0].strip():
-                raise ValueError("malformed tool call: " + body[:80])
+                raise MalformedToolCall(body)
             rest = rest[v0 + len(ARG_VAL):]
             end = rest.find(ARG_VAL_END)
             value = rest[:end] if end >= 0 else rest
@@ -704,7 +713,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             args[key] = _arg_value(value, (props.get(key) or {}).get("type"))
         return ToolCall(name=name, arguments=args)
     if ">" not in body:
-        raise ValueError("malformed tool call: " + body[:80])
+        raise MalformedToolCall(body)
     name = body[len(FUNC_START):body.index(">")]
     rest = body[body.index(">") + 1:]
     args = {}
