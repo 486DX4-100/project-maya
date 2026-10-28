@@ -1720,7 +1720,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 // their drafts: in one drafter pass where they fit one (Model::draft_multi), else one after another
                 // (the drafter's argmax either way: verify_multi takes each draft as a point)
                 const int nd = (int) dsv.size();
-                if (nd > 1 && m.can_draft_multi(dsv.data(), nd)) {
+                const bool one_pass = nd > 1 && m.can_draft_multi(dsv.data(), nd);
+                if (nd > 1 && !one_pass) {   // (more drafters than one pass holds - four with DSpark's block: a drafter
+                                             //  pass each cost more than their drafts won, so a token of each)
+                    for (int j : dix) tried[(size_t) j] = 0;
+                } else if (one_pass) {
                     std::vector<std::vector<int>> dd;
                     std::vector<std::vector<float>> cc;
                     failed = !m.draft_multi(dsv.data(), dys.data(), nd, dd, cc, err);
