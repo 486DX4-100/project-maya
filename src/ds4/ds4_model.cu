@@ -17927,6 +17927,7 @@ bool Model::drafts_sampled() const { return p_->drafts_q; }
 int64_t Model::pos() const { return p_->pos; }
 int64_t Model::max_context() const { return p_->o.max_context; }
 int Model::vocab() const { return p_->g.vocab; }
+bool Model::has_drafter() const { return p_->g.n_mtp > 0; }
 const std::vector<int32_t>& Model::tokens() const { return p_->toks; }
 int Model::seq_count() const { return p_->seq_count(); }
 void Model::seq_bind(int s) { p_->seq_bind(s); }

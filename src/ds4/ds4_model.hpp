@@ -158,6 +158,8 @@ public:
     /// A verify window's tokens at most (y and the drafts after it); verify() takes drafts from any source - those not
     /// the drafter's own draws as a point each (q 1)
     int verify_max() const;
+    /// The DSpark drafter's blocks (the pack's mtp.* tensors) are loaded: false for a pack without them or --dspark none
+    bool has_drafter() const;
     /// The last draft()'s drafts were drawn from the drafter's distribution (DS4_DSPARK_SAMPLE=1), not its argmax
     bool drafts_sampled() const;
 

@@ -1859,6 +1859,7 @@ int main(int argc, char** argv) {
     std::string ids_s, dump, eos = "1", ppl;
     int n = 0, window = 16, suffix_draft = 3;
     bool spec = true;
+    bool dspark_on_asked = false;   // (--dspark on given: a pack without drafter blocks is then told)
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
     bool serve_mode = false, multi_check = false;
@@ -1900,6 +1901,7 @@ int main(int argc, char** argv) {
             const std::string v = val("--dspark");
             spec = v != "off";
             o.dspark = v != "none";   // none: not even loaded
+            dspark_on_asked = v == "on";
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--suffix-draft") suffix_draft = std::max(0, std::atoi(val("--suffix-draft").c_str()));
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
@@ -1960,6 +1962,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
+    if (dspark_on_asked && !o.vision_only && !m.has_drafter())
+        std::fprintf(stderr, "maya-ds4: warning: --dspark on, but this pack has no DSpark drafter blocks (mtp.* tensors): "
+                             "decoding with prompt lookup only (no drafter)\n");
     std::unique_ptr<Lookup> lk;   // (prompt lookup beside DSpark, or alone: one policy over every request of this run)
     if (suffix_draft > 0)
         lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
