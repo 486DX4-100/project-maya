@@ -877,7 +877,7 @@ class StrataEngine:
             sd = tune.get("suffix_draft")   # the DeepSeek engine's prompt lookup beside DSpark: off (0) / on (1)
             if isinstance(sd, int) and not isinstance(sd, bool) and sd in (0, 1):
                 tune_keys += f" suffix_draft={sd}"
-            ct = tune.get("cpu_threads")   # the GLM engine's CPU lane threads (fewer than it started with)
+            ct = tune.get("cpu_threads")   # the GLM engine's CPU lane threads (more: STRATA_GLM_CPU_LANE_MAX)
             if isinstance(ct, int) and not isinstance(ct, bool) and ct > 0:
                 tune_keys += f" cpu_threads={ct}"
             rc = tune.get("read_chunks")   # ... and the pieces it reads an expert from the SSD in (x3)
