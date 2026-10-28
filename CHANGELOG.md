@@ -4,6 +4,40 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.35 - 2026-10-28
+
+GLM keeps every expert in VRAM on NVIDIA where they fit, tuned speed settings are measured again after a driver
+change, GLM conversations with pictures keep their slots, faster long prompts for Qwen-3.8-Flash-Next (CYBER-FROST) on
+three or more GPUs, and a MiniMax `--parallel` fix.
+
+- **GLM: every expert stays in VRAM on NVIDIA where it fits** (#474, @walker2kk): where the GPUs' memory holds every
+  expert, NVIDIA now gets the same complete expert pool as AMD, so a long prompt no longer pushes experts out of VRAM
+  and the decode after it stays at full speed (the reporter's 4x A100 split: 2.5x decode). Where the experts do not all
+  fit, nothing changes. `MAYA_GLM_COMPLETE_POOL=0` keeps the old pool.
+- **A tuned speed setting is measured again after a driver or P2P change** (#419, @catonooka): the CPU-lane tuning
+  (`MAYA_GLM_PCIE_SHARE`, `MAYA_GLM_CPU_LANE`, `MAYA_GLM_READ_CHUNKS`) now remembers the NVIDIA driver, the GPUs' slots
+  and which GPUs reach each other directly (P2P). When one of them changes, Maya says what changed, drops the old values
+  and the engine measures again at its start (the reporter's 2x RTX 3090 after a P2P driver: 1.6x decode back);
+  `./maya.sh --calibrate` tunes it again. A setup no longer re-applies a stale stored tuning.
+- **GLM: a conversation with pictures keeps its slot** (#331, @Cass67; also reported in #418 by @CoolJohn-lab): a chat
+  with pictures is set aside in a conversation slot like a text chat, so a chat with one screenshot no longer reads its
+  whole history again each time another chat pushed it out. Kept slots from an older version are removed once at start
+  (the slot format changed).
+- **GLM: an edited last message after switching chats** (#400, @Zcg2021): A -> B -> back to A with the last message
+  edited no longer reads the whole conversation again (that step's prompt read about 10x faster on a 2K-token chat).
+- **GLM calibration with more CPU-lane threads** (#178, @Jw88888): on one GPU whose CPUs show no SMT siblings (a VM's
+  vCPUs) `--calibrate` also measures more CPU-lane threads than the engine's own count, and lower counts are no longer
+  measured slower than they run; new setting `MAYA_GLM_CPU_LANE_MAX`.
+- **MiniMax `--parallel`: a short question no longer evicts a long picture conversation:** the picture was read again
+  at that conversation's next turn. A new request now takes an empty conversation (or the least recently used one);
+  continued conversations are reused as before (that next turn 2.9x faster on 3x V100, its answer the same).
+- **Qwen-3.8-Flash-Next (CYBER-FROST) on three or more GPUs reads long prompts with every GPU at once:** with the model
+  split across GPUs, the second and third GPU used to take turns on each piece of the prompt; each now works on a
+  different piece at the same time. On three V100s with most experts in VRAM, prompts of 4K, 8K and 16K tokens read
+  about 1.14x, 1.35x and 1.5x faster (a 2K prompt is one piece: no change); with experts streamed from RAM the gain is
+  small. Answers are the same; one GPU and two GPUs are unchanged.
+- **Chat:** the attach menu's item reads "Select file".
+
 ## v1.1.34 - 2026-10-27
 
 DeepSeek and MiniMax answer several requests at once, fixes for one-GPU and tensor-parallel speed, Qwen-3.8-Flash-Next
