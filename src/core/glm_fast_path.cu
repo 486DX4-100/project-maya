@@ -1205,12 +1205,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         // only the tail, the decode never misses, the RAM tier is staging only and the CPU lane has nothing to take.
         // Any device whose budget holds it (a discrete card too: the slots past the experts cost only budget nothing
         // else used); Linux's unified-memory budget is the experts' bytes exactly, so it keeps its own policy there.
-        // STRATA_GLM_COMPLETE_POOL=0: the capped pool (A/B); on by default on AMD only (on_by_default_on_amd).
+        // STRATA_GLM_COMPLETE_POOL=0: the capped pool (A/B); on by default on every GPU (complete_pool_on, #474).
         {
             int k_full = pf_ != nullptr ? tail_slots(prefill_borrow_bytes()) : 0;
             if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
                 k_full = std::max(k_full, tail_slots((size_t) std::max(0LL, std::atoll(v)) << 20));
-            const int full = glmfast::on_by_default_on_amd("STRATA_GLM_COMPLETE_POOL") && !F->unified_memory
+            const int full = glmfast::complete_pool_on() && !F->unified_memory
                                  ? glmfast::complete_pool_slots(avail, stride_sum, g.n_expert, gf::kSpares, k_full)
                                  : 0;
             if (full > 0) {
