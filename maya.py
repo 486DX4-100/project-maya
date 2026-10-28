@@ -2838,6 +2838,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         tuned.update(env)                              # (an --env given now wins)
         if tuned:
             cfg["env"] = tuned
+        if cal.get("gpu_env"):                         # (where it was measured: stale_tuning at a start compares)
+            cfg["installer"]["tuned_on"] = cal["gpu_env"]
         ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else "") +
            (": " + ", ".join(f"{k}={v}" for k, v in cal["settings"].items()) if cal.get("settings") else ""))
         if cal.get("context"):
@@ -3032,8 +3034,17 @@ def saved_calibration(cfg: dict, any_context=False) -> dict | None:
     if cfg.get("backend") == "hip":
         return None
     store, key = load_calibrations(), hardware_key(cfg)
+    now = None
+
+    def current(v):                                    # (one measured under another driver or P2P layout: stale, #419)
+        nonlocal now
+        if not isinstance(v, dict) or not v.get("gpu_env"):
+            return True
+        now = gpu_env(cfg) if now is None else now
+        return not gpu_env_changes(v["gpu_env"], now)
     if key in store or not any_context:
-        return store.get(key)
+        v = store.get(key)
+        return v if v is None or current(v) else None
     want = key.split("|")
     best, best_d = None, None
     for k, v in store.items():
@@ -3044,9 +3055,89 @@ def saved_calibration(cfg: dict, any_context=False) -> dict | None:
             d = abs(math.log(int(have[5]) / int(want[5])))
         except (ValueError, ZeroDivisionError):
             continue
-        if isinstance(v, dict) and (best_d is None or d < best_d):
+        if isinstance(v, dict) and (best_d is None or d < best_d) and current(v):
             best, best_d = dict(v, context=int(have[5])), d
     return best
+
+
+def p2p_pairs(indices: list) -> dict:
+    """Which pairs of these GPUs (nvidia-smi's numbers) read each other's memory directly: {"0-1": "OK", "0-2": "NS",
+    ...} from `nvidia-smi topo -p2p r` ({} when it says nothing)."""
+    txt = re.sub(r"\x1b\[[0-9;]*m", "", S.out(["nvidia-smi", "topo", "-p2p", "r"]) or "")   # (its header is underlined)
+    cols, rows = [], {}
+    for line in txt.splitlines():
+        t = line.split()
+        if t and all(re.fullmatch(r"GPU\d+", x) for x in t):
+            cols = [int(x[3:]) for x in t]
+        elif t and cols and re.fullmatch(r"GPU\d+", t[0]) and len(t) > len(cols):
+            rows[int(t[0][3:])] = dict(zip(cols, t[1:len(cols) + 1]))
+    sel = sorted(set(indices))
+    return {f"{i}-{j}": rows[i][j] for n, i in enumerate(sel) for j in sel[n + 1:] if j in rows.get(i, {})}
+
+
+def gpu_env(cfg: dict) -> dict:
+    """What a measured setting depends on beyond the hardware key (#419): the NVIDIA driver, the config's GPUs' PCI
+    places and, on a split, which pairs of them read each other's memory directly - a P2P driver changes the last
+    without any change to the config, and the CPU lane's split tuned before it halved the decode.  {} where nvidia-smi
+    says nothing (AMD, no GPU): nothing to compare."""
+    if cfg.get("backend") == "hip":
+        return {}
+    found = {g["index"]: g for g in S.gpus() or []}
+    sel = [found[i] for i in cfg.get("gpu") or [] if i in found]
+    if not sel:
+        return {}
+    out = {"driver": sel[0].get("driver") or "?", "pci": ",".join(g.get("pci") or "?" for g in sel)}
+    if len(sel) > 1:
+        out["p2p"] = p2p_pairs([g["index"] for g in sel])
+    return out
+
+
+def gpu_env_changes(was: dict, now: dict) -> list:
+    """What differs between a measurement's gpu_env and this PC's: ["driver 595.58 -> 615.71", ...].  A part either
+    side does not know (an older record, nvidia-smi silent once) is no change."""
+    out = []
+    for k, what in (("driver", "driver"), ("pci", "GPU slots"), ("p2p", "P2P")):
+        a, b = (was or {}).get(k), (now or {}).get(k)
+        if not a or not b or a == "?" or b == "?" or a == b:
+            continue
+        if k == "p2p":
+            a, b = (" ".join(f"{p}:{s}" for p, s in sorted(x.items())) for x in (a, b))
+            if a == b:
+                continue
+        out.append(f"{what} {a} -> {b}")
+    return out
+
+
+def stale_tuning(cfg: dict) -> str | None:
+    """The CPU lane's tuned settings in the config's env (CAL.KEYS: setup's calibration, or one kept by hand) left out
+    when the driver, the GPUs' slots or their P2P layout changed since they were measured (#419: a P2P driver installed
+    later made a split's STRATA_GLM_PCIE_SHARE=0.25 pin the wrong experts - 25 tok/s instead of 40), so the engine
+    measures again at its start.  `cfg` is changed in place; the message, or None (nothing changed).  Settings without
+    a record of where they were measured (an older config) get this PC's now, so the next change is seen."""
+    env = cfg.get("env") or {}
+    keys = [k for k in CAL.KEYS if k in env]
+    if not keys:
+        return None
+    now = gpu_env(cfg)
+    if not now:
+        return None
+    inst = cfg.setdefault("installer", {})
+    was = inst.get("tuned_on")
+    if not was:
+        inst["tuned_on"] = now
+        return ""
+    diff = gpu_env_changes(was, now)
+    if not diff:
+        return None
+    dropped = ", ".join(f"{N.shown(k)}={env[k]}" for k in keys)
+    rest = {k: v for k, v in env.items() if k not in keys}
+    if rest:
+        cfg["env"] = rest
+    else:
+        cfg.pop("env", None)
+    inst.pop("tuned_on", None)
+    return (f"{dropped} was measured on this PC before a change ({'; '.join(diff)}): left out, so the engine "
+            f"measures it again at its start ({ME} --calibrate tunes it again)")
 
 
 def busy_gpus(cfg: dict) -> list:
@@ -3105,10 +3196,13 @@ def calibrate_config(cfg_path: Path) -> bool:
         cfg["env"] = env
     else:
         cfg.pop("env", None)
+    ge = gpu_env(cfg)                                  # (where it was measured: a driver or P2P change re-measures, #419)
+    if ge:
+        cfg.setdefault("installer", {})["tuned_on"] = ge
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     store = load_calibrations()
     store[hardware_key(cfg)] = {"settings": res["settings"], "tok_s": res["report"].get("tok_s"),
-                                "date": time.strftime("%Y-%m-%d")}
+                                "date": time.strftime("%Y-%m-%d"), **({"gpu_env": ge} if ge else {})}
     try:
         CAL_STORE.parent.mkdir(parents=True, exist_ok=True)
         CAL_STORE.write_text(json.dumps(store, indent=1), encoding="utf-8")
@@ -3158,8 +3252,10 @@ def calibrate_ds4_config(cfg_path: Path) -> bool:
     cfg.setdefault("installer", {})["calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"), **res["report"]}
     cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     store = load_calibrations()
+    ge = gpu_env(cfg)                                  # (a driver or P2P change: not offered again by a setup, #419)
     store[hardware_key(cfg)] = {"args": res["args"], "tok_s": res["report"].get("tok_s"),
-                                "prompt_tok_s": res["report"].get("prompt_tok_s"), "date": time.strftime("%Y-%m-%d")}
+                                "prompt_tok_s": res["report"].get("prompt_tok_s"), "date": time.strftime("%Y-%m-%d"),
+                                **({"gpu_env": ge} if ge else {})}
     try:
         CAL_STORE.parent.mkdir(parents=True, exist_ok=True)
         CAL_STORE.write_text(json.dumps(store, indent=1), encoding="utf-8")
@@ -3492,6 +3588,11 @@ def server_command(cfg_path: Path, a) -> tuple:
             stamp_pack(pack, shard_set(pack.parent / src))
     if add_profile(cfg):                               # a config written before the expert profile (an update)
         cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    stale = stale_tuning(cfg)                          # tuned before a driver / P2P change: measured again (#419)
+    if stale is not None:
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        if stale:
+            warn(f"{cfg_path.name}: {stale}")
         ok(f"{cfg_path.name}: starts from the shipped expert profile now (--expert-profile {PROFILE})")
     if ds4 and ds4_seed_profile(cfg):                  # (DeepSeek's: a pack that has not learned one yet)
         ok(f"{cfg_path.name}: starts from DeepSeek's shipped expert profile ({DS4_PROFILE.name}, copied into the pack)")
