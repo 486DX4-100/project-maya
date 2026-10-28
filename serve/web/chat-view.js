@@ -292,7 +292,7 @@ function ThinkingPopover({open, close, anchor, below}) {
 function PlusMenu({open, close, anchor, pickFiles}) {
   const servers = (S.mcp.servers || []).length;
   return html`<${Menu} open=${open} onClose=${close} anchor=${anchor} label="Add" align="left" width=${270} cls="plus-menu">
-    <${MenuItem} icon="attach" label=${S.health.images ? "Add files or images" : "Add text files"} onClick=${() => { close(); pickFiles(); }}/>
+    <${MenuItem} icon="attach" label="Select file" onClick=${() => { close(); pickFiles(); }}/>
     ${servers ? html`<${MenuSep}/>
       <button type="button" role="menuitemcheckbox" aria-checked=${String(P.mcp !== false)} class="menu__item"
         onClick=${() => savePrefs({mcp: P.mcp === false})}>
