@@ -1,5 +1,5 @@
 """serve/models.py - the web app's Models page: the run configs the setup wrote (maya-<model>.json beside maya.py), what
-each one runs with, and the engine settings the page changes in them.
+each one runs with, the engine settings the page changes in them, and a model deleted (delete_plan, delete).
 
 A config's settings, as the page shows them (None: the engine's own default, or "auto"):
   both:      context, images, gpus, reserve_mib, env
@@ -17,6 +17,8 @@ import copy
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -26,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import maya_quants  # noqa: E402  (tools/) the quants' names users see, and each config's family
 
 SWITCH_FILE = ".maya-switch.json"           # the server's note to maya.py: start this config next (a switch)
+DELETE_FILE = ".maya-delete.json"           # ... and to the next server: delete this config (it was the one running)
 CONTEXTS = [8192, 32768, 65536, 131072]       # the setup's choices (a config's own size is offered too)
 DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepSeek (maya.py's DS4_CONTEXTS)
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
@@ -43,9 +46,9 @@ ENV_LOADER = re.compile(r"^(?:LD_\w*|DYLD_\w*|PYTHON\w*|PATH|PATHEXT|BASH_ENV|EN
 GLM_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "expert_cache", "prefill",
             "kv_streaming", "kv_resident")
 DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "tp", "mmap", "prefill_chunk",
-            "cpu_threads")
+            "cpu_threads", "prompt_lookup", "dspark_conf")
 MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
-            "cpu_threads")
+            "cpu_threads", "reserve_gb", "prefill_chunk", "cache_gb", "dspark_conf")
 QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
 
 
@@ -82,6 +85,14 @@ def _int(v, default=None):
         return int(str(v).strip())
     except (TypeError, ValueError):
         return default
+
+
+def _float(v, default=None):
+    try:
+        f = float(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+    return f if f == f else default                    # (not NaN)
 
 
 def family(cfg: dict) -> str:
@@ -190,7 +201,9 @@ def settings_of(cfg: dict) -> dict:
                    draft="dspark" if flag(args, "--dspark", "off") not in ("off", "none") else "none",
                    tp=_int(flag(args, "--tp"), 0), kv_cache=flag(args, "--kv-cache", "int8"),
                    kv_streaming=kvs == "on" or (kvs is None and _int(flag(args, "--kv-resident"), 0) > 0),
-                   kv_resident=_int(flag(args, "--kv-resident")), cpu_threads=_int(flag(args, "--cpu-threads")))
+                   kv_resident=_int(flag(args, "--kv-resident")), cpu_threads=_int(flag(args, "--cpu-threads")),
+                   reserve_gb=_float(flag(args, "--reserve-gb")), prefill_chunk=_int(flag(args, "--chunk")),
+                   cache_gb=_float(flag(args, "--cache-gb")), dspark_conf=_float(flag(args, "--dspark-conf")))
         return out
     if family(cfg) == "qwen":
         ec, pf = flag(args, "--expert-cache", "auto"), flag(args, "--prefill", "auto")
@@ -206,7 +219,10 @@ def settings_of(cfg: dict) -> dict:
                    reserve_mib=_int(flag(args, "--reserve-mib")), parallel=_int(flag(args, "--parallel"), 1),
                    draft="none" if dspark == "none" or (dspark is None and not ds4_has_drafter(cfg)) else "dspark",
                    tp=_int(flag(args, "--tp"), 2), mmap=flag(args, "--mmap-experts", "auto"),   # (2: the engine's own)
-                   prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")))
+                   prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")),
+                   # (--suffix-draft: the prompt lookup's shortest match, 3 by the engine; 0 off)
+                   prompt_lookup=_int(flag(args, "--suffix-draft"), 3) != 0,
+                   dspark_conf=_float(flag(args, "--dspark-conf")))
         if out["mmap"] not in ("auto", "on", "off"):
             out["mmap"] = "auto"
         return out
@@ -240,6 +256,19 @@ def _num(s: dict, key: str, lo: int, hi: int, what: str, none_ok: bool = True):
     v = _int(v)
     if not lo <= v <= hi:
         raise ValueError(f"{what}: from {lo} to {hi}")
+    return v
+
+
+def _dec(s: dict, key: str, lo: float, hi: float, what: str):
+    """A decimal setting: None where empty (the engine's own), else a number from lo to hi."""
+    v = s.get(key)
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool) or _float(v) is None:
+        raise ValueError(f"{what}: a number, please")
+    v = _float(v)
+    if not lo <= v <= hi:
+        raise ValueError(f"{what}: from {lo:g} to {hi:g}")
     return v
 
 
@@ -347,6 +376,15 @@ def apply(cfg: dict, settings: dict) -> dict:
             drop_flag(args, "--kv-resident")
         ct = _num(s, "cpu_threads", 1, 512, "CPU threads")
         args = set_flag(args, "--cpu-threads", ct) if ct is not None else drop_flag(args, "--cpu-threads")
+        # (empty: the engine's own - --reserve-gb 1.0, 0.3 with --tp; --chunk the prefill calibration's; --cache-gb 1.5,
+        #  read with --tp only; --dspark-conf 0.7)
+        for key, name, lo, hi, what in (("reserve_gb", "--reserve-gb", 0, 64, "VRAM kept free"),
+                                        ("cache_gb", "--cache-gb", 0, 256, "Expert cache"),
+                                        ("dspark_conf", "--dspark-conf", 0, 1, "Draft confidence")):
+            v = _dec(s, key, lo, hi, what)
+            args = set_flag(args, name, f"{v:g}") if v is not None else drop_flag(args, name)
+        ch = _num(s, "prefill_chunk", 16, 65536, "Prompt chunk")
+        args = set_flag(args, "--chunk", ch) if ch is not None else drop_flag(args, "--chunk")
     elif ds4:
         # (maya-ds4 --parallel: n conversations at once - each its own context's caches in VRAM; written where it changes)
         par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
@@ -374,6 +412,15 @@ def apply(cfg: dict, settings: dict) -> dict:
                                         ("cpu_threads", "--cpu-threads", 1, 512, "CPU threads")):
             v = _num(s, key, lo, hi, what)
             args = set_flag(args, name, v) if v is not None else drop_flag(args, name)
+        # the prompt lookup: on keeps a config's own shortest match (else the engine's 3), off is --suffix-draft 0
+        if not isinstance(s.get("prompt_lookup"), bool):
+            raise ValueError("Prompt lookup: on or off")
+        if not s["prompt_lookup"]:
+            args = set_flag(args, "--suffix-draft", 0)
+        elif not _int(flag(args, "--suffix-draft"), 0):
+            args = drop_flag(args, "--suffix-draft")
+        conf = _dec(s, "dspark_conf", 0, 1, "Draft confidence")
+        args = set_flag(args, "--dspark-conf", f"{conf:g}") if conf is not None else drop_flag(args, "--dspark-conf")
     else:
         par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
         args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
@@ -578,3 +625,304 @@ def save(path: Path, settings: dict) -> dict:
     write(path, new)
     os.utime(path, (st.st_atime, st.st_mtime))         # (its time says when it last ran: a start picks the latest)
     return {"changed": True, "prev": prev.name}
+
+
+# ------------------------------------------------------------------ deleting a model (the page's Delete)
+# Off the list: its config, its start scripts and what Maya keeps beside it.  With its files: what the setup downloaded
+# for it and the pack Maya built - never a file another model here runs from, nor one outside the models folder the
+# setup downloaded into (a GGUF of your own stays; its pack goes).  Its DFlash2 drafter goes too: another model drafting
+# with the same file drafts with MTP from then on (its --dflash taken out).
+GGUF_PART = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.I)
+
+
+def _res(p) -> Path | None:
+    try:
+        return Path(p).expanduser().resolve() if p else None
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+
+
+def _within(p: Path, d: Path) -> bool:
+    """`p` is `d` or in it."""
+    return p == d or d in p.parents
+
+
+def drafter_of(cfg: dict) -> Path | None:
+    """The DFlash2 drafter a config drafts with, or the one its setup downloaded for it (installer.draft)."""
+    p = flag(cfg.get("args") or [], "--dflash")
+    if p:
+        return Path(p)
+    return dflash_file(cfg) if (cfg.get("installer") or {}).get("draft") == "dflash2" else None
+
+
+def vision_files(cfg: dict) -> list:
+    """GLM's image encoder: its mmproj and vocab files (on or switched off)."""
+    out = []
+    for key in ("vision", "vision_off"):
+        v = cfg.get(key)
+        if isinstance(v, dict):
+            out += [Path(v[k]) for k in ("mmproj", "model") if isinstance(v.get(k), str) and v[k]]
+    return out
+
+
+def pack_shards(pack: Path) -> list:
+    """The model files a pack indexes, in its folder: its sources.json's list, else the GGUF its native_experts.txt
+    names (every part of a split one)."""
+    names = []
+    try:
+        rec = json.loads((pack / "sources.json").read_text(encoding="utf-8")).get("files") or []
+        names = [r["name"] for r in rec if isinstance(r, dict) and isinstance(r.get("name"), str)]
+    except (OSError, ValueError, AttributeError):
+        names = []
+    if not names:
+        try:
+            with open(pack / "native_experts.txt", encoding="utf-8") as f:
+                m = re.search(r"absolute offsets in ([^,)]+)", f.readline())
+        except OSError:
+            m = None
+        first = Path(m.group(1).strip()).name if m else None
+        part = GGUF_PART.match(first) if first else None
+        names = ([f"{part.group(1)}-{i:05d}-of-{part.group(3)}.gguf" for i in range(1, int(part.group(3)) + 1)]
+                 if part else [first] if first else [])
+    return [pack.parent / Path(n).name for n in names]   # (by name: nothing outside the pack's folder)
+
+
+def runs_from(cfg: dict) -> list:
+    """Every path a config runs from: its pack and the model files in it, its drafter, image encoder and tokenizer, and
+    the folder or GGUF its setup named."""
+    pack = pack_of(cfg)
+    found = ([pack] + pack_shards(pack)) if pack else []
+    inst = cfg.get("installer") or {}
+    found += [Path(inst[k]) for k in ("model_dir", "gguf", "gguf_dir") if isinstance(inst.get(k), str) and inst[k]]
+    found += [Path(v) for v in (flag(cfg.get("args") or [], "--dflash"), flag(cfg.get("args") or [], "--mtp"),
+                                cfg.get("tokenizer")) if isinstance(v, str) and v]
+    found += vision_files(cfg)
+    return [r for r in map(_res, found) if r is not None]
+
+
+def _size(p: Path) -> int:
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return 0
+    if not stat.S_ISDIR(st.st_mode):
+        return st.st_size if stat.S_ISREG(st.st_mode) else 0
+    total = 0
+    for dp, _, files in os.walk(p):                     # (symlinked folders: not followed)
+        for n in files:
+            try:
+                st = os.lstat(os.path.join(dp, n))
+            except OSError:
+                continue
+            total += st.st_size if stat.S_ISREG(st.st_mode) else 0
+    return total
+
+
+def delete_plan(root: Path, path: Path) -> dict:
+    """What deleting the config at `path` with its files would delete: {"ok", "why" (when not ok), "items": [{"path",
+    "what" (folder, pack, gguf, vision, drafter), "bytes"}], "bytes", "folder", "gguf" (model files), "pack", "vision",
+    "drafter" (its bytes, or None), "drafter_users" (the other configs drafting with it), "kept" (what stays, said)}."""
+    path = Path(path)
+    cfg = read(path)
+    me = _res(path)
+    others = [(p, read(p)) for p in config_paths(root) if _res(p) != me]
+    refs = [r for _, c in others for r in runs_from(c)]
+    out = {"ok": False, "why": None, "items": [], "bytes": 0, "folder": None, "gguf": 0, "pack": False,
+           "vision": False, "drafter": None, "drafter_users": [], "kept": []}
+    models = _res((cfg.get("installer") or {}).get("models_dir"))
+    pack = _res(pack_of(cfg))
+    if models is None or pack is None:
+        out["why"] = "Maya's setup did not download this model's files, so it does not know which ones are its own"
+        return out
+    folder = pack.parent
+    out["folder"] = str(folder)
+    project = _res(Path(root))
+    items: list = []
+
+    def shared(p: Path) -> bool:                        # (another model runs from it, or from something in it)
+        return any(_within(r, p) for r in refs)
+
+    def covered(p: Path) -> bool:
+        return any(_within(p, it) for it, _ in items)
+
+    def add(p: Path, what: str):
+        if not covered(p) and (p.exists() or p.is_symlink()):
+            items.append((p, what))
+
+    downloaded = _within(folder, models)
+    if (downloaded and folder != models and not shared(folder) and not _within(project, folder)
+            and not _within(Path.home().resolve(), folder)):
+        add(folder, "folder")                           # (its own folder: the files, the pack, the image encoder)
+    else:                                               # (a folder other models' files are in too, or your own)
+        if not shared(pack):
+            add(pack, "pack")
+        if downloaded:
+            for f in pack_shards(pack):
+                if not shared(f):
+                    add(f, "gguf")
+        else:
+            out["kept"].append(f"Your own model files in {folder} stay; only the pack Maya built from them goes.")
+    for v in map(_res, vision_files(cfg)):
+        if v is not None and _within(v, models) and not shared(v):
+            add(v, "vision")
+    d = _res(drafter_of(cfg))
+    if d is not None and d.is_file() and _within(d, models):
+        out["drafter_users"] = [p.name for p, c in others if _res(flag(c.get("args") or [], "--dflash")) == d]
+        add(d, "drafter")
+    for p, what in items:
+        n = _size(p)
+        out["items"].append({"path": str(p), "what": what, "bytes": n})
+        out["bytes"] += n
+        if what == "drafter":
+            out["drafter"] = n
+        elif what == "vision":
+            out["vision"] = True
+        elif what == "pack":
+            out["pack"] = True
+        elif what == "gguf":
+            out["gguf"] += 1
+        else:                                           # (its folder: the GGUF files in it, the pack, the encoder)
+            try:
+                out["gguf"] += sum(1 for e in p.iterdir() if e.suffix.lower() == ".gguf" and e.is_file())
+                out["pack"] = out["pack"] or pack.is_dir()
+                out["vision"] = out["vision"] or any(v is not None and _within(v, p) and v.exists()
+                                                     for v in map(_res, vision_files(cfg)))
+            except OSError:
+                pass
+    out["ok"] = True
+    return out
+
+
+def delete(root: Path, path: Path, files: bool = False) -> dict:
+    """The config at `path` off the list: it, its start scripts, the settings kept beside it (.prev,
+    .shared-settings.json); with `files`, delete_plan's files first (a file that cannot be deleted keeps the config,
+    and says which).  {"deleted", "freed" (bytes), "drafter_users" (now drafting with MTP)}."""
+    path = Path(path)
+    freed, users, errors = 0, [], []
+    if files:
+        plan = delete_plan(root, path)
+        if not plan["ok"]:
+            raise ValueError(plan["why"])
+        for it in plan["items"]:
+            p = Path(it["path"])
+            try:
+                if p.is_dir() and not p.is_symlink():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+                freed += it["bytes"]
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                errors.append(f"{p} ({e.strerror or e})")
+                continue
+            if it["what"] == "drafter":
+                try:
+                    p.parent.rmdir()                    # (its folder, when nothing else is in it)
+                except OSError:
+                    pass
+                for name in plan["drafter_users"]:      # (another model drafting with it: with MTP from now on)
+                    other = Path(root) / name
+                    cfg = read(other)
+                    if not cfg:
+                        continue
+                    other.with_name(other.name + ".prev").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+                    st = other.stat()
+                    write(other, {**cfg, "args": drop_flag(cfg.get("args") or [], "--dflash")})
+                    os.utime(other, (st.st_atime, st.st_mtime))
+                    users.append(name)
+        if errors:
+            raise OSError("could not delete " + "; ".join(errors) + " - the model stays on the list")
+    for p in (path, path.with_name(f"run-{path.stem}.sh"), path.with_name(f"run-{path.stem}.bat"),
+              path.with_name(path.name + ".prev"), path.with_name(path.stem + ".shared-settings.json")):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    return {"deleted": path.name, "freed": freed, "files": bool(files), "drafter_users": users}
+
+
+# ------------------------------------------------------------------ files no model here runs from
+# What the models folders hold that no config here names: a download whose config was deleted by hand or by an older
+# version, a quant set up again into another folder.  Only what is in a folder the setup downloaded into: at its top a
+# folder or a file of 100 MB or more (a download's log is not listed), and one level down in a folder another model
+# runs from only a folder with a pack of its own (GLM's quants side by side in GLM-5.3-Flash/: DeepSeek's dspark/ and
+# vision/ beside its GGUF folder are read through the pack, so a folder without one is never taken for unused).  Never
+# a hidden one, the project or the home folder.  Maya may not have downloaded it: the page says what is in it, and
+# deletes one at a time.
+LEFTOVER_MIN = 10 ** 8
+PACK_MARKS = ("sources.json", "tensors.txt", "mm3.txt", "ds4.txt", "native_experts.txt", "index.txt")
+
+
+def models_dirs(root: Path) -> list:
+    """The folders the setup downloaded into: each config's, and the setup's own (Maya-data/models beside the project)
+    - not the home folder, nor one the project is in."""
+    project, home = _res(root), Path.home().resolve()
+    found = [_res((read(p).get("installer") or {}).get("models_dir")) for p in config_paths(root)]
+    found.append(_res(Path(root).parent / "Maya-data" / "models"))
+    out = []
+    for d in found:
+        if d is None or d in out or not d.is_dir() or _within(home, d) or (project and _within(project, d)):
+            continue
+        out.append(d)
+    return out
+
+
+def _has_pack(p: Path) -> bool:
+    """A pack Maya built is in `p` (or `p` is one), two folders deep at most."""
+    try:
+        return any(next(p.glob(pat + m), None) is not None for pat in ("", "*/", "*/*/") for m in PACK_MARKS)
+    except OSError:
+        return False
+
+
+def leftovers(root: Path) -> dict:
+    """{"folders": the models folders, "items": [{"path", "name", "bytes", "folder" (a folder, else a file), "pack" (a
+    pack Maya built is in it), "hub" (downloaded from the Hugging Face Hub), "modified"}], "bytes"}: what no model here
+    runs from, largest first."""
+    project, home = _res(root), Path.home().resolve()
+    refs = [r for p in config_paths(root) for r in runs_from(read(p))]
+    dirs, items = models_dirs(root), []
+
+    def entries(d: Path) -> list:
+        try:
+            return [e for e in d.iterdir() if not e.name.startswith(".") and not e.is_symlink()]
+        except OSError:
+            return []
+
+    def add(e: Path):
+        n = _size(e)
+        if n >= LEFTOVER_MIN:
+            items.append({"path": str(e), "name": e.name, "bytes": n, "folder": e.is_dir(),
+                          "pack": e.is_dir() and _has_pack(e), "hub": (e / ".cache" / "huggingface").is_dir(),
+                          "modified": e.stat().st_mtime})
+
+    for d in dirs:
+        for e in entries(d):
+            try:
+                if not (e.is_dir() or e.is_file()) or (project and _within(project, e)) or _within(home, e):
+                    continue
+                if not any(_within(r, e) for r in refs):
+                    add(e)
+                elif e.is_dir() and not any(_within(e, r) for r in refs):   # (another model runs from a part of it)
+                    for c in entries(e):
+                        if c.is_dir() and not any(_within(r, c) for r in refs) and _has_pack(c):
+                            add(c)
+            except OSError:
+                continue
+    items.sort(key=lambda i: -i["bytes"])
+    return {"folders": [str(d) for d in dirs], "items": items, "bytes": sum(i["bytes"] for i in items)}
+
+
+def delete_leftover(root: Path, path) -> dict:
+    """One of leftovers()'s items deleted, checked again first (a model set up since may run from it now).
+    {"deleted", "freed" (bytes)}."""
+    item = next((i for i in leftovers(root)["items"] if i["path"] == str(path or "")), None)
+    if item is None:
+        raise ValueError(f"{path} is not a file no model uses here (gone, or a model runs from it now)")
+    p = Path(item["path"])
+    if item["folder"]:
+        shutil.rmtree(p)
+    else:
+        p.unlink()
+    return {"deleted": str(p), "freed": item["bytes"]}

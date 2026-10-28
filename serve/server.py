@@ -151,16 +151,23 @@ class Engine(Protocol):
     def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event) -> Iterator[int]: ...
 
 
+PEAK_MIN_TOKENS = 32   # the Monitor's peak decode speed: answers this long or longer (a few tokens' speed says little)
+
+
 class MockEngine:
     """Replays a scripted completion (text) as token ids, one per step, then the end-of-turn token.  Given a list of
     scripts, each request gets the next one and the last one repeats (a tool call, then the answer after it)."""
 
-    def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0):
+    def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0,
+                 tok_s: float | None = None):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
+        # tok_s: it writes at about that speed and reports its clock as the engine's DONE does (the Monitor's speeds;
+        # `--engine mock` takes MAYA_MOCK_TOK_S)
+        self.tok_s = tok_s
         end = tokenizer.encode(IM_END, parse_special=True)
         self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in ([script] if isinstance(script, str)
                                                                                  else script)]
-        self.script, self.turns = self.scripts[0], 0
+        self.script, self.turns, self._runs = self.scripts[0], 0, 0
         self.last_prompt: list[int] = []
         # it samples nothing, so every request's bias is as good as applied; and a scripted token is certain: logprob 0,
         # the only token its row has (logprobs)
@@ -173,11 +180,18 @@ class MockEngine:
             self.script = self.scripts[min(self.turns, len(self.scripts) - 1)]
             self.turns += 1
         n_top = logprobs_asked(sampling)
-        for t in self.script[:max_new]:
+        t0, steps = time.time(), self.script[:max_new]
+        self._runs += 1
+        for i, t in enumerate(steps):
             if cancel.is_set():
                 return
             if self.delay:
                 time.sleep(self.delay)
+            if self.tok_s:
+                time.sleep((0.8 + 0.4 * ((t * 7919 + self._runs * 104729) % 101) / 100) / self.tok_s)   # (uneven)
+                if i == len(steps) - 1:                 # (its DONE, before the last token: the server stops there)
+                    self.last = {"generated": i + 1, "decode_ms": (time.time() - t0) * 1000,
+                                 "prompt_ms": len(ids) * 0.5, "reused": 0}
             if n_top is not None:
                 t = LpToken(t)
                 t.lp = (0.0, [(int(t), 0.0)] if n_top > 0 else [])
@@ -1940,7 +1954,8 @@ class Service:
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
-                       "prompt_ms": 0.0, "decode_ms": 0.0}
+                       "prompt_ms": 0.0, "decode_ms": 0.0,
+                       "peak_decode": None}   # the fastest answer's decode: {tok_s, tokens, time} (PEAK_MIN_TOKENS+)
         # the loop guard (serve/loop_guard.py; MAYA_LOOP_GUARD=0 / "loop_guard": false: off) and what it did since
         # the server started: loops seen, and how each was broken (the Monitor's totals, /metrics, Prometheus)
         self.loop_guard = True
@@ -2322,7 +2337,9 @@ class Service:
         out = models.listing(self.models_root(), self.config_path)
         out.update(restarts=bool(os.environ.get("MAYA_RESTART_ON_UPDATE")),
                    running=Path(self.config_path).name if self.config_path else None,
-                   restarting=getattr(self, "model_restart", None))
+                   restarting=getattr(self, "model_restart", None),
+                   deleted=getattr(self, "deleted", None),          # (the model running before, deleted at this start)
+                   leftovers=models.leftovers(self.models_root()))
         return out
 
     def _model_path(self, name) -> Path:
@@ -2385,6 +2402,80 @@ class Service:
         print(f"[maya] {p.name} is the model to start" + (": Maya starts again with it" if restarts else
               " next (a start without --config picks it)"), flush=True)
         return {"to": p.name, "model": cfg.get("model_name") or "", "restarts": restarts}
+
+    def delete_model(self, name, files: bool = False, dry_run: bool = False, then=None) -> dict:
+        """The Models page's Delete: the config `name` off the list (models.delete), with `files` what its setup
+        downloaded for it as well.  Not while Maya starts again.  The model running: Maya switches to `then` first, and
+        the next server deletes it (models.DELETE_FILE) once the engine that ran from it is gone.  dry_run: what would
+        go (models.delete_plan), nothing deleted."""
+        p = self._model_path(name)
+        running = self._is_running(p)
+        if getattr(self, "model_restart", None):
+            raise ValueError("Maya is starting again; try again when it is done")
+        if dry_run:
+            return {"file": p.name, "running": running, **models.delete_plan(self.models_root(), p)}
+        if running:
+            return self._delete_running(p, files, then)
+        out = models.delete(self.models_root(), p, bool(files))
+        print(f"[maya] {p.name} deleted" + (f", and its files ({out['freed'] / 2**30:.1f} GB)" if files else
+              " (its files stay)") + "".join(f"; {n} drafts with MTP now (its DFlash2 drafter was deleted)"
+                                             for n in out["drafter_users"]), flush=True)
+        return out
+
+    def _delete_running(self, p: Path, files: bool, then) -> dict:
+        if not then:
+            raise ValueError(f"{p.name} is the model running now: pick the model Maya switches to first")
+        if not os.environ.get("MAYA_RESTART_ON_UPDATE"):
+            raise ValueError("this server was not started by maya.sh or START-MAYA.bat, so it cannot switch to another "
+                             f"model by itself: start another model, then delete {p.name}")
+        if files:                                        # (checked now: the next server only reports)
+            plan = models.delete_plan(self.models_root(), p)
+            if not plan["ok"]:
+                raise ValueError(plan["why"])
+        cfg = models.read(p)                             # (its name, for the page once the config is gone)
+        note = self.models_root() / models.DELETE_FILE
+        note.write_text(json.dumps({"config": str(p.resolve()), "files": bool(files), "time": time.time(),
+                                    "model": cfg.get("model_name") or "", "quant": models.quant_label(cfg, p)}),
+                        encoding="utf-8")
+        try:
+            out = self.switch_model(then)                # (its checks: not this one, can start, not busy)
+        except BaseException:
+            note.unlink(missing_ok=True)
+            raise
+        print(f"[maya] {p.name} is deleted once {out['to']} runs" + (", with its files" if files else ""), flush=True)
+        return {"deleting": p.name, "to": out["to"], "files": bool(files), "restarts": True}
+
+    def finish_delete(self):
+        """The model that ran before this start, deleted now that another one runs (the Models page deleted the
+        running one: its note, models.DELETE_FILE, read once).  self.deleted says how it went, for the page."""
+        note_path = self.models_root() / models.DELETE_FILE
+        try:
+            note = json.loads(note_path.read_text(encoding="utf-8"))
+            note_path.unlink()
+        except (OSError, ValueError):
+            return
+        p = Path(str(note.get("config") or ""))
+        if time.time() - float(note.get("time") or 0) > 900 or not p.is_file() or p.parent != self.models_root():
+            return                                       # (stale, gone already, or not one of these configs)
+        if self._is_running(p):                          # (the switch did not happen: it runs again)
+            self.deleted = {"file": p.name, "error": "it is the model running now", "time": time.time()}
+            print(f"[maya] {p.name} not deleted: it is the model running now", flush=True)
+            return
+        try:
+            out = models.delete(self.models_root(), p, bool(note.get("files")))
+        except (OSError, ValueError) as e:
+            self.deleted = {"file": p.name, "error": str(e), "time": time.time()}
+            print(f"[maya] {p.name} not deleted: {e}", flush=True)
+            return
+        self.deleted = {**out, "model": note.get("model") or "", "quant": note.get("quant") or "", "time": time.time()}
+        print(f"[maya] {p.name} deleted" + (f", and its files ({out['freed'] / 2**30:.1f} GB)" if out["files"] else
+              " (its files stay)"), flush=True)
+
+    def delete_leftover(self, path) -> dict:
+        """The Models page's files no model uses: one deleted (models.delete_leftover)."""
+        out = models.delete_leftover(self.models_root(), path)
+        print(f"[maya] {out['deleted']} deleted ({out['freed'] / 2**30:.1f} GB): no model here used it", flush=True)
+        return out
 
     def _restart_into(self, p: Path, why: str):
         _, port = getattr(self, "listen", None) or ("127.0.0.1", None)
@@ -2645,6 +2736,9 @@ class Service:
             ("llamacpp:requests_processing", "gauge", "Requests running", max(active, int(bool(s.get("busy"))))),
             ("llamacpp:requests_deferred", "gauge", "Requests waiting their turn", s.get("queued") or 0),
             ("maya:requests_total", "counter", "Requests finished", t["requests"]),
+            ("maya:decode_peak_tokens_seconds", "gauge",
+             f"The fastest answer's generation throughput in tokens/s ({PEAK_MIN_TOKENS} tokens or more)",
+             (t.get("peak_decode") or {}).get("tok_s") or 0),
             ("maya:engine_alive", "gauge", "1 while the engine process runs",
              int(self.engine.alive()) if hasattr(self.engine, "alive") else 1),
             ("maya:loop_guard_detected_total", "counter", "Loops the loop guard saw in answers", guard["detected"]),
@@ -3376,7 +3470,7 @@ class Service:
                     started = my_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
-                    self.history.append({
+                    row = {
                         "projection": (sampling or {}).get("experimental_speed_projection") is not False
                         if loaded else None,
                         "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
@@ -3389,8 +3483,13 @@ class Service:
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
                         "hit_rate": hit_rate,
-                        "loop_guard": guards[0].summary() if guards and guards[0].events else None})
+                        "loop_guard": guards[0].summary() if guards and guards[0].events else None}
+                    self.history.append(row)
                     t = self.totals
+                    peak = t.get("peak_decode")
+                    if row["decode_tok_s"] and n >= PEAK_MIN_TOKENS and \
+                            (peak is None or row["decode_tok_s"] > peak["tok_s"]):
+                        t["peak_decode"] = {"tok_s": row["decode_tok_s"], "tokens": n, "time": started}
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
                     t["reused"] += last.get("reused") or 0
@@ -4368,7 +4467,7 @@ def make_handler(svc: Service):
                 if path == "/api/update":
                     self._update()
                     return
-                if path in ("/api/models/settings", "/api/models/switch"):
+                if path in ("/api/models/settings", "/api/models/switch", "/api/models/delete", "/api/models/leftovers"):
                     self._models(path.rsplit("/", 1)[1])
                     return
                 if path == "/api/savings/reset":
@@ -4518,12 +4617,18 @@ def make_handler(svc: Service):
                     raise ValueError("the request body must be a JSON object")
                 if what == "switch":
                     out = svc.switch_model(req.get("file"))
+                elif what == "delete":
+                    out = svc.delete_model(req.get("file"), bool(req.get("files")), bool(req.get("dry_run")),
+                                           req.get("then"))
+                elif what == "leftovers":
+                    out = svc.delete_leftover(req.get("path"))
                 else:
                     out = svc.model_settings(req.get("file"), req.get("settings") or {}, bool(req.get("dry_run")))
             except (TypeError, ValueError, OSError) as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
-            self._json(200 if what == "settings" and req.get("dry_run") else 202, out)
+            self._json(200 if what in ("delete", "leftovers") and not out.get("deleting")
+                       or (what == "settings" and req.get("dry_run")) else 202, out)
 
         def _update(self):
             # It replaces the server's files and restarts it for every client: only the app's own page
@@ -5259,7 +5364,8 @@ def main() -> int:
                 vision = Vision(dict(vcfg, gpu=False), log=vlog, env=venv)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
-            "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
+            "Thinking about it.</think>\n\nHello from the mock engine."],
+            tok_s=float(os.environ.get("MAYA_MOCK_TOK_S") or 0) or None), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's.  A GLM-5.3-Flash pack's
     # copy is the one its GGUF carried (August's): the template zai-org publishes now renders the same prompts and
     # matches tool results to their calls without nested loops (zai-org/GLM-5.3-Flash PR #63: 100 parallel calls
@@ -5312,6 +5418,7 @@ def main() -> int:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
         p = Path(svc.config_path)                        # the tokens it serves, and what its API would have charged
         svc.savings = savings.Ledger(p.parent / savings.FILE, p.name, svc.model, models.quant_label(cfg, p))
+        threading.Thread(target=svc.finish_delete, daemon=True).start()   # (the model before, if the page deleted it)
     args = [str(x) for x in cfg.get("args") or []]
     if "--glm-pack" in args[:-1]:                       # the model's folder: the pack's parent holds its GGUF files
         svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent

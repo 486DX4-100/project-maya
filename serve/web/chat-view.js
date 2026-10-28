@@ -251,42 +251,41 @@ function textWidth(t, el) {
   return measureCtx.measureText(t).width;
 }
 
-function ThinkingPanel({close, sheet}) {
-  const level = thinkingOf(), li = LEVELS.findIndex((l) => l.id === level);
+// the thinking level: a thick bar hovering over the chat by the message box (above it; below it on a new chat's centred
+// one), one segment a level - the model's own: GLM's Off, Low, High and Max - filled up to the one set.  A tap, a click
+// or a drag along it sets another (one slider: the arrow keys, Home and End too).  On a phone it spans the message box.
+function ThinkingBar({bar, below}) {
+  const level = thinkingOf(), n = LEVELS.length, li = Math.max(0, LEVELS.findIndex((l) => l.id === level));
   const titles = thinkTitles();
-  const pick = (id) => setThinking(id);
+  const track = useRef(null), dragging = useRef(false);
+  const set = (i) => { const l = LEVELS[Math.min(n - 1, Math.max(0, i))]; if (l.id !== thinkingOf()) setThinking(l.id); };
+  const from = (x) => { const r = track.current.getBoundingClientRect(); return Math.floor(((x - r.left) / r.width) * n); };
+  const down = (e) => { dragging.current = true; e.currentTarget.setPointerCapture(e.pointerId); set(from(e.clientX)); };
+  const move = (e) => { if (dragging.current) set(from(e.clientX)); };
+  const up = () => { dragging.current = false; };
   const keys = (e) => {
-    if (!["ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+    const to = {ArrowRight: li + 1, ArrowUp: li + 1, ArrowLeft: li - 1, ArrowDown: li - 1, Home: 0, End: n - 1}[e.key];
+    if (to == null) return;
     e.preventDefault();
-    const d = e.key === "ArrowRight" || e.key === "ArrowUp" ? 1 : -1;
-    const n = LEVELS[Math.min(LEVELS.length - 1, Math.max(0, li + d))];
-    pick(n.id);
-    setTimeout(() => { const b = document.querySelector('.think-slider [aria-checked="true"]'); if (b) b.focus(); }, 0);
+    set(to);
   };
-  const isDefault = level === P.thinking;
-  return html`
-    <div class="think-panel__head"><b>Thinking</b><span>${sheet ? "How long the model thinks before it answers, in this chat." : LEVELS[li].desc}</span></div>
-    <div class="think-slider" role="radiogroup" aria-label="Thinking level" onKeyDown=${keys} style=${`--fill:${(li * 100) / (LEVELS.length - 1)}%`}>
-      <span class="think-slider__track"></span><span class="think-slider__fill"></span>
-      ${LEVELS.map((l, i) => html`<button type="button" role="radio" aria-checked=${String(i === li)} tabIndex=${i === li ? 0 : -1}
-        class=${`think-slider__stop${i <= li ? " is-on" : ""}${i === li ? " is-sel" : ""}`} style=${`left:${(i * 100) / (LEVELS.length - 1)}%`}
-        title=${titles[l.id]} aria-label=${`${l.name}: ${l.desc}`} onClick=${() => pick(l.id)}>
-        <span class="think-slider__dot"></span><span class="think-slider__name">${l.name}</span></button>`)}
+  const cls = `think-bar${isPhone() ? "" : " think-bar--pop"}${below && !isPhone() ? " think-bar--below" : ""}${n > 5 ? " think-bar--many" : ""}`;
+  return html`<div ref=${bar} class=${cls} style=${`--n:${n}`}>
+    <div ref=${track} class="think-bar__track" role="slider" tabIndex="0" aria-label="Thinking level, for this chat" aria-valuemin="0"
+      aria-valuemax=${n - 1} aria-valuenow=${li} aria-valuetext=${`${LEVELS[li].name}: ${LEVELS[li].desc}`}
+      style=${`--fill:${((li + 1) * 100) / n}%`}
+      onPointerDown=${down} onPointerMove=${move} onPointerUp=${up} onPointerCancel=${up} onKeyDown=${keys}>
+      <span class="think-bar__fill"></span>
+      ${LEVELS.map((l, i) => html`<span class=${`think-bar__seg${i <= li ? " is-on" : ""}${i === li ? " is-sel" : ""}`}
+        title=${titles[l.id]}>${l.name}</span>`)}
     </div>
-    ${sheet ? html`<p class="think-panel__now"><b>${LEVELS[li].name}</b> · ${LEVELS[li].desc}${isDefault ? " · the default" : ""}</p>`
-            : html`<p class="think-panel__note">For this chat. New chats start at the level in Settings › Chat defaults${isDefault ? "" : ` (${LEVELS.find((l) => l.id === P.thinking).name})`}.</p>`}`;
+  </div>`;
 }
 function ThinkingPopover({open, close, anchor, below}) {
   const ref = useRef(null);
   useDismiss(open, close, ref, anchor);
-  useEffect(() => { if (open && ref.current) { const b = ref.current.querySelector('[aria-checked="true"]'); if (b) b.focus(); } }, [open]);
-  if (!open) return null;
-  if (isPhone()) {
-    return html`<div class="sheet-scrim" onPointerDown=${(e) => { if (e.target === e.currentTarget) close(); }}>
-      <div ref=${ref} class="sheet" role="dialog" aria-label="Thinking"><span class="sheet__grip" aria-hidden="true"></span>
-        <${ThinkingPanel} close=${close} sheet/></div></div>`;
-  }
-  return html`<div ref=${ref} class=${`think-panel${below ? " think-panel--below" : ""}`} role="dialog" aria-label="Thinking"><${ThinkingPanel} close=${close}/></div>`;
+  useEffect(() => { if (open && ref.current) { const b = ref.current.querySelector('[role="slider"]'); if (b) b.focus({preventScroll: true}); } }, [open]);
+  return open ? html`<${ThinkingBar} bar=${ref} below=${below}/>` : null;
 }
 
 function PlusMenu({open, close, anchor, pickFiles}) {
