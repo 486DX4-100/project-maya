@@ -325,6 +325,13 @@ struct Prefill::Impl {
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
+    // the next stage's read of the last chunk handed on (it runs on a thread while this stage reads the next chunk),
+    // and which of the two hand-off buffers the next chunk goes to.  They outlive a `run` call: a stage that is
+    // called once per chunk by the stage before it hands its chunk on and returns, so every stage of the chain
+    // works on a different chunk at the same time.
+    std::future<bool> next_run;
+    std::string next_err;
+    int hand_buf = 0;
     // C-4: the chunk's token ids on the device, for one batched embedding gather
     int32_t* tok_dev = nullptr;
     std::vector<int32_t> tok_host;
@@ -981,6 +988,22 @@ struct PfTimer {
 };
 }  // namespace
 
+// Waits for every chunk this stage handed on, then for the stages after it (their own hand-offs), in the order of the
+// chain: a stage launches its next hand-off only from its own task, which is finished by the time it is waited for.
+// Everything has finished before the first result is read, so a task's exception (rethrown by `get`) leaves no thread
+// running.  false with `err` when one of them failed.
+bool Prefill::drain_pipe(std::string& err) {
+    for (Prefill* p = this; p != nullptr; p = p->next_)
+        if (p->impl_->next_run.valid()) p->impl_->next_run.wait();
+    bool ok = true;
+    for (Prefill* p = this; p != nullptr; p = p->next_)
+        if (p->impl_->next_run.valid() && !p->impl_->next_run.get() && ok) {
+            ok = false;
+            err = p->impl_->next_err;
+        }
+    return ok;
+}
+
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
@@ -988,11 +1011,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
-    // the next stage reads chunk c on a thread while this one reads chunk c + 1 (declared first: an early return
-    // waits for it before anything it reads goes away)
-    std::string next_err;
-    std::future<bool> next_run;
-    int hand_buf = 0;
+    // The next stage reads chunk c on a thread while this one reads chunk c + 1.  The first stage of the chain (the
+    // one `run` is called on from outside) waits for all of them before it returns, an early return too, before
+    // anything they read goes away; a later stage, called once per chunk by the one before it, returns as soon as it
+    // has handed its chunk on.
+    std::string& next_err = m.next_err;
+    std::future<bool>& next_run = m.next_run;
+    int& hand_buf = m.hand_buf;
+    struct PipeEnd {
+        Prefill* p;
+        ~PipeEnd() {
+            if (p != nullptr) {
+                try {
+                    std::string e;
+                    p->drain_pipe(e);
+                } catch (...) {   // (a task's exception: the caller is already leaving this call)
+                }
+            }
+        }
+    } pipe_end{hand_in_ == nullptr ? this : nullptr};
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
@@ -1902,7 +1939,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             host_chunk_ms += ms_since(toc2);
         }
     }
-    if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
+    if (hand_in_ == nullptr && !drain_pipe(err)) return false;   // the first stage waits for the whole chain
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
@@ -1944,8 +1981,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             std::snprintf(b, sizeof b, " %s %.0f (%.1f%%)", kPfNames[i], pt.ms[i], total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
             line += b;
         }
-        std::fprintf(stderr, "maya prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s\n",
-                     (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
+        // (the stage's layers and when it ran, in ms on the process clock: stages that overlap show it)
+        static const auto t_epoch = t_start;
+        std::fprintf(stderr, "maya prefill timing: layers %lld-%lld at %.0f-%.0f ms, %lld tokens, GPU timeline %.0f ms, "
+                             "wall %.0f ms, host staging %.0f ms:%s\n",
+                     (long long) LB, (long long) LE,
+                     std::chrono::duration<double, std::milli>(t_start - t_epoch).count(),
+                     std::chrono::duration<double, std::milli>(Clock::now() - t_epoch).count(), (long long) n, total,
+                     ms_since(t_start), stats_.ms_experts_host, line.c_str());
         std::fprintf(stderr, "maya prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
