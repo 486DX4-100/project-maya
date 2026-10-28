@@ -16685,7 +16685,9 @@ struct Model::Impl {
     // (wp.nrow > 0: a multi step's rows, row t at wp.rpos[t] - decoded tokens, never a picture's)
     void plan_window(int64_t p0, int T, WinPlan& wp) {
         wp.par = par;
-        wp.async = par || (!sync_decode && T <= async_max_t);
+        // (a multi step's rows always on the async path, whatever their count: its verify windows reach 16 rows,
+        //  and the host-routed path's sums for them were not its own decode's - the answers drifted from alone; DS4_ASYNC_T, now 16, covers one request's windows)
+        wp.async = par || (!sync_decode && (T <= async_max_t || wp.nrow > 0));
         wp.vl = 0;
         for (int t = 0; t < T && !imgs.empty() && wp.nrow == 0; ++t)
             if (in_image(p0 + t)) wp.vl |= 1u << t;
