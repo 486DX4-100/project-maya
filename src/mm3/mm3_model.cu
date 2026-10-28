@@ -658,6 +658,19 @@ struct Model::Impl {
         }
     }
 
+    // expert e's pieces dropped from the mapped files' pages once copied (MM3_LOAD_DROP_PAGES=0: kept - a restart then
+    // starts warm and a pack that fits in RAM loads a few seconds faster without the calls)
+    void drop_src(const Layer& l, int e) const {
+        static const bool on = [] {
+            const char* v = ::mm3::env("MM3_LOAD_DROP_PAGES");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (!on) return;
+        const Src& s = l.src[(size_t) e];
+        for (int i = 0; i < 9; ++i)
+            if (s.n[i] > 0) os::drop_mapped(s.p[i], s.n[i]);
+    }
+
     // ---- the CPU lane or a staging copy, by their measured costs (as maya-ds4's PCIe lane): a token's experts that are
     // neither in VRAM nor in a staging slot are computed on the CPU lane, or - those in the pinned pool - copied into a
     // staging slot and computed by the GPU (the copies run on the GPU's copy engine while the CPU lane computes the
@@ -1477,11 +1490,13 @@ struct Model::Impl {
                                 assemble(l, l.res_ids[s], pageable.data());
                                 failed = cudaMemcpy(l.res_base + s * l.blob, pageable.data(), l.blob,
                                                     cudaMemcpyHostToDevice) != cudaSuccess;
+                                drop_src(l, l.res_ids[s]);
                                 continue;
                             }
                             const int b = n & 1;
                             cudaEventSynchronize(ev[b]);
                             assemble(l, l.res_ids[s], pin[b]);
+                            drop_src(l, l.res_ids[s]);
                             cudaMemcpyAsync(l.res_base + s * l.blob, pin[b], l.blob, cudaMemcpyHostToDevice, dp->s);
                             cudaEventRecord(ev[b], dp->s);
                         }
@@ -1567,6 +1582,7 @@ struct Model::Impl {
                         for (size_t i; (i = next.fetch_add(1)) < todo.size();) {
                             const Layer& l = L[(size_t) todo[i].first];
                             assemble(l, todo[i].second, (uint8_t*) l.host_blob[(size_t) todo[i].second]);
+                            drop_src(l, todo[i].second);
                         }
                     });
                 for (auto& t : th) t.join();
