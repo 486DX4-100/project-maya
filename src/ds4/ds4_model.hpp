@@ -6,10 +6,13 @@
 // its own 128-token window, the compressed groups completed by its position.  The state a token leaves is the
 // 128-token window ring of every layer, the compressors' partial groups, the compressed KV and index keys of the KV
 // source layers (append-only), and the Engram n-gram history; checkpoint() / restore() keep the first two (the rest is
-// truncated by position) so a conversation can go back to the end of its last prompt.  A conversation that leaves the
+// truncated by position) so a conversation can go back to the end of its last prompt, or to a restore point a request
+// asked for (mark()).  A conversation that leaves the
 // model altogether (another chat answered in between) is a slot: slot_save / slot_load take the same state - the
 // compressed KV and index keys included, which a checkpoint leaves in place - through a file or a host buffer.
 #pragma once
+
+#include "ds4_logprobs.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -30,10 +33,18 @@ struct Options {
     // NUMA node's cores when measured faster at load; n: at most n, a thread a core
     int cpu_threads = 0;
     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
+    bool profile_readonly = false;    // (--profile-readonly) the profile is read, never written back
+    // (--profile-out) where save_profile() also writes what this run routed alone: the counts read at the load taken off
+    std::string profile_out;
     bool expert_cache = true;         // experts move between VRAM and the CPU lane as they are used
     // the CPU lane's experts read in place from the model's files, the page cache keeping what fits, instead of
     // copied into RAM: 1 on, 0 off, -1 (auto) where the RAM this process can get does not hold them
     int mmap_experts = -1;
+    // --ssd-cache (ds4_store.hpp; opt-in until measured): a GGUF's in-place CPU-lane experts kept whole in a RAM store
+    // of this many GB, read past the page cache - 0 off, < 0 auto (the free RAM less 12 GB); --ssd-policy: which expert
+    // gives way, 0 lru, 1 lfu
+    double ssd_cache_gb = 0.0;
+    int ssd_policy = 0;
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
     // prompt lookup (ds4_main's --suffix-draft): its verify windows run without the drafter too - their buffers (the
@@ -79,6 +90,16 @@ struct PicMark {
     uint64_t len = 0;
 };
 
+/// A prompt's run of chunks planned once and read in parts (Model::feed_plan / feed_part): where it starts, its tokens,
+/// the logits and checkpoint its last part takes, where each chunk ends (tokens from the run's start), and the prompt
+/// skip's cut (its first layer, -1 none; the chunk and row the cut is at) - as one call plans them
+struct FeedPlan {
+    int64_t at = -1;
+    int n = 0, logits_rows = 0, slot = -1;
+    std::vector<int> ends;
+    int skip = -1, cut_k = 0, cut_r = 0;
+};
+
 struct Stats {
     int64_t tokens = 0;
     int64_t experts = 0, cpu_experts = 0;   // routed experts run, and how many of them on the CPU lane
@@ -105,6 +126,14 @@ struct Stats {
     int64_t skip_switches = 0;        // ... the times it switched
     double skip_cold = 0.0;           // ... the cold share over its window (while skipping)
     int64_t ram_experts = 0, ram_moves = 0;   // CPU-lane experts read from the RAM tier; experts moved into it
+    // the RAM store (--ssd-cache): its slots (0: off) and how many hold an expert; the CPU lane's asks it held, read
+    // (and of them could not take: read in place), the lookahead's guesses (started, asked for later, dropped unread),
+    // experts the VRAM cache put in, experts given up, failed reads, the CPU lane's waits for its reads
+    int64_t store_slots = 0, store_held = 0;
+    int64_t store_hits = 0, store_misses = 0, store_no_slot = 0;
+    int64_t store_guesses = 0, store_guess_used = 0, store_cancelled = 0;
+    int64_t store_put = 0, store_evicted = 0, store_failed = 0;
+    double store_wait_ms = 0.0;
     double prof_ms[6] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +
     int64_t prof_tokens = 0;         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
     // lookahead (decode windows of one): the picks of layers guessed a layer before (the next layer's gate on this
@@ -117,6 +146,14 @@ struct Stats {
     // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
     int64_t draft_reached[8] = {}, draft_kept[8] = {};
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
+    // the prompt path's room (a GGUF's VRAM expert slots lent to a run's buffers): experts read back into VRAM at its
+    // hand-backs, and the time; a prompt read in parts that kept it between its parts (Model::feed_part): the experts
+    // held out of VRAM meanwhile (summed over its pauses), and the decode's picks of them (the CPU lane's, or the PCIe
+    // lane's)
+    int64_t lent_back = 0;
+    double lent_back_ms = 0.0;
+    int64_t lend_kept = 0, lend_picks = 0;
+    int64_t eg_ahead = 0;   // a prompt read in parts: Engram lookups of its next part's first chunk read ahead
 };
 
 class Model {
@@ -140,6 +177,14 @@ public:
     /// verify() alike: over the last `last_n` tokens the state has consumed (at most 4096; a verify window's row counts
     /// the drafts before it).  last_n 0 (or every penalty neutral): none, the picks exactly as without.
     void set_penalties(int last_n, float repeat, float freq, float present);
+    /// The request's log-probabilities (GEN logprobs=<k>, ds4_logprobs.hpp) for every pick after this - sample(),
+    /// sample_multi(), verify() and verify_multi() alike: logprobs() then holds a row for each token the pick returned
+    /// (verify: the accepted drafts, then the token after them), each its token's logprob and its row's top k, from the
+    /// row that token came from, after the request's penalties, at temperature 1.  k < 0: none - the picks exactly as
+    /// without, no device work.  force >= 0: the caller writes that token in place of the pick's last one (the thinking
+    /// budget's end), and that row reports it.
+    void set_logprobs(int k, int force = -1);
+    const std::vector<LogprobRow>& logprobs() const;
     /// The last feed's logit rows on the host (rows x vocab floats).
     bool logits(std::vector<float>& out);
 
@@ -166,6 +211,22 @@ public:
     /// Tokens a feed call takes at a time to use the chunked prompt path (all of a prompt: its chunks run as a
     /// pipeline; 16 without it).
     int feed_unit() const;
+    /// A prompt read in parts of whole chunks (--parallel: the other conversations decode between them).  feed_plan()
+    /// plans the next n tokens at pos() as feed() (slot < 0) or feed_mark(..., slot) would read them in one call - the
+    /// path, the chunks and the prompt skip's cut decided once, over all n - and is false where that call is not a run
+    /// of two chunks or more (feed them in one call then).  feed_part() feeds the plan's chunks [k0, k1) (`tokens`: the
+    /// run's n, from its start; pos() where chunk k0 starts), each as that one call reads it; the part with the last
+    /// chunk takes the logits and keeps the checkpoint before the last token.  The parts in order leave the state one
+    /// call leaves.  Between two parts other conversations may be bound, stepped and fed; a Stop in a part, or between
+    /// two, leaves the state past the run's start unusable, as a stopped feed does.  Where the GPUs lend the prompt
+    /// path their expert slots (a GGUF's), the room stays lent from one part to the next: between them those experts
+    /// are computed on the CPU lane, and the next part of the plan needs no new lend; anything else that needs the room
+    /// (another run of chunks, a picture) hands it back first.  feed_release(): a read in parts that ends before its
+    /// last part (a Stop or a failure between two parts) hands its room back (false: it could not - every later
+    /// request fails, as after a run whose room could not be handed back).
+    bool feed_plan(int n, int logits_rows, int slot, FeedPlan& plan);
+    bool feed_part(const FeedPlan& plan, const int* tokens, int k0, int k1, std::string& err);
+    bool feed_release(std::string& err);
     /// Called from feed() while a run of chunks goes through the layers, with the tokens done so far.
     void set_progress(std::function<void(int64_t)> f);
     /// Asked while a run of chunks goes through the layers: true (a Stop) ends it early - one GPU after the layer it is
@@ -222,6 +283,13 @@ public:
     /// Checkpoint 1 also becomes the anchor (kept until a restore goes before it): the position before the end of the
     /// first prompt of a run that continued in place, where a re-rendered history (earlier reasoning dropped) splits.
     void pin();
+    /// Keep the state at the current position as a restore point a request asked for (GEN marks= / shared=: the start
+    /// of the last user message, a point near the prompt's tail, the end of a shared start - shared: given up last),
+    /// besides the three above: restore() and a slot go back to these too.  At most marks_cap() a conversation
+    /// (MAYA_DS4_RESTORE_POINTS, 4; 0: none kept), the least recently used giving way; each check_bytes() of host RAM.
+    void mark(bool shared = false);
+    int marks_cap() const;
+    size_t check_bytes() const;
     /// The positions restore() can go back to, latest first (a slot keeps them: it can be taken back at any of them).
     std::vector<int64_t> check_positions() const;
 

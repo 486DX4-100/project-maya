@@ -183,6 +183,14 @@ if(STRATA_BUILD_TESTS)
   # maya-ds4 --serve's watchdog: it fires on a request that stopped moving, never on a long one still moving (#539)
   add_executable(ds4_watchdog_test tests/ds4_watchdog_test.cpp)
   add_test(NAME ds4_watchdog_test COMMAND ds4_watchdog_test)
+  # maya-ds4's restore points: the one a prompt goes back to, the ones a read keeps (marks= / shared=), the cases
+  add_executable(ds4_marks_test tests/ds4_marks_test.cpp)
+  target_link_libraries(ds4_marks_test PRIVATE strata_warnings)
+  add_test(NAME ds4_marks_test COMMAND ds4_marks_test)
+  # maya-ds4's log-probabilities (GEN logprobs=): the reference, the penalties, ties, the kernel's pieces, the LP line
+  add_executable(ds4_logprobs_test tests/ds4_logprobs_test.cpp)
+  target_link_libraries(ds4_logprobs_test PRIVATE strata_warnings)
+  add_test(NAME ds4_logprobs_test COMMAND ds4_logprobs_test)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
@@ -191,6 +199,34 @@ if(STRATA_BUILD_TESTS)
   add_executable(ds4_ablate_test tests/ds4_ablate_test.cpp)
   target_link_libraries(ds4_ablate_test PRIVATE strata_artifact)
   add_test(NAME ds4_ablate_test COMMAND ds4_ablate_test)
+endif()
+# maya-ds4 --serve --parallel: a prompt read in parts beside running requests - the parts, the time between them, when
+# a long read gives way (src/ds4/ds4_interleave.hpp; host code only, so a build without the suite builds it by name)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_interleave_test.cpp")
+  add_executable(ds4_interleave_test EXCLUDE_FROM_ALL tests/ds4_interleave_test.cpp)
+  target_link_libraries(ds4_interleave_test PRIVATE strata_warnings)
+  add_test(NAME ds4_interleave_test COMMAND ds4_interleave_test)
+endif()
+# maya-ds4's Engram reader: a batch read ahead (a prompt's next part's rows) waits behind the others, every read the
+# file's bytes (src/ds4/ds4_engram_io.hpp; a file in the temp folder, host code only)
+if(NOT WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_engram_reader_test.cpp")
+  add_executable(ds4_engram_reader_test EXCLUDE_FROM_ALL tests/ds4_engram_reader_test.cpp)
+  target_link_libraries(ds4_engram_reader_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME ds4_engram_reader_test COMMAND ds4_engram_reader_test)
+endif()
+# maya-ds4 --parallel, DS4_MULTI_ATTN: a multi step's window buffers side by side and the attention's launches over them
+# (src/ds4/ds4_multi_attn.hpp; host code only, so a build without the suite builds it by name)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_multi_attn_plan_test.cpp")
+  add_executable(ds4_multi_attn_plan_test EXCLUDE_FROM_ALL tests/ds4_multi_attn_plan_test.cpp)
+  target_link_libraries(ds4_multi_attn_plan_test PRIVATE strata_warnings)
+  add_test(NAME ds4_multi_attn_plan_test COMMAND ds4_multi_attn_plan_test)
+endif()
+# DeepSeek's prompt-path and memory rules (src/ds4/ds4_prompt_mem.hpp; pure functions, CPU only, so a build without
+# the suite builds it by name)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_prompt_mem_test.cpp")
+  add_executable(ds4_prompt_mem_test EXCLUDE_FROM_ALL tests/ds4_prompt_mem_test.cpp)
+  target_link_libraries(ds4_prompt_mem_test PRIVATE strata_warnings)
+  add_test(NAME ds4_prompt_mem_test COMMAND ds4_prompt_mem_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
@@ -493,8 +529,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
                               src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
-                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp)
+                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp src/ds4/ds4_packinfo.cpp)
     target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    # the commit and the release `maya-ds4 --version` and --verbose name, written at every build (cmake/build_id.cmake:
+    # git's commit, a source archive's BUILD_ID file, or -DMAYA_BUILD_ID=...; the release from VERSION)
+    set(MAYA_BUILD_ID "" CACHE STRING "maya-ds4 --version's build id (empty: git's commit, or the BUILD_ID file)")
+    add_custom_target(maya_build_id
+      COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
+              -DOUT=${CMAKE_CURRENT_BINARY_DIR}/generated/maya_build_id.h -DID=${MAYA_BUILD_ID}
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_id.cmake
+      BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/maya_build_id.h
+      VERBATIM)
+    add_dependencies(maya-ds4 maya_build_id)
+    target_include_directories(maya-ds4 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu strata_spec ${_strata_gpu_runtime_target}
                           ${_strata_gpu_blas_target})
     if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs: ds4_lt.cu)
@@ -518,6 +565,24 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(ds4_lane_bench tests/ds4_lane_bench.cpp src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq_cpu.cpp)
     target_include_directories(ds4_lane_bench PRIVATE third_party/ggml)
     target_link_libraries(ds4_lane_bench PRIVATE strata_kernels_cpu)
+    # the CPU lane's exact AVX-512 rows without VBMI (src/ds4/ds4_iq512_kern.inc: IQ2_XS, IQ3_XXS, IQ1_M) bit for bit
+    # against ggml-cpu's dot, one thread, no GPU: forced on (any CPU with AVX-512 F/BW/VL/DQ and BMI2), and this CPU's
+    # default choice; --bench times the rows
+    enable_testing()
+    add_executable(ds4_iq512_rows_test tests/ds4_iq512_rows_test.cpp src/ds4/ds4_iq_cpu.cpp)
+    target_include_directories(ds4_iq512_rows_test PRIVATE third_party/ggml)
+    target_link_libraries(ds4_iq512_rows_test PRIVATE strata_kernels_cpu)
+    add_test(NAME ds4_iq512_rows COMMAND ds4_iq512_rows_test)
+    set_tests_properties(ds4_iq512_rows PROPERTIES ENVIRONMENT DS4_IQ512=1 TIMEOUT 120)
+    add_test(NAME ds4_iq512_rows_default COMMAND ds4_iq512_rows_test)
+    set_tests_properties(ds4_iq512_rows_default PROPERTIES TIMEOUT 120)
+    # the i-quant pieces on the host (no GPU): IQ1_M's code table (ds4_iq1_codes.hpp, the persistent device kernels'
+    # decode) and IQ1_S's codes against ggml's own values bit for bit, IQ4_NL experts on the CPU lane against ggml-cpu's
+    # dot bit for bit
+    add_executable(ds4_iq_host_test tests/ds4_iq_host_test.cpp src/ds4/ds4_iq_cpu.cpp)
+    target_include_directories(ds4_iq_host_test PRIVATE third_party/ggml)
+    target_link_libraries(ds4_iq_host_test PRIVATE strata_kernels_cpu)
+    add_test(NAME ds4_iq_host_test COMMAND ds4_iq_host_test)
     # the GGUF kernels (BF16 matrices, MXFP4 experts) against a double-precision reference, and the packed KV caches
     # against the BF16 rows bit for bit (needs a GPU, no model)
     add_executable(ds4_gguf_test tests/ds4_gguf_test.cu src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu
@@ -527,6 +592,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(ds4_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
     if(STRATA_ENABLE_HIP)
       target_link_libraries(ds4_gguf_test PRIVATE strata_mmq)
+    endif()
+    # DS4_MULTI_ATTN: a multi step's attention for all its rows in one launch a step against each conversation's run
+    # alone (attn_core's launches), bit for bit on random rings and caches - decode rows, verify windows, drafter
+    # blocks (needs a GPU, no model; built by name)
+    add_executable(ds4_multi_attn_test EXCLUDE_FROM_ALL tests/ds4_multi_attn_test.cu src/ds4/ds4_kernels.cu
+                                       src/ds4/ds4_host_ar.cpp)
+    target_include_directories(ds4_multi_attn_test PRIVATE ${_strata_gpu_include_directories} include)
+    target_link_libraries(ds4_multi_attn_test PRIVATE ${_strata_gpu_runtime_target})
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_packinfo_test.cpp")
+      # maya-ds4 --pack-info on packs written for it (healthy, dead, short, a type no kernel takes, a drafter its
+      # metadata leaves out, a profile of another size): host code only, no GPU
+      enable_testing()
+      add_executable(ds4_packinfo_test tests/ds4_packinfo_test.cpp src/ds4/ds4_packinfo.cpp)
+      add_test(NAME ds4_packinfo_test COMMAND ds4_packinfo_test)
+      set_tests_properties(ds4_packinfo_test PROPERTIES TIMEOUT 60)
     endif()
   endif()
 
@@ -1027,6 +1107,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(draft_policy_test src/spec/draft_policy_test.cpp)
   target_link_libraries(draft_policy_test PRIVATE strata_spec)
   add_test(NAME draft_policy_test COMMAND draft_policy_test)
+  # the cost-aware window (maya-ds4's DS4_DRAFT_COST=1): synthetic round times and acceptance, the lookup unchanged
+  add_executable(draft_cost_test src/spec/draft_cost_test.cpp)
+  target_link_libraries(draft_cost_test PRIVATE strata_spec)
+  add_test(NAME draft_cost_test COMMAND draft_cost_test)
   # the serve loop's conversation-cache retention policy (header-only, no library to link)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
@@ -1161,7 +1245,13 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  # DeepSeek's DSpark markov head as Q8_0 blocks (DS4_MARKOV_Q8, src/ds4/ds4_markov_q8.hpp) byte for byte against
+  # ggml's quantize_row_q8_0_ref, a head group member's rows against the whole head's (no GPU)
+  add_executable(ds4_markov_q8_test tests/ds4_markov_q8_test.cpp)
+  target_include_directories(ds4_markov_q8_test PRIVATE include)
+  target_link_libraries(ds4_markov_q8_test PRIVATE ggml-base)
   if(STRATA_BUILD_TESTS)
+    add_test(NAME ds4_markov_q8_test COMMAND ds4_markov_q8_test)
     # GLM's split-base expert rows (the CPU lane on a GGUF's own gate/up/down tensors) vs the contiguous blob path
     add_executable(native_split_test src/kernels/cpu/native_split_test.cpp)
     target_link_libraries(native_split_test PRIVATE strata_kernels_cpu)
@@ -1383,6 +1473,14 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(direct_file_async_test PRIVATE Threads::Threads)
     add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
   endif()
+  # maya-ds4's RAM expert store (--ssd-cache, src/ds4/ds4_store.hpp) over files of fake experts written in the build
+  # directory (~1 MB, removed): reads, where they land, eviction, the read queue, giving RAM back, preload, the miss
+  # split's order, put - host code only, no GPU
+  add_executable(ds4_store_test tests/ds4_store_test.cpp)
+  target_include_directories(ds4_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4)
+  target_link_libraries(ds4_store_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME ds4_store_test COMMAND ds4_store_test ${CMAKE_CURRENT_BINARY_DIR})
+  set_tests_properties(ds4_store_test PROPERTIES TIMEOUT 120)
 endif()
 
 if(STRATA_BUILD_TESTS)
