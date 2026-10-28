@@ -866,6 +866,7 @@ class DsmlRewriter:
 
 MINIMAX_NS = "]<]minimax[>["
 MM_THINK, MM_THINK_END = "<mm:think>", "</mm:think>"
+THINK_AGAIN = "\x00think\x00"   # MinimaxRewriter -> OutputParser: a reasoning block opens (never in model text)
 
 
 def may_be_string(schema, defs: dict | None = None, seen: frozenset = frozenset()) -> bool:
@@ -895,8 +896,9 @@ def may_be_string(schema, defs: dict | None = None, seen: frozenset = frozenset(
 
 class MinimaxRewriter:
     """MiniMax-M3.1's output rewritten, as it streams, into what OutputParser reads (DeepSeek's path: GLM's tool-call
-    form with JSON values).  `<mm:think>` opens reasoning (the parser is already in it) and goes; `</mm:think>` is
-    </think>.  Tool calls - `NS<tool_call>` around `NS<invoke name="N">` blocks of `NS<K>V NS</K>` (NS =
+    form with JSON values).  `<mm:think>` opens reasoning: THINK_AGAIN for the parser, which drops it while it is
+    in the reasoning already and goes back into it after an answer part (MiniMax thinks again between tool calls and
+    text: that is reasoning, not answer text); `</mm:think>` is </think>.  Tool calls - `NS<tool_call>` around `NS<invoke name="N">` blocks of `NS<K>V NS</K>` (NS =
     ]<]minimax[>[), a value that holds `NS<k>` elements being an object (or, all `item`, an array) - become
     `<tool_call>N<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` with V JSON: a string parameter (the
     tool's schema admits a string: may_be_string, a nullable string or a union with one included) JSON-quoted piece
@@ -944,7 +946,7 @@ class MinimaxRewriter:
                 end = self.buf.startswith(MM_THINK_END)
                 tag = MM_THINK_END if end else MM_THINK
                 self.buf = self.buf[len(tag):]
-                out.append(self._plain(tag) if self.key is not None else ("</think>" if end else ""))
+                out.append(self._plain(tag) if self.key is not None else ("</think>" if end else THINK_AGAIN))
                 continue
             rest = self.buf[len(MINIMAX_NS):]
             if not rest:
@@ -1306,6 +1308,8 @@ class OutputParser:
         self.buf += delta
         out: list[Event] = []
         while True:
+            if self.state != "content" and THINK_AGAIN in self.buf:
+                self.buf = self.buf.replace(THINK_AGAIN, "")    # (already reasoning; in a call: not an opening)
             if self.state == "reasoning":
                 i = self.buf.find(THINK_END)
                 if i < 0:
@@ -1326,6 +1330,14 @@ class OutputParser:
                         self.buf = ""
                         return out
                     self.buf, self.lead = stripped, False
+                m = self.buf.find(THINK_AGAIN)
+                if m >= 0 and CALL_START not in self.buf[:m]:
+                    # MiniMax thinks again after an answer part: what follows is reasoning until its next </think>
+                    text = self.buf[:m].rstrip("\n")
+                    if text:
+                        out.append(Event("content", self._track(text)))
+                    self.buf, self.state = self.buf[m + len(THINK_AGAIN):], "reasoning"
+                    continue
                 i = self.buf.find(CALL_START)
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,

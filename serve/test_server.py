@@ -80,13 +80,22 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_small_limits_leave_reasoning_and_answer_room(self):
         for api in ("openai", "anthropic", "responses"):
-            for limit in (128, 512, 1024, 2048, 8192):
+            for limit in (128, 512, 1024):
                 with self.subTest(api=api, limit=limit):
                     sampling = self.call(api, limit)
                     budget = sampling["_think_budget"]
                     self.assertGreaterEqual(budget, limit // 2 - 1)
                     # The forced closing marker is an output token too.
                     self.assertLessEqual(budget + 1, limit - limit // 4)
+
+    def test_larger_limits_keep_the_configured_budget(self):
+        # a chat client's max_tokens (Open WebUI's 4096, say) is a cap on the whole output, not a reason to close
+        # the thinking early: only a tiny limit (THINK_TINY_LIMIT or fewer tokens) lowers the budget
+        from serve.server import THINK_TINY_LIMIT
+        for api in ("openai", "anthropic", "responses"):
+            for limit in (THINK_TINY_LIMIT + 1, 2048, 4096, 8192):
+                with self.subTest(api=api, limit=limit):
+                    self.assertEqual(self.call(api, limit)["_think_budget"], 32768)
 
     def test_configured_budget_and_thinking_off(self):
         old = self.svc.think_budget

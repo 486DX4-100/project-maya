@@ -7,16 +7,21 @@ DeepSeek, MiniMax) gets it alike, in the thinking and in the answer.
                    tokens repeated back to back REPS_LONG times (REPS_SHORT for a block under SHORT_BELOW tokens),
                    MIN_SPAN tokens at least?  Each token is compared only with the earlier places of the same id
                    (within P_MAX), so a token costs microseconds.
-    LoopGuard      one request's guard: the detector, the tail the stream holds back (the copies a loop's repeats
-                   would be are never sent before it is clear they are not one), and what each loop does:
-                     1st              the repeats are dropped (the first copy stays) and the engine goes on from
-                                      there with a short repetition penalty (LOOP_PENALTY over the last 2 x period
-                                      tokens, at least PENALTY_MIN_N, for the next 2 x period + PENALTY_EXTRA)
-                     2nd, thinking    the thinking is closed with the model's own end-of-thinking token: it answers
-                     2nd in the answer, or a 3rd    the answer ends there (finish "stop")
+    LoopGuard      one request's guard: the detector, the short tail the stream holds back (at most HOLD_MAX
+                   tokens: a block the model copies from earlier in its output streams on as it is written, never
+                   held whole), and what each loop does:
+                     penalty          the repeats not sent yet are dropped (what was sent stays) and the engine goes
+                                      on from there with a short repetition penalty (LOOP_PENALTY over the last
+                                      2 x period tokens, at least PENALTY_MIN_N, for the next 2 x period +
+                                      PENALTY_EXTRA): the 1st loop in the answer, the 1st and 2nd in the thinking
+                     close thinking   the 3rd loop in the thinking: closed with the model's own end-of-thinking token,
+                                      it answers (never a silent end while it thinks)
+                     stop             the 2nd loop in the answer, or a 4th in all: the answer ends (finish "stop")
+                   A loop in the thinking needs more copies (REPS_*_THINK, MIN_SPAN_THINK): reasoning that drafts a
+                   plan again is not one.
 
 Until a loop is seen nothing changes: the engine gets the same calls with the same sampling and writes the same
-tokens (the stream only holds back the tail that repeats while it does).  Legit repetition - a table's rows, an array
+tokens (the stream only holds back up to HOLD_MAX tokens of a tail that repeats while it does).  Legit repetition - a table's rows, an array
 literal, a function name over and over, code lines alike - is not an exact block repeated back to back three times
 or more, which is what a loop is.
 
@@ -35,6 +40,13 @@ SHORT_BELOW = 32        # blocks under this many tokens must repeat REPS_SHORT t
 REPS_SHORT = 4
 REPS_LONG = 3
 MIN_SPAN = 96           # ... and the copies together cover this many tokens at least
+REPS_SHORT_THINK = 5    # in the thinking: more copies (a model re-drafting its plan is not looping)
+REPS_LONG_THINK = 4
+MIN_SPAN_THINK = 192
+HOLD_MAX = 64           # the most the stream holds back (~1-3 s): a copied block streams on; past this tail, a
+                        # loop's repeats are already on screen and only the ones not sent yet are dropped
+THINK_PENALTIES = 2     # loops in the thinking broken by the penalty before the guard closes the thinking
+STOP_AFTER = 4          # loops in all after which the answer ends (in the answer; the thinking is closed first)
 LOOP_PENALTY = 1.15     # the temporary repetition penalty after the first loop
 PENALTY_MIN_N = 128     # its window (penalty_last_n): 2 x the period, at least this
 PENALTY_EXTRA = 128     # it applies to the next 2 x period + this many tokens, then the request's own sampling again
@@ -76,23 +88,30 @@ class LoopDetector:
     `hold` is the longest run now: the tokens that could still turn out to be a loop's repeats."""
 
     def __init__(self, p_min: int = P_MIN, p_max: int = P_MAX, min_span: int = MIN_SPAN,
-                 reps_short: int = REPS_SHORT, reps_long: int = REPS_LONG, short_below: int = SHORT_BELOW):
+                 reps_short: int = REPS_SHORT, reps_long: int = REPS_LONG, short_below: int = SHORT_BELOW,
+                 reps_short_think: int = REPS_SHORT_THINK, reps_long_think: int = REPS_LONG_THINK,
+                 min_span_think: int = MIN_SPAN_THINK):
         self.p_min, self.p_max = p_min, p_max
-        self.need = [0] * (p_max + 1)
+        self.need = [0] * (p_max + 1)           # the run a period needs in the answer ...
+        self.need_think = [0] * (p_max + 1)     # ... and in the thinking (more copies)
         for p in range(p_min, p_max + 1):
             reps = reps_short if p < short_below else reps_long
             self.need[p] = max((reps - 1) * p, min_span - p)
+            reps = reps_short_think if p < short_below else reps_long_think
+            self.need_think[p] = max((reps - 1) * p, min_span_think - p)
         self.reset()
 
     def reset(self, tokens=()) -> None:
         """Start again over `tokens` (what is kept after a loop's repeats were dropped): only their last 3 x P_MAX
-        count - a run reaches at most 2 x P_MAX before it is a loop."""
+        count - a run reaches at most 2 x P_MAX before it is a loop.  The runs start from zero: what is kept may end
+        in copies that were already sent, and a new loop needs copies of its own."""
         self.n, self.seen, self.runs, self.hold = 0, {}, {}, 0
         tokens = list(tokens)[-3 * self.p_max:]
         for t in tokens:
             self.push(t)                        # (a prefix of what was checked token by token: no loop in it)
+        self.runs, self.hold = {}, 0
 
-    def push(self, t: int) -> Loop | None:
+    def push(self, t: int, thinking: bool = False) -> Loop | None:
         i = self.n
         self.n = i + 1
         q = self.seen.get(t)
@@ -105,7 +124,7 @@ class LoopDetector:
                 k += 1
             if k:
                 del q[:k]
-            old, need, p_min = self.runs, self.need, self.p_min
+            old, need, p_min = self.runs, self.need_think if thinking else self.need, self.p_min
             for j in q:                         # (oldest first: the periods from the longest down)
                 p = i - j
                 if p < p_min:
@@ -127,8 +146,9 @@ def penalty_window(period: int) -> int:
 
 class LoopGuard:
     """One request's loop guard (server.Service._sliced runs it): push() every id the engine writes, send only what
-    lies before the last `hold` of them, and do what an Action says: drop its repeats, close the thinking (append
-    `think_end`), or end; then resume() with what is kept and sampling() for each engine call after it."""
+    lies before the last `hold` of them (at most HOLD_MAX), and do what an Action says: drop its repeats not sent
+    yet, close the thinking (append `think_end`), or end; then resume() with what is kept and sampling() for each
+    engine call after it."""
 
     def __init__(self, think_end: int | None = None, in_think: bool = False, detector: LoopDetector | None = None):
         self.det = detector or LoopDetector()
@@ -141,22 +161,22 @@ class LoopGuard:
 
     @property
     def hold(self) -> int:
-        return self.det.hold
+        """The tail held back now: what could still be a loop's repeats, never more than HOLD_MAX tokens (a whole
+        copied block held until it ends was a long silence, then a burst)."""
+        return min(self.det.hold, HOLD_MAX)
 
     def push(self, t: int, written: int | None = None) -> Action | None:
         if self.in_think and t == self.think_end:
             self.in_think = False
-        loop = self.det.push(t)
+        loop = self.det.push(t, self.in_think)
         if loop is None:
             return None
         where = "thinking" if self.in_think else "answer"
         self.hits[where] += 1
-        if sum(self.hits.values()) >= 3:
-            kind = STOP
-        elif where == "thinking":
-            kind = PENALTY if self.hits[where] == 1 else CLOSE_THINKING
+        if where == "thinking":                 # (never STOP while it thinks: that ends with no answer at all)
+            kind = PENALTY if self.hits[where] <= THINK_PENALTIES else CLOSE_THINKING
         else:
-            kind = PENALTY if self.hits[where] == 1 else STOP
+            kind = PENALTY if self.hits[where] == 1 and sum(self.hits.values()) < STOP_AFTER else STOP
         act = Action(kind, loop.period, loop.copies, loop.repeats, where, written if written is not None else 0)
         self.events.append(act)
         return act

@@ -172,7 +172,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_ROUTE_LOG` | off | `<prefix>`: every decode route as a line in `<prefix>.<GPU>` - the layer, its experts, which were fetched, missed or computed on the CPU, then after a `\|` the 16 near misses (the next ranks by the same score) - for cache studies: `tools/glm_tier_replay.py` replays a log through a model of the VRAM tier's rules and alternatives |
 | `MAYA_GLM_SCORE_PREFILL` | off | with `MAYA_GLM_SCORE=<c>` (score `--tokens` after the first c): `1` reads those c tokens through the prompt path instead of one by one, so a long context is scored in minutes (debug: comparing KV-cache formats at long context) |
 | `MAYA_GLM_MULTI_BENCH` | off | `<n>,<prompt>,<tokens>` (with `MAYA_GLM_SEQS` >= n, `--glm-pack`, no `--serve`): n prompts, then that many greedy tokens each - sequence 0 alone through the token path, then all n through the pipelined decode; positive `MAYA_GLM_SPLIT_ROWS` groups up to k sequences per part and reports `split-rows`; prints both rates and how many of sequence 0's tokens agree (all of them with `MAYA_GLM_CPU_LANE=0`). `MAYA_GLM_MULTI_DUMP=<file>` also writes every sequence's tokens there, a line each (then the lone run's), to compare two builds or settings token for token |
-| `MAYA_GLM_THINK_RESERVE` | 1024 | the server: preferred token reserve for the final answer, raised to a quarter of the request's `max_tokens` when larger; the preferred floor is capped at half of a small output limit so reasoning still has room. The forced `</think>` token also counts toward the output limit. The config's `"thinking_budget"` is lowered per request to fit; the reserve can also be supplied as `STRATA_GLM_THINK_RESERVE` in the run config's `env` |
+| `MAYA_GLM_THINK_RESERVE` | 1024 | the server: the token reserve for the final answer when a request's output limit is tiny. The config's `"thinking_budget"` (32768) is lowered by a request's `max_tokens` (or the context left) only when that limit is 1024 tokens or fewer (a side request such as a title): then a quarter is kept for the answer, with this preferred floor, capped at half the limit so reasoning still has room; the forced `</think>` token also counts toward the limit. A larger `max_tokens` is the cap on the whole output and leaves the thinking budget as it is (a chat client's 4096 no longer closes the thinking at ~3K tokens; a thinking that reaches the limit ends with `finish_reason` "length"); the reserve can also be supplied as `STRATA_GLM_THINK_RESERVE` in the run config's `env` |
 | `MAYA_ENGINE_STALL_S` | 90 | the server: an engine silent this long that also used no CPU, disk or GPU in that time is stuck - it is ended, the request gets an error and the next request starts it again (a silent engine that is working is never ended); `0` = off |
 | `MAYA_WATCHDOG_S` | 180 | the engine: a request that finishes no prompt layer and no token for this long has hung, even with a thread spinning (#40). The engine writes where it stopped to its log (on Windows also `maya-stall-<pid>.dmp`, every thread's stack: attach both to an issue) and ends; the request gets an error and the next request starts it again. `0` = off |
 | `MAYA_DS4_WATCHDOG_S` | 600 | DeepSeek's engine (`maya-ds4 --serve`): a request whose prompt, tokens and steps between stop moving for this long has hung (#539, #494: a tensor-parallel group with one GPU spinning and the other idle). The engine writes where the main thread and each GPU's thread of a prompt were (`maya ds4 serve: where it stopped: ...`) and ends; the request gets an error and the next one starts it again. `0` = off |
@@ -332,17 +332,22 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
 `MAYA_GLM_LOOP_ANSWER`).
 
 - **What counts as a loop:** the end of what was written is one block of 8-2048 tokens repeated exactly, back to back
-  (4 times for a block under 32 tokens, 3 times for a longer one), over 96 tokens at least. A table's rows, an array,
-  a name used over and over or code lines alike are not exact copies of one block back to back, so they go on
-  untouched. The check costs a few microseconds a token.
-- **The first loop:** the repeats are dropped (the first copy stays) and the model goes on from there with a mild
-  repetition penalty (1.15 over the last 2 x the block's length, at least 128 tokens) for the next 2 x the block's
-  length + 128 tokens; then the request's own sampling again.
-- **A second loop in the thinking:** the repeats are dropped, the thinking is closed (the model's own end-of-thinking
-  token) and it answers, with the same short penalty at first.
-- **A second loop in the answer, or a third in all:** the answer ends there (`finish_reason` "stop").
-- **Streaming:** tokens that repeat what came just before them are held back while they do (two blocks at most), so
-  a client never receives repeats that are dropped; when the text moves on, they follow at once.
+  (4 times for a block under 32 tokens, 3 times for a longer one), over 96 tokens at least. In the thinking it takes
+  more: 5 and 4 times, over 192 tokens at least (reasoning that drafts a plan again is not a loop). A table's rows,
+  an array, a name used over and over or code lines alike are not exact copies of one block back to back, so they go
+  on untouched. The check costs a few microseconds a token.
+- **The first loop** (the first and second in the thinking): the repeats not sent yet are dropped and the model goes
+  on from there with a mild repetition penalty (1.15 over the last 2 x the block's length, at least 128 tokens) for
+  the next 2 x the block's length + 128 tokens; then the request's own sampling again.
+- **A third loop in the thinking:** the thinking is closed (the model's own end-of-thinking token) and it answers,
+  with the same short penalty at first. The thinking is never ended any other way: the answer always follows.
+- **A second loop in the answer, or a fourth in all:** the answer ends there (`finish_reason` "stop"). When no answer
+  text was written yet (a model without an end-of-thinking token, looping while it reasons), the answer says so in
+  one line instead of ending empty.
+- **Streaming:** the stream is at most 64 tokens behind the model. Tokens that repeat what came before them are held
+  back only for that short tail; a block the model copies from earlier in its output (a draft written again, a
+  restated plan) streams on as it is written. What was sent stays; a loop's repeats past the tail are cut from what
+  follows.
 - **Nothing changes without a loop:** the same engine calls with the same sampling, the same tokens.
 
 The server window gets a line for each loop broken (`[maya] loop guard: a 19-token block 5 times in the answer at
