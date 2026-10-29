@@ -440,7 +440,15 @@ inline void row_dot_iq1m(const uint8_t* row, int nblocks, const block_q8_K* cons
         }
     }
     // This TU disables contraction; explicit fusion preserves ggml's rounding for subnormal accumulators too.
-    for (int t = 0; t < NT; ++t) res[t] = std::fma(IQ1M_DELTA, hsum_ggml(deltaf[t]), hsum_ggml(accf[t]));
+    for (int t = 0; t < NT; ++t) {
+#if defined(_MSC_VER)
+        // ggml-cpu's MSVC build rounds the delta product and the final add separately.
+        const float delta = IQ1M_DELTA * hsum_ggml(deltaf[t]);
+        res[t] = hsum_ggml(accf[t]) + delta;
+#else
+        res[t] = std::fma(IQ1M_DELTA, hsum_ggml(deltaf[t]), hsum_ggml(accf[t]));
+#endif
+    }
 }
 
 template <int TY, int NT>

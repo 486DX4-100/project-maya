@@ -1228,7 +1228,8 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_CPU_X86 AND MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
-    set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    # Match the non-MSVC no-contraction mode: IQ1_M's subnormal-scale parity checks need it too.
+    set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
     set_source_files_properties(src/kernels/cpu/iq_avx512_one.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   elseif(STRATA_CPU_X86)
     # (no VNNI / VBMI needed - cpu_avx512bw_ok() is enough to run them; no FP contraction: their sums must take
@@ -1469,6 +1470,12 @@ if(STRATA_BUILD_TESTS)
   if(STRATA_CPU_X86)
     add_executable(exl3_cpu_bench src/kernels/cpu/exl3_cpu_bench.cpp)
     target_link_libraries(exl3_cpu_bench PRIVATE strata_kernels_cpu)
+  endif()
+
+  if(WIN32)
+    add_executable(ds4_copy_cache_windows_test tests/ds4_copy_cache_windows_test.cpp)
+    target_include_directories(ds4_copy_cache_windows_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME ds4_copy_cache_windows_test COMMAND ds4_copy_cache_windows_test)
   endif()
 
   if(UNIX AND NOT APPLE)

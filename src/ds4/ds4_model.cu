@@ -1605,6 +1605,31 @@ struct Model::Impl {
     std::mutex pf_mu;
     std::condition_variable pf_cv;
     std::vector<std::pair<const void*, size_t>> pf_q;
+    // Windows only: the in-place experts' pages this process's own reads bring into its working set (the CPU lane's
+    // computes, the lookahead's prefetches) are counted in use until trimmed, unlike Linux where the same pages sit in
+    // the page cache and count as available - a long decode on a warm-capped pack drains every free GiB that way
+    // (measured: +18.6 GB of working set over one 32k prompt and a 2k decode, private bytes flat).  The trimmer thread
+    // demotes the oldest noted ranges to the standby list (os::unlock_range): a clean file page stays resident and
+    // soft-faults back unchanged, it only counts as available again.  MAYA_DS4_INPLACE_TRIM_GB is the working-set room
+    // the in-place pages may hold above the load's own (default 6 on Windows; 0 disables); TRIM_MS the pass interval.
+    const float ip_trim_gb = [] {
+#if defined(_WIN32)
+        const char* v = std::getenv("MAYA_DS4_INPLACE_TRIM_GB");
+        return v != nullptr ? (float) std::atof(v) : 6.0f;
+#else
+        return 0.0f;
+#endif
+    }();
+    const int ip_trim_ms = [] {
+        const char* v = std::getenv("MAYA_DS4_INPLACE_TRIM_MS");
+        return v != nullptr ? std::max(50, std::atoi(v)) : 250;
+    }();
+    std::atomic<bool> ip_on{false};
+    uint64_t ip_base_ws = 0, ip_unlocked = 0;
+    std::deque<std::pair<const void*, size_t>> ip_ring;
+    std::unordered_map<const void*, uint32_t> ip_live;   // range -> notes of it in the ring (0/newer note: hot)
+    std::mutex ip_mu;
+    std::thread ip_th;
     // the expert cache: swaps prepared on threads of their own (DS4_CACHE_THREADS: 1 on one GPU - 4 measured no
     // faster on one V100 - and 4 on several, a group's members' copies each: each its staging buffers and copy
     // streams), switched between windows
@@ -2188,6 +2213,7 @@ struct Model::Impl {
         }
         pf_cv.notify_all();
         if (pf_th.joinable()) pf_th.join();
+        if (ip_th.joinable()) ip_th.join();   // (the in-place trimmer: its own quit check is the loop's sleep)
         {
             std::lock_guard<std::mutex> lk(sw_mu);
         }
@@ -4335,6 +4361,16 @@ struct Model::Impl {
                 serve_lane();
             });
             if (ahead_mode > 0) pf_th = std::thread([this] { prefetch_loop(); });
+#if defined(_WIN32)
+            if (file_experts && ip_trim_gb > 0) {   // (the in-place pages' working-set trimmer - see its note by ip_ring)
+                ip_base_ws = os::working_set_bytes();
+                ip_on.store(true, std::memory_order_relaxed);
+                ip_th = std::thread([this] { ip_loop(); });
+                std::fprintf(stderr,
+                             "ds4: in-place experts: working-set trim on (ceiling %.1f GB over the load's %.1f, every %d ms)\n",
+                             (double) ip_trim_gb, (double) ip_base_ws / 1073741824.0, ip_trim_ms);
+            }
+#endif
         }
         if (par && (!std::getenv("DS4_COPY_IDLE") || std::atoi(std::getenv("DS4_COPY_IDLE")) != 0)) {
             idle_ev.assign(devs.size(), nullptr);
@@ -7424,6 +7460,7 @@ struct Model::Impl {
                         for (int r = 0; r < 3; ++r) {
                             const uint64_t nb = (uint64_t) (mx_n(r) / NH) * mx_row_b(l, r) * NH;
                             hinted += os::release_copied_cache(pk.fds[(size_t) l.mx_file[r]],
+                                                              pk.maps[(size_t) l.mx_file[r]].first,
                                                               l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r], nb);
                         }
                         cache_hint_bytes.fetch_add(hinted, std::memory_order_relaxed);
@@ -7443,9 +7480,15 @@ struct Model::Impl {
         if (direct_copy)
             std::fprintf(stderr, "ds4: expert copy I/O: %.3f GB direct, %.3f GB buffered fallback\n",
                          (double) direct_copy_bytes.load() / 1e9, (double) buffered_fallback_bytes.load() / 1e9);
-        if (drop_copy_cache || drop_cache)
+        if (drop_copy_cache || drop_cache) {
+#if defined(_WIN32)
+            std::fprintf(stderr, "ds4: copied expert cache: VirtualUnlock trimmed %.3f GB of whole source pages from the process working set (file-backed re-fault remains possible)\n",
+                         (double) cache_hint_bytes.load() / 1e9);
+#else
             std::fprintf(stderr, "ds4: copied expert cache: DONTNEED hints accepted for %.3f GB of whole source pages (eviction is advisory)\n",
                          (double) cache_hint_bytes.load() / 1e9);
+#endif
+        }
         copy_mode = true;
         ram_held = (int) jobs.size();
         zc_pin();
@@ -10989,6 +11032,7 @@ struct Model::Impl {
                         continue;
                     }
                     for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
+                    ip_note_expert(n, e);   // (the Windows trimmer: prefetched pages enter this process's working set)
                 }
         }
         if (pf_want.empty()) return;
@@ -10997,6 +11041,60 @@ struct Model::Impl {
             pf_q.insert(pf_q.end(), pf_want.begin(), pf_want.end());
         }
         pf_cv.notify_one();
+    }
+
+    // (the in-place trimmer, above) a range of a file's mapping this process is about to read or has just read: noted
+    // for the trimmer, oldest first.  Cheap (a deque push and a count under a light mutex) and skipped entirely when it
+    // is off.  Each use notes again, so a range's count reaching zero at the oldest end - the only place the trimmer
+    // demotes - means no use since that note: only genuinely cold pages ever leave the working set (a hot expert's
+    // stale older notes decrement a count that a newer use raised, and demote nothing).
+    void ip_note(const void* p, size_t n) {
+        if (!ip_on.load(std::memory_order_relaxed) || p == nullptr || n == 0) return;
+        std::lock_guard<std::mutex> lk(ip_mu);
+        if (ip_ring.size() >= 131072) ip_drop();
+        ++ip_live[p];
+        ip_ring.push_back({p, n});
+    }
+    // expert e of layer l the CPU lane reads in place (neither VRAM nor the RAM tier holds it): its matrices noted
+    void ip_note_expert(const Layer& l, int e) {
+        if (!ip_on.load(std::memory_order_relaxed) || !file_read(l, e)) return;
+        if (l.lay.fmt == gg::kFmtMXFP4)
+            for (int r = 0; r < 3; ++r) ip_note(mx_mat(l, e, r), mx_part_bytes(l, r));
+        else if ((size_t) e < l.region_file.size())
+            ip_note(pk.at(l.region_file[(size_t) e], l.region_off[(size_t) e]), l.region_bytes[(size_t) e]);
+    }
+    // (the ring's oldest note, dropped without demotion: its count kept true)
+    void ip_drop() {
+        const auto& f = ip_ring.front();
+        const auto it = ip_live.find(f.first);
+        if (it != ip_live.end() && --it->second == 0) ip_live.erase(it);
+        ip_ring.pop_front();
+    }
+    void ip_loop() {
+        const uint64_t ceiling = ip_base_ws + (uint64_t) ((double) ip_trim_gb * 1073741824.0);
+        while (!quit.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ip_trim_ms));
+            if (quit.load(std::memory_order_relaxed)) return;
+            uint64_t ws = os::working_set_bytes();
+            for (int pass = 0; ws > ceiling && pass < 8; ++pass) {
+                std::vector<std::pair<const void*, size_t>> take;
+                {
+                    std::lock_guard<std::mutex> lk(ip_mu);
+                    for (size_t i = 0; i < 256; ++i) {
+                        if (ip_ring.empty()) break;
+                        const auto f = ip_ring.front();
+                        const auto it = ip_live.find(f.first);
+                        const bool cold = it == ip_live.end() || it->second <= 1;   // (a newer note: still hot)
+                        if (it != ip_live.end() && --it->second == 0) ip_live.erase(it);
+                        ip_ring.pop_front();
+                        if (cold) take.push_back(f);
+                    }
+                }
+                if (take.empty()) break;   // (everything noted is still in use: the growth is elsewhere)
+                for (const auto& r : take) ip_unlocked += os::unlock_range(r.first, r.second);
+                ws = os::working_set_bytes();
+            }
+        }
     }
 
     // DS4_TP_CHECK: the largest difference allowed against the whole, a fraction of the largest output; how long a
@@ -13928,8 +14026,10 @@ struct Model::Impl {
                     se[i] = ex[ns++] = picks[(size_t) j].first;
                     lt.mask |= 1u << i;
                     dst[i] = land_dst(l, se[i], i, seq, ids, 1);
-                } else
+                } else {
+                    ip_note_expert(l, picks[(size_t) j].first);   // (the CPU lane computes it in place: note its pages)
                     keep.push_back(picks[(size_t) j]);
+                }
             }
             picks.swap(keep);
         }
@@ -14042,8 +14142,10 @@ struct Model::Impl {
                 while (q < ns && ex[(size_t) q].second != pk_.first) ++q;
                 if (q < ns) {
                     if (pk_.second < pcie::kPullEnt) went[pk_.second] = (signed char) q;
-                } else
+                } else {
+                    ip_note_expert(l, pk_.first);   // (the CPU lane computes it in place: note its pages)
                     keep.push_back(pk_);
+                }
             }
             picks.swap(keep);
             for (int q = 0; q < ns; ++q) {

@@ -1216,6 +1216,8 @@ by default.
 | `MAYA_DS4_LOAD_DROP_CACHE` | on | drop each region's pages from the file cache once its bytes are copied; `0` keeps them |
 | `MAYA_DS4_LOAD_THREADS` | 12 | the threads that read the experts' regions (an EXL3 or other region pack; a GGUF pack's copies keep their own count): more threads load faster on a machine with the cores |
 | `MAYA_DS4_LOAD_INTERLEAVE` | off | `1`: the files round-robin - the first expert of each file, then the second, ... - so the threads read several files at once (a pack split over two drives streams both); `0`: file by file, as before |
+| `MAYA_DS4_INPLACE_TRIM_GB` | 6 on Windows, 0 elsewhere | the in-place experts' pages the working set may hold above the load's own: over it a trimmer demotes the oldest noted ranges to the standby list (`VirtualUnlock`), where they count as available and soft-fault back unchanged; `0` disables the trimmer |
+| `MAYA_DS4_INPLACE_TRIM_MS` | 250 | the trimmer's pass interval, in milliseconds (minimum 50) |
 
 ### The pages are dropped as the bytes are copied
 
@@ -1231,6 +1233,17 @@ The drop is not free: walking 203 GB of pages costs about 20 us a MB, 4 s in all
 leaves the cache room, the reclaim that the drop saves costs less than that. It is on by default because the pack
 that does not fit pays minutes, not seconds, and `MAYA_DS4_LOAD_DROP_CACHE=0` is the better setting where the drop
 costs more than it saves.
+
+### Windows: the in-place experts and the working set
+
+On Linux the in-place experts' pages live in the page cache, which counts as available memory: a decode that reads
+them grows nothing that matters. On Windows the same pages, faulted by the CPU lane's computes and the lookahead's
+prefetches, sit in *this process's working set* and count as in use until trimmed - a 32k prompt plus a 2k decode on
+a warm-capped pack added 18.6 GB that way (private bytes flat, so no allocation leak: mapped file pages). The
+`MAYA_DS4_INPLACE_TRIM_GB` trimmer notes each in-place range the lanes touch and, past the ceiling, demotes the
+oldest of them with `VirtualUnlock`: a clean file page moves to the standby list, where it counts as available and
+soft-faults back unchanged, so this costs neither I/O nor the bytes. `os::advise(!need)`'s Windows branch demotes
+through the view `map_ro` registered for the fd, which makes the promotion- and swap-time releases real there too.
 
 Measured cold (the container stopped, `echo 3 > /proc/sys/vm/drop_caches`, then started; the engine's own
 `ds4: loaded in` line):
@@ -1262,14 +1275,14 @@ no stalls. That is the machine's setting, not the engine's - a `tmpfiles.d` line
 
 ### DeepSeek expert-copy I/O
 
-These Linux options apply only to GGUF CPU experts selected for copying into anonymous RAM
+These options apply only to GGUF CPU experts selected for copying into anonymous RAM
 (`--mmap-experts off` or an explicit copy budget). They do not change routing, tensor bytes, Engram reads,
 CPU/GPU placement, or inference arithmetic. Both default to `0`; the normal buffered read path remains the default. The release of the source pages runs by
-default anyway through `MAYA_DS4_LOAD_DROP_CACHE` (above), with this boundary-page rule.
+default anyway through `MAYA_DS4_LOAD_DROP_CACHE` (above), with this boundary-page rule. `DS4_COPY_DIRECT` is Linux-only.
 
 | Environment variable | Default | Effect |
 |---|---|---|
-| `DS4_COPY_DROP_CACHE` | `0` (the release is on through `MAYA_DS4_LOAD_DROP_CACHE`) | `1`: after all three matrices and both NUMA parts of an expert have copied successfully, advise the filesystem to release whole source pages with `POSIX_FADV_DONTNEED`. Partial boundary pages are retained. Eviction is advisory, and mapped, locked or busy pages can remain cached. |
+| `DS4_COPY_DROP_CACHE` | `0` (the release is on through `MAYA_DS4_LOAD_DROP_CACHE`) | `1`: after all three matrices and both NUMA parts of an expert have copied successfully, release whole source pages. Linux uses `POSIX_FADV_DONTNEED`; Windows uses `VirtualUnlock` to remove them from this process's working set while preserving their file-backed contents for a later fault. Partial boundary pages are retained. Global eviction remains advisory, and pages shared with another process can remain cached. |
 | `DS4_COPY_DIRECT` | `0` | `1`: copy expert data through the existing Linux direct-I/O descriptor and a reusable per-worker 4 KiB-aligned staging buffer. The exact bytes are then copied to the NUMA destination. Unsupported or failed direct reads fall back to buffered reads; startup reports direct and fallback byte counts. |
 
 Put the variables in a model config's `env`, for example:
@@ -1281,8 +1294,9 @@ Put the variables in a model config's `env`, for example:
 For direct reads instead, use `DS4_COPY_DROP_CACHE=0`, `DS4_COPY_DIRECT=1`. They can also be combined so that
 buffered fallbacks receive release hints. A hint may affect another process reading the same expert file, so use
 it when startup cache pressure matters more than retaining that file's cache. Other tensor ranges are not explicitly
-advised; OS eviction remains advisory and is page/folio-granular. Windows ignores both controls. Direct reads are not
-necessarily faster than buffered reads with source-page release.
+advised; OS eviction remains advisory and is page/folio-granular. Windows ignores `DS4_COPY_DIRECT`, but honors the
+source-page release through `VirtualUnlock`. Direct reads are not necessarily faster than buffered reads with
+source-page release.
 
 The controls do not clear global caches, compact memory, change ZFS limits, lock CPU expert RAM, or guarantee zero
 swap. They also do not eliminate page cache created by other startup readers. Check the existing Engram residency
