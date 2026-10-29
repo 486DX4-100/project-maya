@@ -1426,6 +1426,25 @@ the first read of the chat 16.7 -> 17.7 s.
 | `MAYA_DS4_RESTORE_TAIL` | 512 | how many tokens before the prompt's end the tail point sits; `0`: no tail point |
 | `MAYA_DS4_RESTORE_TAIL_AUTO` | 1 | the engine leaves the tail point out where it measured its cost higher than reading its tokens again (above); `0`: kept on every read, as before |
 
+### New conversations behind the same system prompt and tools
+
+The point at the end of the system prompt and its tools also serves conversations that start later: when a prompt read
+from token 0 reaches it, the engine keeps a copy of the state there apart from the conversation (its compressed KV,
+rings and partial groups, in RAM). A new conversation that starts with the same system prompt and tools - after an
+unrelated chat, in another `--parallel` conversation, with or without `MAYA_DS4_SLOT_KEEP` - takes it back and reads
+only its own part. It is the state a read of the same prompt from token 0 keeps at that point (that read also stops
+there), so the rest is read from the same state a cold read reaches. The state is small (V4.1's compressed KV: about
+20 MB for an 11K-token system prompt with 12 tools). Agent clients that open a new conversation for every task or
+sub-agent gain the most: on one V100, a new conversation behind an 11.3K-token system prompt and tools had its first
+token about 19x sooner after an unrelated conversation, and about 25x sooner with `--parallel 2` while another
+conversation was answering.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_PREFIX_KEEP` | 2 | how many system-prompt starts are kept, the least recently used giving way; `0`: none |
+| `MAYA_DS4_PREFIX_GB` | 2 | their RAM at most (a start bigger than this is not kept) |
+| `MAYA_DS4_PREFIX_MIN` | 1024 | the shortest start kept, in tokens |
+
 ## DeepSeek: tensor parallel groups of 3 with a GGUF pack (experimental)
 
 A GGUF pack's tensor parallel width must divide the attention heads (64) and the output groups (8), so `--tp 3`
