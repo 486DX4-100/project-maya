@@ -229,6 +229,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hipblaslt_table_list_test.cpp")
   target_link_libraries(hipblaslt_table_list_test PRIVATE strata_warnings)
   add_test(NAME hipblaslt_table_list_test COMMAND hipblaslt_table_list_test)
 endif()
+# the engine's start-up line of the GLM settings set in the environment (include/strata/platform/env_report.hpp; host
+# code only, so a build without the suite builds it by name)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/env_report_test.cpp")
+  add_executable(env_report_test EXCLUDE_FROM_ALL tests/env_report_test.cpp)
+  target_include_directories(env_report_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_link_libraries(env_report_test PRIVATE strata_warnings)
+  add_test(NAME env_report_test COMMAND env_report_test)
+endif()
 
 # ---- strata_plan ----------------------------------------------------------
 # Also header-only.  A "planner" that hides state would be one whose decision is not inspectable, and the
