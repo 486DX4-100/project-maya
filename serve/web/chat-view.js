@@ -1,6 +1,6 @@
 // serve/web/chat-view.js - the chat: its header (the model menu, the context meter, the chat's ⋯ menu), the messages
 // (an answer is painted in place while it streams), the message box with its thinking speedometer, and a new chat's
-// greeting with ideas to start from.
+// greeting: the model that answers it and ideas to start from.
 import {Component, html, useEffect, useLayoutEffect, useRef, useState} from "./preact.js";
 import {SPRITE, coarse, ctxfmt, esc, fmt, isPhone, modelName, timeStr, tokfmt} from "./lib.js";
 import {LEVELS, P, PRESET_NAMES, S, copyText, emit, presetOf, savePrefs, thinkTitles} from "./state.js";
@@ -8,7 +8,7 @@ import {mcpOn} from "./server.js";
 import {addFiles, cancelEdit, chatView, ctxMeter, editMessage, focusInput, newChat, painters, regenerate,
         removeAttachment, scrollDown, send, setThinking, stopAnswer, thinkingOf, updateCtxMeter} from "./chats.js";
 import {markdown, onCodeClick, patchHtml, streamingMarkdown} from "./md.js";
-import {ChatMenuItems, openSettings, setSide, showView} from "./sidebar.js";
+import {ChatMenuItems, openSettings, setSide, showView, status, usd} from "./sidebar.js";
 import {MS, loadModels} from "./models.js";
 import {Gauge, Icon, Menu, MenuItem, MenuSep, ModelLogo, useDismiss} from "./ui.js";
 
@@ -45,17 +45,18 @@ function ModelMenu({open, close, anchor}) {
   <//>`;
 }
 
-function Header() {
+// (empty: a new chat - its model card says which model answers, so no model button or context meter up here)
+function Header({empty}) {
   const [model, setModel] = useState(false), [opts, setOpts] = useState(false);
   const mBtn = useRef(null), oBtn = useRef(null);
   const name = modelName(S.health.model, true);   // (the short form here: "Qwen-3.8-Flash-Next"; the menu's line below it has the full one)
   if (isPhone()) {
     return html`<header class="chat-head chat-head--float">
       <button type="button" class="glass-btn" aria-label="Chats" onClick=${() => { S.drawer = true; emit(); }}><${Icon} name="menu"/></button>
-      <button type="button" ref=${mBtn} class="model-btn model-btn--phone" aria-haspopup="menu" aria-expanded=${String(model)}
-        onClick=${() => setModel(!model)}>${name}<${Icon} name="chevron" sm/></button>
+      ${empty ? html`<span></span>` : html`<button type="button" ref=${mBtn} class="model-btn model-btn--phone" aria-haspopup="menu" aria-expanded=${String(model)}
+        onClick=${() => setModel(!model)}>${name}<${Icon} name="chevron" sm/></button>`}
       <button type="button" class="glass-btn" aria-label="New chat" onClick=${newChat}><${Icon} name="new-chat"/></button>
-      <${ModelMenu} open=${model} close=${() => setModel(false)} anchor=${mBtn}/>
+      ${empty ? null : html`<${ModelMenu} open=${model} close=${() => setModel(false)} anchor=${mBtn}/>`}
     </header>`;
   }
   return html`<header class="chat-head">
@@ -63,14 +64,14 @@ function Header() {
       ${S.sideOpen ? null : html`
         <button type="button" class="icon-btn" aria-label="Open the sidebar" title="Open the sidebar" onClick=${() => setSide(true)}><${Icon} name="panel-left"/></button>
         <button type="button" class="icon-btn" aria-label="New chat" title="New chat" onClick=${newChat}><${Icon} name="new-chat"/></button>`}
-      <span class="anchor">
+      ${empty ? null : html`<span class="anchor">
         <button type="button" ref=${mBtn} class=${`model-btn${model ? " is-open" : ""}`} aria-haspopup="menu" aria-expanded=${String(model)}
           title=${S.health.model} onClick=${() => setModel(!model)}>${name}<${Icon} name="chevron" sm/></button>
         <${ModelMenu} open=${model} close=${() => setModel(false)} anchor=${mBtn}/>
-      </span>
+      </span>`}
     </div>
     <div class="chat-head__right">
-      <${Meter}/>
+      ${empty ? null : html`<${Meter}/>`}
       <span class="anchor">
         <button type="button" ref=${oBtn} class="icon-btn" aria-label="Chat options" title="Chat options" aria-haspopup="menu"
           aria-expanded=${String(opts)} onClick=${() => setOpts(!opts)}><${Icon} name="ellipsis"/></button>
@@ -148,6 +149,29 @@ class Answer extends Component {
       const body = d.querySelector(".think__body");
       if (d.open && body.dataset.pending) { body.textContent = this.props.m.reasoning; delete body.dataset.pending; }
     };
+    // the answer's numbers (tokens, speed, the prompt read): behind the info button, a tap or a click shows them
+    this.info = (open) => {
+      const pop = this.pop, btn = this.infoBtn;
+      if (!pop || open === !pop.hidden) return;
+      pop.hidden = !open;
+      btn.setAttribute("aria-expanded", String(open));
+      btn.classList.toggle("is-on", open);
+      const thread = this.base && this.base.closest(".thread");
+      if (thread) thread.classList.toggle("has-pop", open);   // (room under the last answer for it, while open)
+      if (open) {
+        // (the last answer's would open under the message box: the chat scrolls it into sight above the box)
+        const sc = chatView.el, dock = document.querySelector(".chat__dock");
+        const over = sc && dock ? pop.getBoundingClientRect().bottom + 12 - dock.getBoundingClientRect().top : 0;
+        if (over > 0) sc.scrollBy({top: over, behavior: "smooth"});
+        this.away = (e) => { if (!pop.contains(e.target) && !btn.contains(e.target)) this.info(false); };
+        this.esc = (e) => { if (e.key === "Escape") { e.stopPropagation(); this.info(false); btn.focus(); } };
+        setTimeout(() => document.addEventListener("pointerdown", this.away, true), 0);
+        document.addEventListener("keydown", this.esc, true);
+      } else {
+        document.removeEventListener("pointerdown", this.away, true);
+        document.removeEventListener("keydown", this.esc, true);
+      }
+    };
     this.copy = () => {
       copyText(this.props.m.text, true);
       const use = this.base.querySelector("[data-a=copy] use");
@@ -156,7 +180,7 @@ class Answer extends Component {
     };
   }
   componentDidMount() { painters.set(this.props.m, this.paint); this.update(this.props, true); }
-  componentWillUnmount() { if (painters.get(this.props.m) === this.paint) painters.delete(this.props.m); }
+  componentWillUnmount() { this.info(false); if (painters.get(this.props.m) === this.paint) painters.delete(this.props.m); }
   shouldComponentUpdate(np) {
     if (np.m !== this.props.m) return true;
     this.update(np, false);
@@ -202,7 +226,15 @@ class Answer extends Component {
     }
     body.classList.toggle("is-streaming", streaming && !!m.text);
     const acts = this.acts;
-    acts.querySelector(".answer__meta").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
+    // (a stop stays in sight; the numbers go behind the info button, a line each)
+    acts.querySelector(".answer__meta").textContent = !streaming && m.stopped ? "Stopped" : "";
+    const lines = streaming ? [] : (m.meta || "").split(" · ").filter(Boolean).map((t) => t[0].toUpperCase() + t.slice(1));
+    this.infoBtn.hidden = !lines.length;
+    if (!lines.length) this.info(false);
+    if (this.pop.dataset.text !== lines.join("\n")) {
+      this.pop.dataset.text = lines.join("\n");
+      this.pop.replaceChildren(...lines.map((t) => { const d = document.createElement("div"); d.textContent = t; return d; }));
+    }
     acts.querySelector("[data-a=copy]").hidden = streaming || !m.text;
     acts.querySelector("[data-a=regen]").hidden = streaming || !!S.busy || !last;   // the last answer only, when nothing runs
     acts.hidden = streaming;
@@ -216,6 +248,10 @@ class Answer extends Component {
       <div class="answer__actions" ref=${(e) => { this.acts = e; }}>
         <button type="button" class="icon-btn icon-btn--sm" data-a="copy" aria-label="Copy the answer" title="Copy" onClick=${this.copy}><${Icon} name="copy" sm/></button>
         <button type="button" class="icon-btn icon-btn--sm" data-a="regen" aria-label="Write this answer again" title="Regenerate" onClick=${regenerate}><${Icon} name="refresh" sm/></button>
+        <span class="anchor">
+          <button type="button" class="icon-btn icon-btn--sm" data-a="info" ref=${(e) => { this.infoBtn = e; }} hidden aria-label="About this answer"
+            title="Tokens and speed" aria-haspopup="dialog" aria-expanded="false" onClick=${() => this.info(this.pop.hidden)}><${Icon} name="info" sm/></button>
+          <div class="answer__pop" role="dialog" aria-label="About this answer" hidden ref=${(e) => { this.pop = e; }}></div></span>
         <span class="answer__meta"></span></div>
     </article>`;
   }
@@ -363,7 +399,43 @@ function note() {
                                        : "Runs on this machine. Nothing leaves it.";
 }
 
-// ------------------------------------------------------------------ a new chat's greeting
+// ------------------------------------------------------------------ a new chat: the model, the box, ideas
+// the model that answers here: ready or busy, its context, the last answer's speed, images, what it saved - and the Models
+// page, to switch to another
+function ModelCard({phone}) {
+  const h = S.health || {}, m = S.metrics, st = status(true);
+  const ready = S.conn === "ok" && st.text === "Idle";
+  const last = m && (m.requests || [])[0], sv = m && m.savings;
+  const name = h.model_label || modelName(h.model) || "The model", state = ready ? "Ready" : st.text;
+  const pill = html`<span class=${`pill pill--${ready ? "ok" : st.tone}`}><i class="status__dot"></i>${state}</span>`;
+  if (phone) {   // (the whole card a button: the name, then its state and the facts on one line, short)
+    // (the speed and what it saved; the context size when there is neither yet - a narrow line has room for two)
+    let facts = [last && last.decode_tok_s ? `${fmt(last.decode_tok_s, last.decode_tok_s < 10 ? 1 : 0)} tok/s` : null,
+                 sv && sv.priced ? `${usd(sv.usd)} saved` : null].filter(Boolean);
+    if (!facts.length && h.max_context) facts = [`${ctxfmt(h.max_context)} context`];
+    return html`<button type="button" class="model-card model-card--phone" onClick=${() => showView("models")}
+        aria-label=${`${name}, ${state}${facts.length ? `, ${facts.join(", ")}` : ""}. Switch model`}>
+      <${ModelLogo} model=${h.model} size=${40}/>
+      <span class="model-card__text"><span class="model-card__name"><b>${name}</b></span>
+        <span class="model-card__line num"><span class="model-card__state" data-tone=${ready ? "ok" : st.tone}><i></i>${state}</span>${
+          facts.length ? ` · ${facts.join(" · ")}` : ""}</span></span>
+      <${Icon} name="chevron-right" sm/></button>`;
+  }
+  const facts = [h.max_context ? ["Context", ctxfmt(h.max_context)] : null,
+                 last && last.decode_tok_s ? ["Last answer", `${fmt(last.decode_tok_s, 1)} tok/s`] : null,
+                 h.model ? ["Images", h.images ? "on" : "off"] : null,
+                 sv && sv.priced ? ["Saved", usd(sv.usd)] : null].filter(Boolean);
+  return html`<section class="model-card" aria-label="The model">
+    <${ModelLogo} model=${h.model} size=${44}/>
+    <div class="model-card__text">
+      <div class="model-card__name" role="status"><b title=${h.model || ""}>${name}</b>${pill}</div>
+      ${facts.length ? html`<div class="model-card__facts num">${facts.map(([k, v]) => html`<span>${k}<b>${v}</b></span>`)}</div>` : null}
+    </div>
+    <button type="button" class="btn btn--secondary btn--sm" onClick=${() => showView("models")}><${Icon} name="swap" sm/>Switch model</button>
+  </section>`;
+}
+
+// ideas to start from
 const IDEAS = [
   {icon: "box", label: "A three.js scene in one HTML file",
    q: "Write a single-file HTML page with a three.js scene: a slowly rotating, softly lit crystal on a dark background, with orbit controls."},
@@ -375,9 +447,12 @@ const IDEAS = [
    q: "Summarize the key ideas of mixture-of-experts language models for a curious engineer, in five short paragraphs."},
 ];
 const useIdea = (q) => { S.draft = q; emit(); updateCtxMeter(); focusInput(); };
+
+// a new chat: what are we building, the model that answers it, the box, and ideas to start from
 function Greeting({phone}) {
   return html`<div class=${`greeting${phone ? " greeting--phone" : ""}`}>
     <h1>What are we building today?</h1>
+    <${ModelCard} phone=${phone}/>
     ${phone ? null : html`<${Composer} center/>`}
     <div class="ideas" role="list" aria-label="Ideas to start with">
       ${IDEAS.map((it) => html`<div role="listitem"><button type="button" class="idea" onClick=${() => useIdea(it.q)}>
@@ -442,7 +517,7 @@ export function ChatPage() {
     onDragOver=${(e) => { if (!files(e)) return; e.preventDefault(); setDrop(true); }}
     onDragLeave=${(e) => { if (e.target === e.currentTarget || !e.currentTarget.contains(e.relatedTarget)) setDrop(false); }}
     onDrop=${(e) => { setDrop(false); if (!e.dataTransfer || !e.dataTransfer.files.length) return; e.preventDefault(); addFiles(e.dataTransfer.files); focusInput(); }}>
-    <${Header}/>
+    <${Header} empty=${empty}/>
     <div class="chat__scroll" ref=${scroller} onScroll=${onScroll}>
       ${empty ? html`<${Greeting} phone=${phone}/>` : html`<${Thread}/>`}
     </div>
