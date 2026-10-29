@@ -221,6 +221,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_prompt_mem_test.cpp")
   target_link_libraries(ds4_prompt_mem_test PRIVATE strata_warnings)
   add_test(NAME ds4_prompt_mem_test COMMAND ds4_prompt_mem_test)
 endif()
+# STRATA_HIPBLASLT_TUNING's table list: ':' on Linux, ';' on Windows with drive letters kept (host code only, so a
+# build without HIP builds it by name)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hipblaslt_table_list_test.cpp")
+  add_executable(hipblaslt_table_list_test EXCLUDE_FROM_ALL tests/hipblaslt_table_list_test.cpp)
+  target_include_directories(hipblaslt_table_list_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
+  target_link_libraries(hipblaslt_table_list_test PRIVATE strata_warnings)
+  add_test(NAME hipblaslt_table_list_test COMMAND hipblaslt_table_list_test)
+endif()
 
 # ---- strata_plan ----------------------------------------------------------
 # Also header-only.  A "planner" that hides state would be one whose decision is not inspectable, and the

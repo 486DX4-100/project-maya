@@ -2932,7 +2932,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                            key=lambda p: (p.stem.split("-")[3], p.stem))
             tables.extend(str(path) for path in found)
         if tables:
-            hip_env["STRATA_HIPBLASLT_TUNING"] = ":".join(tables)
+            # the OS's path-list separator: a ':' would also split a Windows drive letter (C:\...)
+            hip_env["STRATA_HIPBLASLT_TUNING"] = os.pathsep.join(tables)
         env = {**hip_env, **env}
     if env:
         cfg["env"] = env

@@ -87,7 +87,7 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(cfg["gpu"], [1, 0])
         self.assertNotIn("STRATA_GLM_SPLIT", cfg["env"])
         self.assertEqual(cfg["env"]["STRATA_HIPBLASLT_TUNING"],
-                         f"{tables / 'gfx1201-glm-hipblaslt-100202.txt'}:{tables / 'gfx1100-glm-hipblaslt-100202.txt'}")
+                         f"{tables / 'gfx1201-glm-hipblaslt-100202.txt'}{os.pathsep}{tables / 'gfx1100-glm-hipblaslt-100202.txt'}")
 
     def test_config_selects_hip_and_preserves_user_tuning(self):
         pc = maya.check_pc(self.a)
@@ -120,7 +120,7 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(env["STRATA_GLM_PREFILL_MB"], "4096")
         self.assertEqual(env["STRATA_GLM_RESERVE_MB"], "3072")
         self.assertEqual(env["STRATA_GLM_RAM_HEADROOM_GB"], "16")
-        self.assertEqual(env["STRATA_HIPBLASLT_TUNING"].split(":"),
+        self.assertEqual(env["STRATA_HIPBLASLT_TUNING"].split(os.pathsep),
                          [str(tables / "gfx1100-glm-hipblaslt-100202.txt"),
                           str(tables / "gfx1100-glm-hipblaslt-100401.txt"),
                           str(tables / "gfx1100-glm-hipblaslt-100401-b.txt")])
@@ -129,6 +129,21 @@ class HipSetupTests(unittest.TestCase):
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                               self.root / "pack", "test", 8192, self.root / "data", None)
         self.assertEqual(maya.read_json(p)["env"]["STRATA_HIPBLASLT_TUNING"], "/selected/table.txt")
+
+    def test_tuning_table_list_uses_the_os_path_separator(self):
+        # Windows joins with ';': a ':' would also split the drive letter of C:\... (the engine then opened \...)
+        tables = self.root / "tools/hip"
+        tables.mkdir(parents=True)
+        for v in ("100202", "100401"):
+            (tables / f"gfx1100-glm-hipblaslt-{v}.txt").write_text(f"STRATA_HIPBLASLT_TUNING_V1 gfx1100 {v}\n")
+        pc = maya.check_pc(self.a)
+        for sep in (";", ":"):
+            with self.subTest(sep=sep), patch.object(maya.os, "pathsep", sep):
+                p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
+                                      self.root / "pack", "test", 8192, self.root / "data", None)
+                self.assertEqual(maya.read_json(p)["env"]["STRATA_HIPBLASLT_TUNING"],
+                                 sep.join(str(tables / f"gfx1100-glm-hipblaslt-{v}.txt")
+                                          for v in ("100202", "100401")))
 
     def test_gpus_with_an_apu_use_discrete_first_and_sequential_loading(self):
         self.gpus.append({"index": 3, "arch": "gfx1151", "vendor": "amd", "name": "Radeon 8060S", "vram_gb": 112})

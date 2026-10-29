@@ -156,16 +156,13 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     const auto suffix = arch.find(':');
     if (suffix != std::string::npos) arch.resize(suffix);
 
-    // A ':'-separated list (one table per architecture, for a layer split across different cards): each device
-    // keeps every table whose header names its architecture and hipBLASLt version, in this order
-    // (resolve_hipblaslt_algo takes, per shape, the first of them whose solution this hipBLASLt build accepts).
-    std::string error, list(path);
+    // A path list (':' on Linux, ';' on Windows; split_table_list) - one table per architecture, for a layer split
+    // across different cards: each device keeps every table whose header names its architecture and hipBLASLt
+    // version, in this order (resolve_hipblaslt_algo takes, per shape, the first of them whose solution this
+    // hipBLASLt build accepts).
+    std::string error;
     size_t rows = 0;
-    for (size_t at = 0; at <= list.size();) {
-        const size_t end = std::min(list.find(':', at), list.size());
-        const std::string one = list.substr(at, end - at);
-        at = end + 1;
-        if (one.empty()) continue;
+    for (const std::string& one : strata::prefill::hipblaslt::split_table_list(path)) {
         strata::prefill::hipblaslt::TuningTable table;
         std::string e;
         if (table.load(one, arch, version, e)) {

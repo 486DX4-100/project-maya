@@ -117,7 +117,7 @@ Windows, large-image limits, and multiple-image workloads were not tested here.
 `--gpus 0,1` splits the layers across two supported cards, as on NVIDIA: each card caches the experts of its own
 half, and the second half also runs the model's MTP block, which drafts the next token so both cards stay busy. Setup
 puts the card with more VRAM first (it takes the bigger first half), leaves the split point to the engine, and writes
-one hipBLASLt table per architecture (`MAYA_HIPBLASLT_TUNING` takes a `:`-separated list; each card uses the table
+one hipBLASLt table per architecture (`MAYA_HIPBLASLT_TUNING` takes a path list, `:`-separated on Linux and `;` on Windows; each card uses the table
 for its own architecture). A discrete GPU paired with a unified-memory APU puts the discrete GPU first and loads the
 parts sequentially (`MAYA_GLM_PARALLEL_LOAD=0`), so the APU sizes its pool after the first part pins its RAM tier.
 The two cards may be different architectures. The split passes one small host-memory hop
