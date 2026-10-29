@@ -643,7 +643,7 @@ class Leftovers(unittest.TestCase):
         p = ds4_cfg(self.d)
         cfg = json.loads(p.read_text())
         root = self.models / "DeepSeek-V4.1-Flash"
-        root.mkdir(parents=True)
+        self.models.mkdir(parents=True, exist_ok=True)   # (root itself: the rename makes it; Windows will not rename onto a folder)
         (self.d / "DeepSeek-V4.1-Flash").rename(root)
         cfg["args"][1] = str(root / "pack")
         cfg["installer"]["models_dir"] = str(self.models)
