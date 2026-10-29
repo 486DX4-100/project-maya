@@ -77,6 +77,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "tools"))
 import setup as S  # noqa: E402  Strata's installer: PC checks, pip, llama.cpp, downloads (nothing runs on import)
 from setup import ask, fail, ok, run, say, step, warn  # noqa: E402
+import maya_import as MI  # noqa: E402  --import-model: model files downloaded some other way, found by size + sha256
 import maya_names as N  # noqa: E402  the settings' names users see (MAYA_*) and the older ones the code reads
 import maya_quants as Q  # noqa: E402  the quants' names users see (MiniMax M3.1 · Maya-XS) and the older ones as aliases
 import calibrate_glm as CAL  # noqa: E402  the CPU lane's tuning for this PC (./maya.sh --calibrate)
@@ -2112,6 +2113,134 @@ def sha256_checked(path: Path, want) -> bool:
     return True
 
 
+def import_catalog(models: Path) -> list:
+    """Every published model file Maya's setup would put under the models folder, for --import-model: {"label": the
+    model's folder, "rel": the file's place, "size": its published size (None for a GGUF the table lists by sha256
+    only), "sha": the accepted sha256 values}, with the layout the setup downloads into."""
+    import contextlib
+    import io
+    cat = []
+
+    def add(label: str, base: str, names: dict, sizes: dict | None = None):
+        for name, sha in names.items():
+            cat.append({"label": label, "rel": f"{base}/{name}", "size": (sizes or {}).get(name),
+                        "sha": [x.lower() for x in ([sha] if isinstance(sha, str) else sha)]})
+
+    def entry(label: str, base: str, m: dict):
+        if m.get("files"):
+            add(label, base, m["sha256"], m["files"])
+        else:                                          # (a GLM GGUF: shards, the sha256 per name)
+            add(label, base, {n: m["sha256"][n] for n in shard_names(m) if n in m["sha256"]})
+
+    for quant, m in MODELS.items():
+        entry(quant, quant, m)
+        v = m.get("vision")
+        if v:
+            add(quant, f"{quant}/{v['folder']}", v["sha256"])
+    cat.append({"label": "GLM-5.3-Flash-DFlash2", "rel": f"GLM-5.3-Flash-DFlash2/{DFLASH['file']}",
+                "size": DFLASH["bytes"], "sha": [DFLASH["sha256"].lower()]})
+    quiet = contextlib.redirect_stdout(io.StringIO())
+
+    def tolerant(make, *args):                         # (a manifest that is not published yet: fail() exits)
+        try:
+            with quiet:
+                return make(*args)
+        except (SystemExit, OSError, KeyError, ValueError):
+            return None
+    nsa = argparse.Namespace(model_dir=None)
+    for quant in DS4_QUANTS:
+        m = tolerant(ds4_gguf_model, quant)
+        if m and m.get("files"):
+            d = ds4_dir(nsa, models, {}, quant)
+            entry(d.relative_to(models).as_posix(), d.relative_to(models).as_posix(), m)
+    for spec in DS4_EXL3.values():
+        files = (read_json(spec["manifest"]).get("files") or {})
+        base = spec["dir"]
+        if files:
+            add(base, base, {k: v[1] for k, v in files.items()}, {k: v[0] for k, v in files.items()})
+    vision = tolerant(ds4_vision_model)
+    if vision:
+        entry(f"{DS4}-GGUF/vision", f"{DS4}-GGUF/vision", vision)
+    mm = tolerant(mm3_models)
+    if mm:
+        entry(MM3_DIR, MM3_DIR, mm[0])
+        entry(f"{MM3_DIR}/dspark", f"{MM3_DIR}/{mm[1]['folder']}", mm[1])
+    for quant, shown in MM3_QUANTS.items():
+        m = tolerant(mm3_gguf_entry, quant) if quant != "exl3" else None
+        if m and m.get("files") and all(m["sha256"].values()):
+            entry(shown, shown, m)
+    q = tolerant(qwen_entry)
+    if q:
+        entry(QWEN, QWEN, q)
+    return cat
+
+
+def import_model(a, folder: str) -> int:
+    """--import-model <folder>: find the published model files in a folder by their size and sha256 (whatever the
+    downloader named them, in whatever subfolders, also a Hugging Face cache's blobs/snapshots), and move them (same
+    drive) or copy them (another drive: --copy) into the models folder's layout; then print what was found, what
+    is missing and what did not match.  Nothing that did not match is touched; nothing is deleted."""
+    src = Path(folder).expanduser().resolve()
+    if not src.is_dir():
+        fail(f"{folder} is not a folder", f"{ME} --import-model <the folder with the downloaded files>")
+    have = configs()
+    inst = (read_json(have[0]).get("installer") or {}) if have else {}
+    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+              Path(inst["models_dir"]) if inst.get("models_dir") else
+              Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
+    cat = import_catalog(models)
+    say(f"  Looking in {src} for Maya's model files (by size and sha256, not by name); they go to {models}")
+    got = MI.find(src, cat, progress=say)
+    placed, shared = MI.choose(got["found"])
+    if not placed and not shared:
+        warn("none of the files there is one of Maya's published model files")
+    for path, _, size, hits in placed:
+        say(f"  found  {path.name}  ({size / 1e9:.2f} GB)  ->  {hits[0]['rel']}" +
+            (f" (+{len(hits) - 1} more places)" if len(hits) > 1 else ""))
+    for path, labels in shared:
+        say(f"  shared {path.name}: used by several models ({', '.join(labels[:3])}, ...) and none of them is in this "
+            "folder - left where it is (the setup downloads it with the model)")
+    have_lines, missing_lines = MI.report_lines(cat, placed, models)
+    for label, absent in missing_lines:
+        if absent:
+            say(f"  missing for {label}: " + ", ".join(absent[:6]) + (f" and {len(absent) - 6} more" if len(absent) > 6 else ""))
+        else:
+            say(f"  {label}: every file is here")
+    skipped = [(p, s) for p, s in got["unmatched"] if s >= (1 << 20)]
+    if skipped:
+        say(f"  {len(skipped)} file(s) there did not match any published file and are left alone"
+            + (" (a download that is not finished, another version, or another model):" if len(skipped) <= 20 else
+               " - the first 20:"))
+        for p, s in skipped[:20]:
+            say(f"      {p}  ({s / 1e9:.2f} GB)" if s >= 1e8 else f"      {p}  ({s / 1e6:.1f} MB)")
+    if not placed:
+        return 1
+    anchor = next(p for p in [models, *models.parents] if p.exists())
+    apart = [p for p, r, _, _ in placed if not MI.same_drive(r, anchor) or os.path.abspath(p) != str(r)]
+    copy = bool(a.copy)
+    if apart and not copy:
+        say()
+        say(f"  {len(apart)} file(s) are on another drive than {models} (or are links into a cache): they can only be "
+            "copied - the original stays where it is, so the space is used twice.")
+        copy = ask("  Copy them? (y/n)", ["y", "n"], "n", a.yes) == "y"
+    elif not (a.yes or a.copy):
+        say()
+        if ask(f"  Move {len(placed)} file(s) into {models}? (y/n)", ["y", "n"], "y", False) != "y":
+            say("  Nothing was moved.")
+            return 0
+    moved = copied = 0
+    skipped_now = []
+    for path, real, size, hits in placed:
+        r = MI.place(path, real, size, hits, models, copy, say)
+        moved, copied = moved + r["moved"], copied + r["copied"]
+        skipped_now += r["skipped"]
+    for line in skipped_now:
+        warn(line)
+    ok(f"{moved} file(s) moved, {copied} copied into {models}; they are recorded as verified (no second check)")
+    say(f"  Now run {ME} --setup and pick the model (or {ME} --setup --model <name>): the files are used where they are.")
+    return 0
+
+
 def file_url(m: dict, name: str) -> str:
     """A download's file on Hugging Face: from the model's repo, or the one its "sources" names for it (DeepSeek's
     Engram tables: DeepSeek's base repo)."""
@@ -2272,6 +2401,8 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
     else:
         say("  You can also run them yourself (or download the files any other way into that folder, or pass")
         say(f"  --gguf-dir <folder with the files>), then run {ME} again.")
+    say(f"  Files you downloaded with another program, under any names: {ME} --import-model <their folder> finds them")
+    say("  by size and sha256 and moves them into place.")
     if not curl:
         warn("curl is not installed" + ("" if WIN else " (sudo apt-get install -y curl)") + ": if you say yes, the "
              "same URLs are downloaded with Python instead (also resumable)")
@@ -5849,6 +5980,13 @@ def main() -> int:
                     help="take the recommended answers (the model download still needs --download-model)")
     ap.add_argument("--plain", action="store_true",
                     help="the setup in plain text, the answers typed (not on the setup's own screen)")
+    ap.add_argument("--import-model", metavar="FOLDER",
+                    help="use model files downloaded some other way (a download manager, a copy from another PC, a "
+                         "Hugging Face cache): finds Maya's published files in FOLDER by size and sha256 (any names, "
+                         "any subfolders) and moves them into the models folder, or copies them with --copy when "
+                         "they are on another drive")
+    ap.add_argument("--copy", action="store_true",
+                    help="with --import-model: copy files that cannot be moved (another drive); the originals stay")
     ap.add_argument("--download-model", action="store_true",
                     help="download the model without asking (the commands and the size are still printed)")
     ap.add_argument("--model", metavar="MODEL",
@@ -5963,6 +6101,8 @@ def main() -> int:
     say(f"Project Maya v{version} - GLM-5.3-Flash, {DS4} or {MM3} on your own GPU(s).")
     if a.report:
         return report(version, a.backend, a.config)
+    if a.import_model:
+        return import_model(a, a.import_model)
     if a.bench:
         have = [a.config] if a.config is not None else configs()
         if a.backend:
