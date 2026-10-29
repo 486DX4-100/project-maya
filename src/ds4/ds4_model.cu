@@ -1338,6 +1338,43 @@ struct Model::Impl {
                nx->n_exp >= 1 && nx->n_exp <= 1024 && l.k_exp >= 1 && l.k_exp <= kPicks && m >= 1 && m <= kAhead &&
                D >= 4 && D % 4 == 0 && D <= kMaxDim;
     }
+    // DS4_TP_SHARES=w0,w1,..[:w0,w1,..][/..] (experimental): a GGUF group's FFN shares on DS4_TP_GGUF_UNEVEN's member
+    // ranges, group by group ('/') - member m takes w_m of sum(w) equal parts of n_ff (whole blocks), so a member short
+    // of room (the drafter's lead) holds less of each VRAM expert; several patterns (':') go round the group's layers
+    // by index (2,3,4:2,4,3 - 3.5 parts each for members 1 and 2 on average); a group without an entry, or whose
+    // patterns are not its width, takes the whole-block split
+    static const std::vector<std::vector<std::vector<int>>>& tp_shares() {
+        static const std::vector<std::vector<std::vector<int>>> s = [] {
+            std::vector<std::vector<std::vector<int>>> r;
+            const char* e = std::getenv("DS4_TP_SHARES");
+            if (e == nullptr || *e == 0) return r;
+            std::stringstream gs(e);
+            std::string grp;
+            while (std::getline(gs, grp, '/')) {
+                std::vector<std::vector<int>> pats;
+                std::stringstream ps(grp);
+                std::string pat;
+                while (std::getline(ps, pat, ':')) {
+                    std::vector<int> w;
+                    std::stringstream ws(pat);
+                    std::string v;
+                    while (std::getline(ws, v, ',')) w.push_back(std::atoi(v.c_str()));
+                    pats.push_back(std::move(w));
+                }
+                r.push_back(std::move(pats));
+            }
+            return r;
+        }();
+        return s;
+    }
+    // layer il's shares in group grp of nm members, or none (the whole-block split)
+    static const std::vector<int>* tp_share(int grp, int nm, int il) {
+        const auto& s = tp_shares();
+        if (grp < 0 || (size_t) grp >= s.size() || s[(size_t) grp].empty()) return nullptr;
+        const auto& pats = s[(size_t) grp];
+        const std::vector<int>& w = pats[(size_t) il % pats.size()];
+        return (int) w.size() == nm ? &w : nullptr;
+    }
     static constexpr uint64_t kRamMargin = 8ull << 30;   // RAM left to the rest (the system, the page cache's churn)
     static constexpr uint64_t kAutoCopyRoom = 8ull << 30;   // --mmap-experts auto copies only with this much more spare
                                                             // (the Engram rows' page cache, other programs)
@@ -3281,6 +3318,7 @@ struct Model::Impl {
                 if (ty >= 0) blk = std::max(blk, gg::type_block(ty));
             }
             // (DS4_TP_GGUF_UNEVEN: whole blocks, as many as members at least - n_ff 2304 in 256s: 5 + 4)
+            if (!tp_shares().empty()) tp_uneven = true;   // (DS4_TP_SHARES: on the whole-block member ranges)
             const bool uneven = tp_uneven && g.ff % blk == 0;
             // DS4_TP_UNEVEN_HEADS=1 (experimental): keep a width the heads do not split in evenly - the layers' own
             // check takes the heads over head_members(tp) of the members, as a non-GGUF pack's do (64 heads, tp 3: 2)
@@ -3607,9 +3645,25 @@ struct Model::Impl {
                 x.ah0 = ha < 0 ? 0 : ha * x.ahn;
                 x.ogn = ha < 0 ? 0 : g.o_groups / na;
                 x.og0 = ha < 0 ? 0 : ha * x.ogn;
-                if (gguf_x && tp_uneven)   // (DS4_TP_GGUF_UNEVEN: whole blocks, the odd ones round the members)
-                    splitb(g.ff, tp_blk, l.nm, m, x.ff0, x.ffn, l.il % l.nm);
-                else if (gguf_x) {
+                if (gguf_x && tp_uneven) {   // (DS4_TP_GGUF_UNEVEN: whole blocks, the odd ones round the members)
+                    if (const std::vector<int>* w = tp_share(l.grp, l.nm, l.il)) {   // (DS4_TP_SHARES' parts)
+                        int sum = 0, before = 0;
+                        bool pos = true;
+                        for (int j = 0; j < l.nm; ++j) {
+                            pos = pos && (*w)[(size_t) j] > 0;
+                            sum += (*w)[(size_t) j];
+                            if (j < m) before += (*w)[(size_t) j];
+                        }
+                        if (!pos || g.ff % sum != 0 || (g.ff / sum) % tp_blk != 0) {
+                            err = "DS4_TP_SHARES: n_ff " + std::to_string(g.ff) + " does not split in these shares in " +
+                                  std::to_string(tp_blk) + "-value blocks";
+                            return false;
+                        }
+                        x.ff0 = g.ff / sum * before;
+                        x.ffn = g.ff / sum * (*w)[(size_t) m];
+                    } else
+                        splitb(g.ff, tp_blk, l.nm, m, x.ff0, x.ffn, l.il % l.nm);
+                } else if (gguf_x) {
                     x.ffn = g.ff / l.nm;
                     x.ff0 = m * x.ffn;
                 } else
@@ -4501,6 +4555,13 @@ struct Model::Impl {
         int FF = 0, ff0_ = 0;
         if (tp_uneven) splitb(g.ff, tp_blk, nm, 0, ff0_, FF);   // (rot 0: member 0 takes the odd block - the widest)
         else split128(g.ff, nm, 0, ff0_, FF);
+        for (const auto& pats : tp_shares())   // (DS4_TP_SHARES: the widest share of any group this wide)
+            for (const auto& w : pats) {
+                if ((int) w.size() != nm) continue;
+                int sum = 0, most = 0;
+                for (int v : w) sum += v, most = std::max(most, v);
+                if (sum > 0 && g.ff % sum == 0) FF = std::max(FF, g.ff / sum * most);
+            }
         c.HQ = HQ, c.OG = OG, c.FF = FF;
         // The attention slab (its q in millions of values: the rows of q, the sparse attention and the output
         // projections at a time) and the dense weights' FP16 scratch (MB): 8 / 16, or on a device with much memory
@@ -6396,7 +6457,20 @@ struct Model::Impl {
                     if (++l.n_vram < l.n_exp) pq.push({sh[(size_t) il][(size_t) l.n_vram] / ucount(l), il});
                 }
             }
-            const double budget = *std::min_element(mroom.begin(), mroom.end());
+            // (DS4_TP_SHARES: each member's room in the mean part's bytes - its own part of a slot is not the mean's -
+            //  so the proposal takes the member whose room runs out first in slots; trim_to_fit then checks the bytes)
+            std::vector<double> mslots = mroom;
+            if (tp_uneven && !tp_shares().empty() && mroom.size() > 1)
+                for (size_t mi = 0; mi < mroom.size(); ++mi) {
+                    double mine = 0, mean = 0;
+                    for (const Layer& l : L)
+                        if (l.grp == (int) gi && !l.mtp && l.n_cls == 1 && (size_t) l.nm == mroom.size()) {
+                            mine += (double) unit(member(l, (int) mi));
+                            mean += ucount(l);
+                        }
+                    if (mine > 0) mslots[mi] = mroom[mi] * mean / mine;
+                }
+            const double budget = *std::min_element(mslots.begin(), mslots.end());
             double want = 0, seen = 0;
             for (const Layer& l : L)
                 if (l.grp == (int) gi && !l.mtp && l.n_cls == 1) {
