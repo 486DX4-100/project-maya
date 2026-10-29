@@ -127,6 +127,14 @@ IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+TEXT_FILE_MIN, TEXT_FILE_MAX = 512 * 1024, 16 * 1024 * 1024
+
+
+def text_file_limit(context: int) -> int:
+    """The largest text file the chat page attaches (#635): the context holds at most this many bytes of text (about 4
+    bytes a token), at least the 512 KB the page always took and at most 16 MB.  The page sends the file as text, so
+    the real limit is the model's context; the page says so when a file is over it."""
+    return max(TEXT_FILE_MIN, min(TEXT_FILE_MAX, int(context or 0) * 4))
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.  5 s: drafted
 # tokens come in bursts of 1-4 a step, and over 2 s the rate swung +-25% around the engine's steady one
@@ -4396,6 +4404,7 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
+                                 "max_text_file": text_file_limit(svc.engine.max_context),
                                  "model_label": svc.model_label,   # (the model first: "GLM-5.3 · Maya-S24")
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec,
                                  "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp), "unloaded": svc.unloaded})

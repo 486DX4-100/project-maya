@@ -1566,6 +1566,21 @@ class WebApp(unittest.TestCase):
         side = (ROOT / "serve/web/sidebar.js").read_text(encoding="utf-8")   # (the sidebar's model card)
         self.assertIn("S.health.model_label || modelName(S.health.model)", side)
 
+    def test_text_file_limit_follows_the_context(self):
+        """#635: /health tells the chat page how big a text file the context holds (about 4 bytes a token, 512 KB to
+        16 MB); the page reads it instead of a fixed 512 KB."""
+        from serve.server import text_file_limit
+        self.assertEqual(text_file_limit(32768), 512 * 1024)               # (never less than before)
+        self.assertEqual(text_file_limit(262144), 1024 * 1024)
+        self.assertEqual(text_file_limit(1048576), 4 * 1024 * 1024)
+        self.assertEqual(text_file_limit(10**9), 16 * 1024 * 1024)         # (a sane cap)
+        self.assertEqual(text_file_limit(0), 512 * 1024)
+        health = json.loads(self.get("/health")[2])
+        self.assertEqual(health["max_text_file"], text_file_limit(health["max_context"]))
+        page = (ROOT / "serve/web/chats.js").read_text(encoding="utf-8")
+        self.assertIn("S.health.max_text_file", page)
+        self.assertNotIn("MAX_TEXT_FILE", page)
+
     def test_home_screen_start_url(self):
         """The manifest's start_url and scope resolve to the page, not to /web/ (iOS's Add to Home Screen opened a 404);
         an icon saved with the old /web/ is sent to the page."""
