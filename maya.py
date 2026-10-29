@@ -896,6 +896,49 @@ def rocm_sdk() -> str | None:
     return None
 
 
+def rocm_devel_links(site: Path, repair: bool = True) -> tuple:
+    """TheRock's device-library links (rocBLAS's / hipBLASLt's kernels for each GPU) in an expanded ROCm SDK, checked
+    and repaired: `rocm-sdk init` hard-links each file of a rocm-sdk-device-<arch> wheel's .devel_links manifest into
+    _rocm_sdk_devel, but tests its target as <dest folder>/../../.. unnormalized, and under a long install folder that
+    path passes Windows' 260 characters: the link is skipped without a word and rocBLAS crashes on its first call
+    (0xC0000005, #574). Here each target is normalized first, and an absent link is made from it (extended-length
+    paths, so the long-path setting does not matter). -> (links made, [relpaths still absent]); (0, []) without an
+    expanded SDK in `site`."""
+    devel, made, absent = site / "_rocm_sdk_devel", 0, []
+    if not devel.is_dir():
+        return 0, []
+    long = (lambda p: "\\\\?\\" + str(p)) if WIN else str
+    for manifest in sorted((site / "_rocm_sdk_libraries" / ".devel_links").glob("*.json")):
+        try:
+            links = json.loads(manifest.read_text(encoding="utf-8")).get("links") or []
+        except (OSError, ValueError):
+            continue
+        for link in links:
+            rel, target = link.get("relpath"), link.get("target")
+            if not rel or not target:
+                continue
+            dest = devel / rel
+            if os.path.isfile(long(dest)):
+                continue
+            source = os.path.normpath(os.path.join(str(dest.parent), target))
+            if repair and os.path.isfile(long(source)):
+                try:
+                    os.makedirs(long(dest.parent), exist_ok=True)
+                    os.link(long(source), long(dest))
+                    made += 1
+                    continue
+                except OSError:
+                    pass
+            absent.append(rel)
+    return made, absent
+
+
+def rocm_sdk_site(sdk: str) -> Path:
+    """The site-packages of the environment a rocm-sdk(.exe) belongs to (<env>/Scripts/rocm-sdk.exe on Windows)."""
+    env = Path(sdk).resolve().parent.parent
+    return env / "Lib" / "site-packages" if WIN else next(iter(sorted(env.glob("lib/python*/site-packages"))), env)
+
+
 def windows_rocm() -> tuple:
     """(ROCm's root, the folder of its DLLs) on Windows, or (None, None): ROCM_PATH, else TheRock's wheels, else AMD's
     HIP SDK for Windows (HIP_PATH, which its installer sets, else the newest in C:\\Program Files\\AMD\\ROCm)."""
@@ -909,6 +952,13 @@ def windows_rocm() -> tuple:
         # within S.out's minute, and start over on every run (as llama.cpp's Windows CI does: init, then path)
         say("  AMD's ROCm SDK: rocm-sdk init (the first time it unpacks about 3 GB) ...")
         run([sdk, "init"], check=False)
+        made, absent = rocm_devel_links(rocm_sdk_site(sdk))
+        if made:
+            say(f"  AMD's ROCm SDK: linked {made} GPU library file(s) rocm-sdk init had left out (a long folder path)")
+        if absent:
+            fail(f"AMD's ROCm SDK is missing {len(absent)} GPU library file(s) after rocm-sdk init (e.g. "
+                 f"{absent[0]}): rocBLAS would crash on its first call",
+                 f"install Maya in a shorter folder (e.g. C:\\Maya) and run {ME} there")
         path = lambda what: (S.out([sdk, "path", what]).strip().splitlines() or [""])[-1].strip()
         root = path("--root")
         if root:

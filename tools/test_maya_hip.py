@@ -130,6 +130,31 @@ class HipSetupTests(unittest.TestCase):
                               self.root / "pack", "test", 8192, self.root / "data", None)
         self.assertEqual(maya.read_json(p)["env"]["STRATA_HIPBLASLT_TUNING"], "/selected/table.txt")
 
+    def test_rocm_devel_links_repaired(self):
+        # #574: rocm-sdk init skipped the device-library links whose unnormalized target passed 260 characters
+        site = self.root / "site"
+        lib = site / "_rocm_sdk_libraries"
+        (lib / "bin/rocblas/library/gfx1151").mkdir(parents=True)
+        for f in ("Kernels.hsaco", "TensileLibrary_Type_x.dat"):
+            (lib / "bin/rocblas/library/gfx1151" / f).write_bytes(f.encode())
+        (lib / ".devel_links").mkdir()
+        up = "../../../../../_rocm_sdk_libraries/bin/rocblas/library/gfx1151/"
+        links = [{"relpath": f"bin/rocblas/library/gfx1151/{f}", "target": up + f}
+                 for f in ("Kernels.hsaco", "TensileLibrary_Type_x.dat", "gone.dat")]
+        (lib / ".devel_links/gfx1151.json").write_text(json.dumps({"version": "7.14.1", "links": links}))
+        self.assertEqual(maya.rocm_devel_links(site), (0, []))           # (no expanded SDK yet: nothing to check)
+        devel = site / "_rocm_sdk_devel/bin/rocblas/library/gfx1151"
+        devel.mkdir(parents=True)
+        os.link(lib / "bin/rocblas/library/gfx1151/Kernels.hsaco", devel / "Kernels.hsaco")   # the one init made
+        self.assertEqual(maya.rocm_devel_links(site, repair=False),
+                         (0, [links[1]["relpath"], links[2]["relpath"]]))
+        made, absent = maya.rocm_devel_links(site)
+        self.assertEqual((made, absent), (1, [links[2]["relpath"]]))   # a target that is not there stays absent
+        self.assertEqual((devel / "TensileLibrary_Type_x.dat").read_bytes(), b"TensileLibrary_Type_x.dat")
+        self.assertTrue((devel / "TensileLibrary_Type_x.dat").samefile(
+            lib / "bin/rocblas/library/gfx1151/TensileLibrary_Type_x.dat"))   # a hard link, as init makes them
+        self.assertEqual(maya.rocm_devel_links(site), (0, [links[2]["relpath"]]))
+
     def test_tuning_table_list_uses_the_os_path_separator(self):
         # Windows joins with ';': a ':' would also split the drive letter of C:\... (the engine then opened \...)
         tables = self.root / "tools/hip"
