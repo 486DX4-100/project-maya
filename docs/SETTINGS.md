@@ -636,6 +636,8 @@ tokens/s.
 | Setting | Default | |
 | --- | --- | --- |
 | `DS4_COPY_PIN` | on (several GPUs, copies in RAM, chunked prompts) | `0`: the copies are not pinned; the prompt path stages every expert through the CPU, as before |
+| `MAYA_DS4_PIN_LAST` | on with NVIDIA on Windows, else off | `1`: the copies are pinned at the end of the load, after the engine's own pinned buffers (prompt staging, the CPU lane's rings), and only while `MAYA_DS4_PIN_ROOM_GB` more can still be locked - else they stay unpinned and the prompt path stages them, as when the pin fails. Windows caps what one process may lock; pinning 131.8 GB of copies on a 160 GB PC left too little for the staging and the start failed (#589). `0`: pinned as the experts are copied, as on Linux |
+| `MAYA_DS4_PIN_ROOM_GB` | 1 | with `MAYA_DS4_PIN_LAST`: the room left lockable for what the engine pins later |
 
 ## DeepSeek: long prompts read without the second half's work
 

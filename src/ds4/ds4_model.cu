@@ -4433,6 +4433,7 @@ struct Model::Impl {
                 workers.push_back(std::make_unique<Worker>());
                 workers.back()->start();
             }
+        if (cp_pin_last()) cp_pin();   // (#589: after every pinned buffer above, before the paths are timed)
         tune_lane();   // (before calibrate_paths: its CPU-lane speed is the chosen pools')
         pick_len = chunk > 0 ? prompt_pick_length(ds4_env("DS4_PROMPT_PICK")) : 0;
         if (pick_len > 0)
@@ -7518,7 +7519,7 @@ struct Model::Impl {
         copy_mode = true;
         ram_held = (int) jobs.size();
         zc_pin();
-        cp_pin();
+        if (!cp_pin_last()) cp_pin();   // (else at the load's end: #589)
         double cb = 0;
         for (const Job& j : jobs) cb += (double) L[(size_t) j.layer].blob;
         char hp[64] = "";
@@ -7812,11 +7813,57 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: pinning the copied experts (%.1f GB) failed - the prompt path stages them as before\n", gb);
             return;
         }
+        // (pinned last: the room the engine's later pinned buffers need must still be there - else these pins go back)
+        if (cp_pin_last() && !pin_room()) {
+            for (size_t c = 0; c < nc; ++c)
+                if (mine[c] == 1) cudaHostUnregister(ram_chunks[c]);
+            cudaGetLastError();
+            std::fprintf(stderr, "ds4: pinning the copied experts (%.1f GB) would leave under %.1f GB the OS lets this "
+                                 "process lock (MAYA_DS4_PIN_ROOM_GB) - the prompt path stages them as before\n",
+                         gb, pin_room_gb());
+            return;
+        }
         for (size_t c = 0; c < nc; ++c)
             if (mine[c] == 1) zc_chunk[c] = 1;
         cp_dma = true;
         std::fprintf(stderr, "ds4: the copied experts pinned (%.1f GB in %.1f s): the prompt path DMAs them in place\n", gb,
                      (now_ms() - t0) / 1000.0);
+    }
+    // #589: Windows (WDDM) caps the memory one process may lock, and with 160 GB of RAM pinning 131.8 GB of copied
+    // experts succeeded and left too little for the prompt path's own pinned staging (cudaHostAlloc 385 MiB failed:
+    // the start failed).  There (NVIDIA, Windows) the copies are pinned last - after every pinned buffer the load makes
+    // - and only while MAYA_DS4_PIN_ROOM_GB (1) more can still be locked for what the engine pins later; else they stay
+    // unpinned (the staging, as when the pin fails).  MAYA_DS4_PIN_LAST=1 / 0 forces the order on / off (tests).
+    static bool cp_pin_last() {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_PIN_LAST");
+            if (v != nullptr && v[0] != '\0') return std::atoi(v) != 0;
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+            return true;
+#else
+            return false;
+#endif
+        }();
+        return on;
+    }
+    static double pin_room_gb() {
+        static const double gb = [] {
+            const char* v = ds4_env("DS4_PIN_ROOM_GB");
+            return v != nullptr ? std::max(0.0, std::atof(v)) : 1.0;
+        }();
+        return gb;
+    }
+    // whether pin_room_gb() more can be locked now (a pinned allocation of that size, freed at once)
+    static bool pin_room() {
+        const size_t b = (size_t) (pin_room_gb() * 1073741824.0);
+        if (b == 0) return true;
+        void* p = nullptr;
+        if (cudaHostAlloc(&p, b, cudaHostAllocPortable) != cudaSuccess || p == nullptr) {
+            cudaGetLastError();
+            return false;
+        }
+        cudaFreeHost(p);
+        return true;
     }
     bool zc_ok(const Layer& l, int e) const {   // expert e pulled in place: it has a pinned copy
         if (!ln_zc || l.ram.empty() || l.ram[(size_t) e] < 0) return false;
