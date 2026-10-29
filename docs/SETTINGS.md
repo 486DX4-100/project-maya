@@ -1318,7 +1318,8 @@ are taken from its own node first.
 An integrated GPU's memory is the PC's RAM. `--mmap-experts auto` no longer copies the CPU lane's experts into RAM
 beside one: the GPU's own allocations (the experts it holds, and what it allocates later) come out of the same RAM,
 and every copy beside them leaves the machine too little of it. The experts stay in the files; the log says so where
-they would have fit.
+they would have fit. This is for integrated NVIDIA GPUs; an AMD APU (Strix Halo), whose GPU memory is mostly a BIOS
+carve-out apart from the RAM the OS sees, copies them as before.
 
 On Linux with an integrated NVIDIA GPU (a DGX Spark's GB10), the driver's free memory counts only MemFree, while the
 model's files just read sit in the page cache the kernel can give back; `MAYA_DS4_UMA_FREE=1` places the experts (and

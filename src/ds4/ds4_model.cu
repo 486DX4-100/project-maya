@@ -7192,13 +7192,17 @@ struct Model::Impl {
         // keeps the SSD out of the decode: #339's reports)
         // (auto beside an integrated GPU: none - its own allocations, the experts it holds and what it allocates
         // later, come out of the same RAM, and every CPU-lane copy beside them leaves the machine too little of it;
-        // DS4_COPY_ALL=1: the fit alone decides, as on a discrete GPU; =0: auto never copies)
+        // DS4_COPY_ALL=1: the fit alone decides, as on a discrete GPU; =0: auto never copies).  NVIDIA only: an AMD APU
+        // (Strix Halo) reports itself integrated too, but its GPU memory is mostly a BIOS carve-out apart from the OS's
+        // RAM, so it keeps the copy as before until measured there
         bool integ = false;
+#if !defined(STRATA_USE_HIP)
         for (const Dev& d : devs) {
             int v = 0;
             if (cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, d.id) != cudaSuccess) (void) cudaGetLastError();
             integ = integ || v != 0;
         }
+#endif
         const int force_all = tri_of(ds4_env("DS4_COPY_ALL"));
         const bool auto_all = o.mmap_experts < 0 && copy_all_auto(all, can, (double) kAutoCopyRoom, integ, force_all);
         double budget = strict_ram ? all : (o.mmap_experts == 0 ? std::min(all, can) : auto_all ? all : 0.0);
