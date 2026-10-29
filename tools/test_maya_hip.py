@@ -108,6 +108,8 @@ class HipSetupTests(unittest.TestCase):
         (tables / "gfx1100-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100202\n")
         (tables / "gfx1201-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1201 100202\n")
         (tables / "gfx1100-glm-hipblaslt-100401.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100401\n")
+        # a second table for one version (another build's solution numbers) comes after that version's own file
+        (tables / "gfx1100-glm-hipblaslt-100401-b.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100401\n")
         pc = maya.check_pc(self.a)
         self.a.env = ["STRATA_GLM_PREFILL_SUB=512"]
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
@@ -120,7 +122,8 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(env["STRATA_GLM_RAM_HEADROOM_GB"], "16")
         self.assertEqual(env["STRATA_HIPBLASLT_TUNING"].split(":"),
                          [str(tables / "gfx1100-glm-hipblaslt-100202.txt"),
-                          str(tables / "gfx1100-glm-hipblaslt-100401.txt")])
+                          str(tables / "gfx1100-glm-hipblaslt-100401.txt"),
+                          str(tables / "gfx1100-glm-hipblaslt-100401-b.txt")])
         # Keep the runtime's exact-version choice; an explicit operator table still wins.
         self.a.env.append("STRATA_HIPBLASLT_TUNING=/selected/table.txt")
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},

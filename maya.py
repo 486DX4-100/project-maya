@@ -2923,9 +2923,13 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
             hip_env.update({"STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
         # Pass every available version per architecture: the engine's existing header guard selects the
         # table matching each card and its installed hipBLASLt, or keeps plain hipBLAS when none matches.
+        # A version can have more than one table (<version>.txt, then <version>-b.txt, ...: builds of one hipBLASLt
+        # version that number their solutions differently); the engine takes, per shape, the first one its build
+        # accepts, so each version's own file comes first.
         tables = []
         for arch in dict.fromkeys(g.get("arch", "") for g in gpus):
-            found = sorted((ROOT / "tools" / "hip").glob(f"{arch}-glm-hipblaslt-*.txt"))
+            found = sorted((ROOT / "tools" / "hip").glob(f"{arch}-glm-hipblaslt-*.txt"),
+                           key=lambda p: (p.stem.split("-")[3], p.stem))
             tables.extend(str(path) for path in found)
         if tables:
             hip_env["STRATA_HIPBLASLT_TUNING"] = ":".join(tables)

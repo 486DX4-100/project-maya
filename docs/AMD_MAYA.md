@@ -276,7 +276,10 @@ sub-batches. Two settings matter on AMD:
   `tools/hip/tune_hipblaslt` (`tools/hip/<arch>-glm-hipblaslt-<version>.txt`).
   Setup writes it when a table for the card exists. The engine accepts a table
   only for its own architecture and hipBLASLt version; otherwise, and for shapes
-  without a row, it keeps plain hipBLAS. The tuner's absolute-error gate now
+  without a row, it keeps plain hipBLAS. Builds of one hipBLASLt version can
+  number their solutions differently, so a version may have more than one table
+  (`<version>.txt`, `<version>-b.txt`): the engine keeps every matching table
+  and takes, per shape, the first whose solution its hipBLASLt accepts. The tuner's absolute-error gate now
   scales with `sqrt(K / 4096)`, so long-K projections are no longer rejected.
 
 Measured prompt speed, GLM-5.3-Flash Maya-S-v2 IQ2_XXS, ROCm 7.2:
