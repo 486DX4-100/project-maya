@@ -220,6 +220,7 @@ The setup shows every download before it starts it, builds everything once (20-4
 
 - **Windows:** `START-MAYA.bat` instead of `./setup.sh` - see [docs/WINDOWS.md](docs/WINDOWS.md).
 - **AMD:** [docs/AMD_MAYA.md](docs/AMD_MAYA.md).
+- **Intel Arc:** not supported by Maya's engine; a community report of the Maya-XS DeepSeek GGUFs on llama.cpp's SYCL backend: [docs/INTEL_ARC.md](docs/INTEL_ARC.md).
 - **Updating:** the page's **Settings › About and updates**, or `git pull` then `./setup.sh`. The model isn't downloaded again.
 - **Model files downloaded another way** (a download manager, another PC, a Hugging Face cache): `./maya.sh --import-model FOLDER`
   finds Maya's files in FOLDER by size and checksum, whatever they are called, and moves them into place (`--copy` when
