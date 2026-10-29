@@ -426,12 +426,8 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
-// MMQ reads whole column tiles of row ids (up to 128 each) without checking them against the group's last row: the
-// product past the chunk's last row when the last group's tile is not full, its stream-k fixup up to about two tiles -
-// so the id table carries readable entries after its T * K (issue #645: 2 GPUs, 2048-token chunks, compute-sanitizer
-// flagged mul_mat_q reading up to 80 ids and the fixup ~190 past the table's end, which a card where the next page is
-// not mapped turns into "an illegal memory access").  The values there are never used.
-constexpr size_t MMQ_IDS_PAD = 512;
+// the id table carries readable entries after its T * K: MMQ reads whole tiles of ids past the last row (see IDS_PAD)
+constexpr size_t MMQ_IDS_PAD = (size_t) mmq::IDS_PAD;
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
