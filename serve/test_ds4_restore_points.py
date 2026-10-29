@@ -104,13 +104,15 @@ class RestorePoints(unittest.TestCase):
         q2 = self.ids([{"role": "user", "content": DOC + "\nSum the figures of region 2."}])
         pts = self.points(q1)
         self.assertNotIn("shared", pts)                             # (no system prompt: the first turn is at the start)
-        self.assertEqual(pts["marks"], [len(q1) - 512])
+        # (its own key, tail=: the engine leaves it out where its read stop costs more than reading those tokens)
+        self.assertEqual(pts, {"tail": len(q1) - 512})
         self.assertGreaterEqual(lcp(q1, q2), len(q1) - 512)          # (a new question goes back to it)
         self.assertEqual(self.points(q1, tail=0), {})
-        self.assertEqual(self.points(q1, tail=300)["marks"], [len(q1) - 300])
+        self.assertEqual(self.points(q1, tail=300)["tail"], len(q1) - 300)
         # a short last message: the boundary alone (a tail point before it would be a read cut for nothing)
         pts = self.points(self.ids(self.chat()))
         self.assertEqual(len(pts["marks"]), 1)
+        self.assertNotIn("tail", pts)
 
     def test_short_prompts_and_literal_markers(self):
         self.assertEqual(self.points(self.ids([{"role": "user", "content": "Hi"}])), {})
@@ -123,7 +125,7 @@ class RestorePoints(unittest.TestCase):
             self.assertEqual(literal[p], self.svc.ds_user_id)
         self.assertEqual(sum(1 for t in literal if t == self.svc.ds_user_id), 2)
         self.assertEqual(literal.count(self.svc.ds_system_id), 1)   # (the system prompt's own, at the start)
-        self.assertEqual(self.points(literal)["marks"][-1], len(literal) - 512)   # (the tail: inside the long message)
+        self.assertEqual(self.points(literal)["tail"], len(literal) - 512)   # (the tail: inside the long message)
 
     def test_tool_results_and_a_later_system_message(self):
         call = {"id": "a", "type": "function", "function": {"name": "lookup", "arguments": '{"q": "x"}'}}
@@ -171,7 +173,9 @@ class RestorePoints(unittest.TestCase):
         self.assertIn(f"shared={pts['shared']}", StrataEngine.sampling_keys({**sampling, "temperature": 0.7}).split())
         # MAYA_DS4_RESTORE_TAIL moves the tail point
         _, sampling = self.run_request([{"role": "user", "content": DOC}], {ON: "4", TAIL: "100"})
-        self.assertEqual(sampling["_restore"]["marks"], [len(self.engine.last_prompt) - 100])
+        self.assertEqual(sampling["_restore"]["tail"], len(self.engine.last_prompt) - 100)
+        self.assertNotIn("marks", sampling["_restore"])
+        self.assertIn(f"tail={len(self.engine.last_prompt) - 100}", StrataEngine.sampling_keys(sampling).split())
 
     def test_off_with_0_and_never_the_clients_own(self):
         _, on = self.run_request(self.chat(), {})   # (on by default)
@@ -180,6 +184,7 @@ class RestorePoints(unittest.TestCase):
         self.assertNotIn("_restore", off)
         self.assertNotIn("marks=", StrataEngine.sampling_keys(off))
         self.assertNotIn("shared=", StrataEngine.sampling_keys(off))
+        self.assertNotIn("tail=", StrataEngine.sampling_keys(off))
         # the line with the setting off is the line without this feature (the keys of the request's own sampling)
         self.assertEqual(StrataEngine.sampling_keys(off), StrataEngine.sampling_keys({}))
         # a client's own `_restore` never reaches the engine

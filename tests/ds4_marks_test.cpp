@@ -17,6 +17,7 @@ using strata::ds4::mark_plan;
 using strata::ds4::mark_victim;
 using strata::ds4::MarkAt;
 using strata::ds4::MarkUse;
+using strata::ds4::TailCost;
 
 namespace {
 
@@ -250,6 +251,36 @@ int main() {
         cv.prompt(cat(sys, run(7000, 50)));   // (differs right after the shared start)
         for (const MarkUse& m : cv.mk) assert(m.pos <= 3000);
         for (int64_t c : cv.ck) assert(c < 0 || c <= cv.pos());
+    }
+    {   // the tail point's cost (#668): kept until measured; left out where its run's picks cost more than twice the
+        // long run's (most experts on the CPU lane: the short run is nearly a whole pass over them); probed again
+        TailCost tc;
+        assert(tc.keep() && !tc.measured());
+        assert(!tc.add(1000.0, 100000, 2000, 50.0, 2000, 512));     // (too short before the point to be a long run)
+        assert(!tc.add(0.0, 100000, 19000, 50.0, 2000, 512));       // (nothing timed)
+        assert(tc.add(1000.0, 100000, 19000, 25.0, 2000, 512));     // 1.25x: a GPU that holds the experts
+        assert(tc.keep() && !tc.costly());
+        assert(tc.add(1000.0, 100000, 19000, 30.0, 2000, 512));
+        assert(tc.measured() && !tc.costly());
+        for (int i = 0; i < 100; ++i) assert(tc.keep());
+        TailCost cpu;
+        assert(cpu.add(18000.0, 100000, 19000, 3000.0, 2000, 512));   // 8.3x: the CPU lane's pass
+        assert(cpu.keep());                                           // (one read: not decided yet)
+        assert(cpu.add(18000.0, 100000, 19000, 2800.0, 2000, 512));
+        assert(cpu.costly());
+        int kept = 0;
+        for (int i = 0; i < 64; ++i) kept += cpu.keep(32);
+        assert(kept == 2);                                            // (one in 32: measured again)
+        // the PC changed (more experts in VRAM): the probes' cheap runs bring it back
+        assert(cpu.add(1000.0, 100000, 19000, 20.0, 2000, 512) && cpu.add(1000.0, 100000, 19000, 20.0, 2000, 512));
+        assert(cpu.add(1000.0, 100000, 19000, 20.0, 2000, 512) && !cpu.costly() && cpu.keep());
+        // three pipeline stages: a one-chunk run goes through them one after another (3.75x a pick: 1.25x a stage)
+        TailCost three;
+        assert(three.add(1000.0, 100000, 19000, 75.0, 2000, 512, 3) && three.add(1000.0, 100000, 19000, 75.0, 2000, 512, 3));
+        assert(three.measured() && !three.costly());
+        TailCost one;   // (the same times on one GPU: costly)
+        assert(one.add(1000.0, 100000, 19000, 75.0, 2000, 512, 1) && one.add(1000.0, 100000, 19000, 75.0, 2000, 512));
+        assert(one.costly());
     }
     std::printf("ds4_marks_test: ok\n");
     return 0;

@@ -623,10 +623,11 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int], window_s: flo
 
 
 # MAYA_DS4_RESTORE_POINTS (4): the DeepSeek engine keeps restore points where a later prompt is likely to leave this
-# one - its GEN line carries marks=<pos>,... and shared=<pos> - besides the end of the last prompt, the position before
-# it and the anchor it keeps anyway.  N (1-16) turns them on, and is also the engine's cap a conversation (it reads the
-# same setting); 0: no keys, every GEN line as before.  MAYA_DS4_RESTORE_TAIL (512): how far before the
-# prompt's end the tail point sits (0: none).
+# one - its GEN line carries marks=<pos>,..., tail=<pos> and shared=<pos> - besides the end of the last prompt, the
+# position before it and the anchor it keeps anyway.  N (1-16) turns them on, and is also the engine's cap a
+# conversation (it reads the same setting); 0: no keys, every GEN line as before.  MAYA_DS4_RESTORE_TAIL (512): how far
+# before the prompt's end the tail point sits (0: none); it goes as tail=, not in marks=, because the engine leaves it
+# out where its read stop costs more than reading those tokens again (most experts outside VRAM, #668).
 RESTORE_LEAST = 1024        # no point before this many tokens: such a start is read again in about the time a point costs
 
 
@@ -643,14 +644,14 @@ def restore_point_settings(env=None) -> tuple[bool, int]:
 
 
 def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTORE_LEAST) -> dict:
-    """Where the DeepSeek engine keeps restore points for this prompt -> {"marks": [pos, ...], "shared": pos} (either
-    may be missing; {}: none).  From the prompt's ids as the template wrote them: a turn opens with its role's special
+    """Where the DeepSeek engine keeps restore points for this prompt -> {"marks": [pos, ...], "tail": pos, "shared":
+    pos} (any may be missing; {}: none).  From the prompt's ids as the template wrote them: a turn opens with its role's special
     token (<｜User｜>, a tool result's turn too; <｜System｜> for a system message after the first user turn), and text
     inside a message never encodes to one (render_ids), so the positions are the template's own.
 
     - the start of the last user turn: its last message edited, or sent again after another answer, goes back there;
-    - `tail` tokens before the end, when the last turn is longer than that: a new question after the same long document
-      in the same message;
+    - "tail": `tail` tokens before the end, when the last turn is longer than that: a new question after the same long
+      document in the same message (the engine keeps it where its read stop costs less than reading those tokens);
     - "shared": the end of the system prompt and its tools (the first user turn): another conversation behind the same
       start goes back there, and the engine gives that point up last.
     Positions under `least` are left out: a start that short is read again in about the time a point costs."""
@@ -670,7 +671,7 @@ def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTOR
         marks.append(last)
     t = len(ids) - tail
     if tail > 0 and t >= least and (last is None or t > last):
-        marks.append(t)
+        out["tail"] = t
     if marks:
         out["marks"] = sorted(marks)
     return out
@@ -1138,16 +1139,19 @@ class StrataEngine:
 
     @staticmethod
     def restore_keys(sampling: dict) -> str:
-        """`marks=<pos>,...` and `shared=<pos>`: the DeepSeek engine's restore points for this prompt (Service.run puts
-        them in `_restore` with MAYA_DS4_RESTORE_POINTS; no other engine gets them).  "" without: the line as before."""
+        """`marks=<pos>,...`, `tail=<pos>` and `shared=<pos>`: the DeepSeek engine's restore points for this prompt
+        (Service.run puts them in `_restore` with MAYA_DS4_RESTORE_POINTS; no other engine gets them).  "" without: the
+        line as before."""
         pts = sampling.get("_restore")
         if not isinstance(pts, dict):
             return ""
-        marks = [p for p in pts.get("marks") or () if isinstance(p, int) and not isinstance(p, bool) and p > 0]
-        shared = pts.get("shared")
+
+        def pos(v):
+            return isinstance(v, int) and not isinstance(v, bool) and v > 0
+        marks = [p for p in pts.get("marks") or () if pos(p)]
+        tail, shared = pts.get("tail"), pts.get("shared")
         return ((" marks=" + ",".join(str(p) for p in marks) if marks else "") +
-                (f" shared={shared}" if isinstance(shared, int) and not isinstance(shared, bool) and shared > 0
-                 else ""))
+                (f" tail={tail}" if pos(tail) else "") + (f" shared={shared}" if pos(shared) else ""))
 
     @staticmethod
     def logprob_key(sampling: dict) -> str:

@@ -496,6 +496,9 @@ struct Req {
     // prompt that leaves this one past one of them goes back there (ds4_marks.hpp); none: as before
     std::vector<int64_t> marks;
     long long shared = -1;
+    // tail=<pos>: the point near the prompt's tail (MAYA_DS4_RESTORE_TAIL), kept as the marks are unless its read stop
+    // costs more on this PC than reading its tokens again (TailCost, ds4_marks.hpp); -1: none
+    long long tail = -1;
     // logprobs=<k> (0 .. 20; the server's OpenAI logprobs / top_logprobs): after each T line an LP line - the token's
     // logprob and its row's k most likely (ds4_logprobs.hpp); -1: none, the request exactly as without
     int logprobs = -1;
@@ -623,6 +626,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
             for (int x : parse_ids(v))
                 if (x > 0) r.marks.push_back(x);
         } else if (k == "shared") r.shared = std::atoll(v.c_str());
+        else if (k == "tail") r.tail = std::atoll(v.c_str());
         else if (k == "logprobs") {
             const int n = std::atoi(v.c_str());
             r.logprobs = n < 0 ? -1 : std::min(n, strata::ds4::kTopLogprobs);
@@ -1257,7 +1261,18 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::vector<Pic> pics;
         std::vector<strata::ds4::MarkAt> cuts;   // the restore points the read stops at (ds4_marks.hpp)
         size_t next_cut = 0;                     // (the next of them)
+        // the tail point the read stops at (-1: none) and what the read spent before it and after it (TailCost)
+        int64_t tail_at = -1;
+        double ms_main = 0.0, ms_tail = 0.0;
+        int64_t picks_main = 0, picks_tail = 0;
     };
+    // MAYA_DS4_RESTORE_TAIL_AUTO (1): the tail point is left out where its cost is measured higher than reading its
+    // tokens again; 0: kept on every read that reaches it, as before
+    static const bool tail_auto = [] {
+        const char* v = std::getenv("MAYA_DS4_RESTORE_TAIL_AUTO");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    strata::ds4::TailCost tail_cost;
     const auto prompt_begin = [&](Req& r, bool geni, const std::string& tag, Prompt& P) -> bool {
         const double t0 = now_ms();
         P.t0 = t0;
@@ -1391,10 +1406,30 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // between the point and the prompt's end, when that is less
         std::vector<strata::ds4::MarkAt>& cuts = P.cuts;
         cuts.clear();
-        if ((!r.marks.empty() || r.shared >= 0) && m.marks_cap() > 0) {
+        P.tail_at = -1;
+        P.ms_main = P.ms_tail = 0.0;
+        P.picks_main = P.picks_tail = 0;
+        // the tail point (tail=): only where the read reaches it, and - once two reads measured it - where its run
+        // costs no more than reading its tokens again (TailCost: most experts outside VRAM make it a whole pass)
+        std::vector<int64_t> asked = r.marks;
+        if (r.tail > (long long) from && r.tail < (long long) r.ids.size() - 1 && m.marks_cap() > 0) {
+            const bool was = tail_cost.costly();
+            if (!tail_auto || tail_cost.keep()) asked.push_back(r.tail);
+            static bool said_off = false;
+            if (tail_auto && was && !said_off) {
+                std::fprintf(stderr, "maya ds4 serve: the tail restore point is left out on this PC: its read stop cost "
+                                     "%.1fx a long read's time for its tokens (more than reading them again: most experts "
+                                     "outside VRAM); one in 32 still keeps it, to measure again "
+                                     "(MAYA_DS4_RESTORE_TAIL_AUTO=0 keeps it always)\n", tail_cost.ratio);
+                said_off = true;
+            }
+        }
+        if ((!asked.empty() || r.shared >= 0) && m.marks_cap() > 0) {
             std::vector<std::pair<int64_t, int64_t>> spans;
             for (const Pic& q : pics) spans.push_back({q.start, (int64_t) q.len});
-            cuts = strata::ds4::mark_plan(r.marks, r.shared, (int64_t) from, (int64_t) r.ids.size(), m.marks_cap(), 16, spans);
+            cuts = strata::ds4::mark_plan(asked, r.shared, (int64_t) from, (int64_t) r.ids.size(), m.marks_cap(), 16, spans);
+            for (const strata::ds4::MarkAt& c : cuts)
+                if (c.pos == (int64_t) r.tail && c.pos > (int64_t) from) P.tail_at = c.pos;   // (the plan kept it there)
             static bool said = false;
             if (!said)
                 std::fprintf(stderr, "maya ds4 serve: restore points a request asks for: up to %d a conversation, "
@@ -1448,6 +1483,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
             const bool fin = P.done + n == total;
             size_t took = n;   // (fewer: a yield - the model ended the run early, the rest a later piece's)
+            const double f0 = P.tail_at >= 0 ? now_ms() : 0.0;   // (TailCost: the run's time and expert picks)
+            const int64_t e0 = P.tail_at >= 0 ? m.stats().experts : 0;
             if (fin && last_window) {
                 ok = (n < 2 || m.feed(r.ids.data() + P.done, (int) n - 1, 0, err));
                 if (ok && n >= 2 && (size_t) m.fed() < n - 1) took = (size_t) m.fed();
@@ -1459,6 +1496,20 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 ok = fin ? m.feed_mark(r.ids.data() + P.done, (int) n, 1, 1, err)
                          : m.feed(r.ids.data() + P.done, (int) n, 0, err, (int) (upto - P.done - n));
                 if (ok) took = (size_t) m.fed();
+            }
+            if (ok && P.tail_at >= 0) {
+                const bool after = P.done >= (size_t) P.tail_at;
+                (after ? P.ms_tail : P.ms_main) += now_ms() - f0;
+                (after ? P.picks_tail : P.picks_main) += m.stats().experts - e0;
+                if (after && P.done + took == total && tail_auto) {   // (the read's end: its cost measured)
+                    const bool was = tail_cost.costly(), known = tail_cost.measured();
+                    if (tail_cost.add(P.ms_main, P.picks_main, (size_t) P.tail_at - from, P.ms_tail, P.picks_tail,
+                                      total - (size_t) P.tail_at, m.pipeline_stages()) &&
+                        ((was && !tail_cost.costly()) || (!known && tail_cost.measured() && !tail_cost.costly())))
+                        std::fprintf(stderr, "maya ds4 serve: the tail restore point is kept%s: its read stop costs %.1fx "
+                                             "a long read's time for its tokens (2x or less: no more than reading them "
+                                             "again)\n", was ? " again" : "", tail_cost.ratio);
+                }
             }
             P.done += took;
             beat();

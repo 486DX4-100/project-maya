@@ -1399,7 +1399,12 @@ keep the state at three more places of each prompt it reads:
 
 - the start of the last user turn (a tool result's turn too): an edited or retried last message reads only itself;
 - 512 tokens before the prompt's end, when the last turn is longer than that: a new question after the same document,
-  in the same message, reads those 512 tokens and itself;
+  in the same message, reads those 512 tokens and itself. The read stops there, so those tokens are a run of their own;
+  where most experts are not in VRAM that short run costs nearly a whole pass over them, on the CPU lane or lent to the
+  GPU's prompt path (#668: a ~20K-token prompt read ~13% slower on one GPU with 91% of the experts on the CPU lane; one
+  V100 with 12% of the experts in VRAM: ~11%). The engine measures it on the reads that keep
+  the point - the time an expert pick takes in that run against the rest of the read - and leaves the point out while
+  it costs more than reading those tokens again; one read in 32 still keeps it, to measure again;
 - the end of the system prompt and its tools (the first user turn), given up last: another conversation behind the same
   start reads only its own part.
 
@@ -1419,6 +1424,7 @@ the first read of the chat 16.7 -> 17.7 s.
 | --- | --- | --- |
 | `MAYA_DS4_RESTORE_POINTS` | 4 | `N` (1-16): the server asks for the points, and the engine keeps up to N a conversation besides its three - the least recently used gives way, the shared start last - in RAM, in every conversation it holds and in every kept conversation's slot; `0`: no GEN line carries them, the engine as before |
 | `MAYA_DS4_RESTORE_TAIL` | 512 | how many tokens before the prompt's end the tail point sits; `0`: no tail point |
+| `MAYA_DS4_RESTORE_TAIL_AUTO` | 1 | the engine leaves the tail point out where it measured its cost higher than reading its tokens again (above); `0`: kept on every read, as before |
 
 ## DeepSeek: tensor parallel groups of 3 with a GGUF pack (experimental)
 

@@ -70,6 +70,48 @@ inline std::vector<MarkAt> mark_plan(const std::vector<int64_t>& asked, int64_t 
     return out;
 }
 
+// The tail point's cost on this PC (the server's tail=<pos>, MAYA_DS4_RESTORE_TAIL; #668).  The read stops there, so
+// the tokens after it are a run of their own: where most experts are not in VRAM, that short run costs nearly a whole
+// pass over them (each expert's weights read for a few rows - on the CPU lane, or lent to the GPU's prompt path one
+// run at a time), seconds on a long prompt that a single run did not spend.  Measured on the reads that kept the
+// point - the time a routed expert pick took in the run after it against the runs before it (a pick: a row through a
+// layer's experts; the long-prompt skip's rows have none, so the two compare like for like), over the split's pipeline
+// stages (`stages`: a run of one chunk goes through them one after another, as a single run's last chunk does; a long
+// run keeps them all busy) - the point costs what its run spends beyond those picks at that rate.  It is kept while
+// that is no more than reading its tokens again (the tail run's picks at that rate): a ratio of 2 or less.  Until two
+// reads have measured it the point is kept, and one tail point in `probe` is kept while it is left out, to measure
+// again (the cost moves with the experts the PC holds in VRAM).  Pure logic (tests/ds4_marks_test.cpp).
+struct TailCost {
+    int n = 0;              // the reads measured
+    double ratio = 0.0;     // their tail run's time a pick over the rest of the read's (over the stages), a running
+                            // mean (the last two halves: the first read after a start is slow everywhere)
+    int left_out = 0;       // tail points left out since the last one kept
+    static constexpr double kKeepAt = 2.0;
+    // a read that kept the point: its runs before it (ms, picks) and its run after it (ms, picks).  A read too short
+    // before the point to be a long run's rate (`tail_tokens` x 4 tokens or fewer) is not counted: false
+    bool add(double ms_main, int64_t picks_main, size_t main_tokens, double ms_tail, int64_t picks_tail,
+             size_t tail_tokens, int stages = 1) {
+        if (!(ms_main > 0.0) || !(ms_tail > 0.0) || picks_main <= 0 || picks_tail <= 0 || main_tokens <= 4 * tail_tokens)
+            return false;
+        const double r = (ms_tail / (double) picks_tail) / (ms_main / (double) picks_main) / (double) std::max(1, stages);
+        ratio = n == 0 ? r : 0.5 * (ratio + r);
+        ++n;
+        left_out = 0;
+        return true;
+    }
+    bool measured() const { return n >= 2; }
+    bool costly() const { return measured() && ratio > kKeepAt; }
+    // keep the next tail point?  (a point left out counts towards the next probe)
+    bool keep(int probe = 32) {
+        if (!costly()) return true;
+        if (++left_out >= probe) {
+            left_out = 0;
+            return true;
+        }
+        return false;
+    }
+};
+
 // a kept restore point as the choice of the one to give up sees it
 struct MarkUse {
     int64_t pos = 0;
