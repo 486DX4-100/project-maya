@@ -4499,12 +4499,7 @@ void Glm5Model::fast_service() {
                     return std::max(1, std::min(16, v ? std::atoi(v) : 8));
                 }();
                 const int rch = F->read_chunks > 0 ? F->read_chunks : rch_env;
-                F->workers->run(nr * 3 * rch, [&](int job) {
-                    const int m = rd[job / (3 * rch)], part = job % (3 * rch);
-                    fast_read_part(il, ids[mi[m]], part / rch, dst[m], part % rch, rch);
-                });
-                for (int i = 0; i < ns; ++i) F->rload[(size_t) cls][(size_t) sl[i]].store(stv[i], std::memory_order_release);
-                if (nw > 0) {
+                const auto wait_ahead = [&] {   // the lookahead's reads in flight for this route land outside its jobs
                     const auto tw = std::chrono::steady_clock::now();
                     for (int i = 0; i < nw; ++i)
                         while ((F->rload[(size_t) cls][(size_t) wt[i]].load(std::memory_order_acquire) & 3u) != 2u)
@@ -4513,17 +4508,72 @@ void Glm5Model::fast_service() {
                     F->ah_wait_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                                 std::chrono::steady_clock::now() - tw).count(),
                                             std::memory_order_relaxed);
-                }
+                };
+                // STRATA_GLM_STREAM_FETCH=1 (zephel01/Abyss d626d96, mw00 #570): the answer goes out BEFORE the reads,
+                // each read job sets its chunk's bit of ready[] once the chunk is in the slot, and the device's fetch
+                // copies the chunks as they land - the PCIe pull runs behind the SSD read instead of after it.  The
+                // same bytes reach the same slots (the output is unchanged).  GGUF packs only (EXL3's chunks are laid
+                // out differently), and at most 10 chunks a part (32 bits a ready word).
+                static const bool stream_env = [] {
+                    const char* v = getenv("STRATA_GLM_STREAM_FETCH");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                const bool stream = stream_env && nr > 0 && 3 * rch <= 32 && pack_layers_[(size_t) il].x_cb < 0;
                 gf::MoeResponse* Rp = F->resp_h;
-                Rp->ptr_mask = 0;
-                Rp->n_upd = 0;
-                Rp->cpu = 0;
-                for (int m = 0; m < nm; ++m) {
-                    Rp->ptr[mi[m]] = (unsigned long long) dst[m];
-                    Rp->ptr_mask |= 1u << mi[m];
+                if (stream) {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        std::fprintf(stderr, "glm fast: CUDA%d disk misses stream to the GPU behind their reads "
+                                     "(STRATA_GLM_STREAM_FETCH, %d chunks a part)\n", dev_, rch);
+                    }
+                    if (nw > 0) wait_ahead();
+                    const auto& Lys = F->L[(size_t) il];
+                    Rp->ptr_mask = 0;
+                    Rp->n_upd = 0;
+                    Rp->cpu = 0;
+                    Rp->stream_mask = 0;
+                    Rp->s_gu = (unsigned long long) Lys.gu_bytes;
+                    Rp->s_dn = (unsigned long long) Lys.dn_bytes;
+                    Rp->s_chunks = rch;
+                    for (int m = 0; m < nm; ++m) {
+                        Rp->ptr[mi[m]] = (unsigned long long) dst[m];
+                        Rp->ptr_mask |= 1u << mi[m];
+                        Rp->ready[mi[m]] = 0xffffffffu;   // (landed already)
+                    }
+                    for (int r2 = 0; r2 < nr; ++r2) {
+                        Rp->ready[mi[rd[r2]]] = 0u;
+                        Rp->stream_mask |= 1u << mi[rd[r2]];
+                    }
+                    std::atomic_thread_fence(std::memory_order_release);
+                    Rp->seq = next;
                 }
-                std::atomic_thread_fence(std::memory_order_release);
-                Rp->seq = next;
+                F->workers->run(nr * 3 * rch, [&](int job) {
+                    const int m = rd[job / (3 * rch)], part = job % (3 * rch);
+                    fast_read_part(il, ids[mi[m]], part / rch, dst[m], part % rch, rch);
+                    if (stream) {   // the chunk is in the slot: its bit tells the fetch kernel
+                        // (the .cu files build as C++17: no std::atomic_ref - a lock-free atomic over the same word)
+                        static_assert(sizeof(std::atomic<unsigned int>) == sizeof(unsigned int) &&
+                                      std::atomic<unsigned int>::is_always_lock_free, "ready word");
+                        std::atomic_thread_fence(std::memory_order_release);
+                        reinterpret_cast<std::atomic<unsigned int>*>(&Rp->ready[mi[m]])
+                            ->fetch_or(1u << part, std::memory_order_release);
+                    }
+                });
+                for (int i = 0; i < ns; ++i) F->rload[(size_t) cls][(size_t) sl[i]].store(stv[i], std::memory_order_release);
+                if (!stream) {
+                    if (nw > 0) wait_ahead();
+                    Rp->ptr_mask = 0;
+                    Rp->n_upd = 0;
+                    Rp->cpu = 0;
+                    Rp->stream_mask = 0;
+                    for (int m = 0; m < nm; ++m) {
+                        Rp->ptr[mi[m]] = (unsigned long long) dst[m];
+                        Rp->ptr_mask |= 1u << mi[m];
+                    }
+                    std::atomic_thread_fence(std::memory_order_release);
+                    Rp->seq = next;
+                }
                 const uint64_t us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                         std::chrono::steady_clock::now() - t0).count();
                 F->disk_reads.fetch_add((uint64_t) nr, std::memory_order_relaxed);   // read here (not ahead)

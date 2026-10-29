@@ -345,6 +345,13 @@ struct MoeResponse {
     volatile unsigned int seq;
     unsigned int ptr_mask;            // plan entries the host made resident: ptr[i] valid
     unsigned long long ptr[8];
+    // STRATA_GLM_STREAM_FETCH=1: entries in stream_mask were posted before their disk reads finished; ready[i] gets
+    // bit (part * s_chunks + chunk) as each chunk lands in ptr[i] (fast_read_part's layout: gate 0, up s_gu, down
+    // 2 s_gu), and the fetch kernels copy each chunk once its bit is set (zephel01/Abyss d626d96, mw00 #570)
+    unsigned int stream_mask;
+    unsigned int ready[8];
+    unsigned long long s_gu, s_dn;
+    int s_chunks;
     int n_upd;                        // table updates: tab[key] = val
     int upd_key[64];
     unsigned long long upd_val[64];

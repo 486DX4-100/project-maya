@@ -4339,11 +4339,76 @@ __global__ void __launch_bounds__(256) moe_prefetch_kernel(MoeDev d, size_t n16)
     }
 }
 
+// STRATA_GLM_STREAM_FETCH: the response's streamed entries (posted before their disk reads finished).  0 when the
+// route had no disk misses, or the answer is not this route's (a wait that gave up).
+__device__ unsigned int moe_stream_mask(const MoeDev& d) {
+    if (d.wait_seq == nullptr || d.resp == nullptr) return 0u;
+    const unsigned int need = *(volatile const unsigned int*) d.wait_seq;
+    if (need == 0u) return 0u;
+    const volatile MoeResponse* r = (const volatile MoeResponse*) d.resp;
+    return r->seq == need ? r->stream_mask : 0u;
+}
+
+// entry i of a streamed response: each chunk copied from its RAM landing slot once the host's read of it set its
+// ready bit (part * n + chunk, fast_read_part's layout), so the PCIe pull runs behind the SSD read instead of after
+// it (zephel01/Abyss d626d96).  Block b takes the chunks b modulo their count; with more blocks than chunks each chunk
+// is split between them.  A bit that never comes gives up after ~60 s like moe_wait.  (Every value deciding this
+// block's path is the same for all its threads: the __syncthreads below are reached by all or none.)
+__device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_t* t) {
+    const volatile MoeResponse* r = (const volatile MoeResponse*) d.resp;
+    const int rch = r->s_chunks;
+    const unsigned long long gu = r->s_gu, dn = r->s_dn;
+    const int nb = 3 * rch, G = (int) gridDim.x, b = (int) blockIdx.x;
+    const bool split = G >= nb;
+    const int nsub = split ? G / nb : 1, sub = split ? b / nb : 0;
+    if (nb <= 0 || sub >= nsub) return;
+    for (int bit = split ? b % nb : b; bit < nb; bit += split ? nb : G) {
+        const int part = bit / rch, c = bit % rch;
+        const unsigned long long len = part == 2 ? dn : gu;
+        const unsigned long long piece = ((len + (unsigned long long) rch - 1) / rch + 4095ull) & ~4095ull;
+        const unsigned long long c0 = min(len, (unsigned long long) c * piece), c1 = min(len, c0 + piece);
+        if (c1 <= c0) continue;
+        const unsigned long long n = c1 - c0, per = ((n + nsub - 1) / nsub + 15ull) & ~15ull;
+        const unsigned long long a0 = min(n, (unsigned long long) sub * per), a1 = min(n, a0 + per);
+        if (a1 <= a0) continue;
+        if (threadIdx.x == 0) {
+            const long long t0 = clock64();
+            while (((r->ready[i] >> bit) & 1u) == 0u) {
+                if (clock64() - t0 > (1ll << 36)) break;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                __nanosleep(128);   // (fewer polls over PCIe beside the copies)
+#endif
+            }
+            __threadfence_system();
+        }
+        __syncthreads();
+        const unsigned long long off = (part == 0 ? 0ull : part == 1 ? gu : 2ull * gu) + c0 + a0;
+        const uint8_t* sp = s + off;
+        uint8_t* tp = t + off;
+        const size_t nbytes = (size_t) (a1 - a0);
+        if ((((unsigned long long) sp | (unsigned long long) tp) & 15ull) == 0ull) {
+            const size_t m16 = nbytes / 16;
+            for (size_t j = threadIdx.x; j < m16; j += blockDim.x) ((uint4*) tp)[j] = ((const uint4*) sp)[j];
+            for (size_t j = m16 * 16 + threadIdx.x; j < nbytes; j += blockDim.x) tp[j] = sp[j];
+        } else {
+            for (size_t j = threadIdx.x; j < nbytes; j += blockDim.x) tp[j] = sp[j];
+        }
+        __syncthreads();
+    }
+}
+
 // one block per SM, 16-byte loads: the PCIe pull measured 11.5 GB/s (a little over cudaMemcpy's 10.7)
 __global__ void __launch_bounds__(256) moe_fetch_kernel(MoeDev d, int k, size_t n16) {
+    __shared__ unsigned int s_sm;
+    if (threadIdx.x == 0) s_sm = moe_stream_mask(d);
+    __syncthreads();
     for (int i = 0; i < k; ++i) {
         const unsigned long long src = d.fetch_src[i];
         if (src == 0ull) continue;
+        if ((s_sm >> i) & 1u) {
+            moe_stream_copy(d, i, (const uint8_t*) src, (uint8_t*) d.plan_ptr[i]);
+            continue;
+        }
         const uint4* s = (const uint4*) src;
         uint4* t = (uint4*) d.plan_ptr[i];
         for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
@@ -4400,10 +4465,18 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
         __syncthreads();
     }
     if (tid < 8) s_src[tid] = tid < k ? ((volatile const unsigned long long*) d.fetch_src)[tid] : 0ull;
+    __shared__ unsigned int s_sm;   // STRATA_GLM_STREAM_FETCH's streamed entries (block 0 reset wait_seq: s_need)
+    if (tid == 0)
+        s_sm = s_need != 0u && d.resp != nullptr && ((volatile const MoeResponse*) d.resp)->seq == s_need
+                   ? ((volatile const MoeResponse*) d.resp)->stream_mask : 0u;
     __syncthreads();
     for (int i = 0; i < k; ++i) {
         const unsigned long long src = s_src[i];
         if (src == 0ull) continue;
+        if ((s_sm >> i) & 1u) {
+            moe_stream_copy(d, i, (const uint8_t*) src, (uint8_t*) d.plan_ptr[i]);
+            continue;
+        }
         const uint4* s = (const uint4*) src;
         uint4* t = (uint4*) d.plan_ptr[i];
         for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
