@@ -52,6 +52,7 @@
 #include "strata/core/prefix_cut.hpp"
 #include "strata/core/prefill_pieces.hpp"
 #include "strata/core/prefill_gaps.hpp"
+#include "strata/core/vram_mark.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -1762,6 +1763,13 @@ static int glm_pack_generate(const Options& o) {
     std::vector<DeferredPause> deferred_pauses;
     std::function<void()> gap_reset;
     std::chrono::steady_clock::time_point gap_mark;   // the read's start (after any restore), then each gap's end
+    // the GPUs the prompt-read line asks the free VRAM of: the ones the expert pool lives on (empty: every visible one)
+    const auto vram_devs = [&]() {
+        std::vector<int> d;
+        if (model.fast())
+            for (const auto& pv : model.pool_vram()) d.push_back(pv.dev);
+        return d;
+    };
     const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
                                  std::chrono::steady_clock::time_point& t0) -> int {
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
@@ -1840,6 +1848,7 @@ static int glm_pack_generate(const Options& o) {
             if (turn_on && last >= reuse && last < reuse + 512 && !have) ckpt_keep(prompt, reuse, true);
         }
         std::vector<float> lg;
+        const strata::core::VramMark vram0 = strata::core::vram_mark(vram_devs());   // (the line at the read's end)
         t0 = std::chrono::steady_clock::now();
         gap_mark = t0;   // (STRATA_GLM_PREFILL_GAPS: the first gap's stage starts with the read, not the restore)
         // the prompt one CHUNK at a time (PP reports per chunk: the server shows it and counts it as a heartbeat);
@@ -1995,6 +2004,13 @@ static int glm_pack_generate(const Options& o) {
                             (double) (i - reuse) / (ms / 1000.0 + 1e-9), reuse);
             }
             if (read_stopped()) { finish = "cancel"; break; }
+        }
+        {   // one line a prompt: the tokens read, the time, and the free VRAM before and after (issues #648, #438)
+            const std::string vt = strata::core::vram_mark_text(vram0, strata::core::vram_mark(vram_devs()));
+            if (!vt.empty())
+                std::fprintf(stderr, "glm vram: prompt %zu tokens read in %.1f s; %s\n",
+                             prompt.size() > reuse ? prompt.size() - reuse : (size_t) 0,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), vt.c_str());
         }
         return 0;
     };

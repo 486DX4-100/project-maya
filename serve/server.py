@@ -121,7 +121,7 @@ CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does n
 CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144}
 CONTEXT_TESTED_DEFAULT = 262144
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
-REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|"
+REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|ERR|error|"
                           r"failed|out of memory|WARNING", re.I)
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"

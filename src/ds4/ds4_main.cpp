@@ -29,6 +29,7 @@
 #include "ds4_model.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_watchdog.hpp"
+#include "strata/core/vram_mark.hpp"
 #include "strata/platform/env_alias.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -678,6 +679,8 @@ void start_watchdog(const strata::ds4::Model& m) {
         }
     }).detach();
 }
+
+std::vector<int> g_vram_gpus;   // --gpus (empty: every visible GPU): the cards the prompt line's free VRAM is asked of
 
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack,
           Lookup* lk, DraftCost* dc) {
@@ -1337,6 +1340,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // written)
     struct Prompt {
         double t0 = 0;
+        strata::core::VramMark v0;   // (the free VRAM when the read began: the prompt-read line at its end)
         strata::ds4::Stats s0;   // (the request's own CPU lane share)
         size_t from = 0;         // the tokens the state already held
         size_t done = 0;         // the prompt's tokens in the state so far
@@ -1360,6 +1364,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const auto prompt_begin = [&](Req& r, bool geni, const std::string& tag, Prompt& P) -> bool {
         const double t0 = now_ms();
         P.t0 = t0;
+        P.v0 = strata::core::vram_mark(g_vram_gpus);
         P.s0 = m.stats();
         std::vector<Pic>& pics = P.pics;
         {
@@ -1651,6 +1656,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         return true;
     };
     const auto prompt_end = [&](Prompt& P) {
+        {   // one line a prompt: the tokens read, the time, and the free VRAM before and after (issues #648, #438)
+            const std::string vt = strata::core::vram_mark_text(P.v0, strata::core::vram_mark(g_vram_gpus));
+            if (!vt.empty())
+                std::fprintf(stderr, "maya ds4 serve: prompt read: %zu tokens in %.1f s; %s\n",
+                             P.done > P.from ? P.done - P.from : (size_t) 0, (now_ms() - P.t0) / 1000.0, vt.c_str());
+        }
         m.set_images({});
         {   // the pictures the state holds: the prompt's, and those the state kept short of `from` (a turn that adds no
             // picture still holds the ones the history above it has)
@@ -3451,7 +3462,10 @@ int main(int argc, char** argv) {
                              "same tokens)\n");
     } else if (ds4_env("DS4_DRAFT_COST") != nullptr && std::atoi(ds4_env("DS4_DRAFT_COST")) != 0)
         std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: no DSpark drafter loaded, nothing to size\n");
-    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get(), dc.get());
+    if (serve_mode) {
+        g_vram_gpus = o.gpus;
+        return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get(), dc.get());
+    }
     if (!prof_run.empty()) return profile_run(m, prof_run, o.profile_out);
     if (!spec_eval_path.empty()) return spec_eval(m, spec_eval_path, n > 0 ? n : 256, temp, cli_seed);
     if (sampler_n > 0) {
