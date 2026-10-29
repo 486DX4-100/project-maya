@@ -4509,14 +4509,14 @@ void Glm5Model::fast_service() {
                                                 std::chrono::steady_clock::now() - tw).count(),
                                             std::memory_order_relaxed);
                 };
-                // STRATA_GLM_STREAM_FETCH=1 (zephel01/Abyss d626d96, mw00 #570): the answer goes out BEFORE the reads,
-                // each read job sets its chunk's bit of ready[] once the chunk is in the slot, and the device's fetch
-                // copies the chunks as they land - the PCIe pull runs behind the SSD read instead of after it.  The
-                // same bytes reach the same slots (the output is unchanged).  GGUF packs only (EXL3's chunks are laid
-                // out differently), and at most 10 chunks a part (32 bits a ready word).
+                // STRATA_GLM_STREAM_FETCH (on; =0 off - zephel01/Abyss d626d96, mw00 #570): the answer goes out BEFORE
+                // the reads, each read job sets its chunk's bit of ready[] once the chunk is in the slot, and the
+                // device's fetch copies the chunks as they land - the PCIe pull runs behind the SSD read instead of
+                // after it.  The same bytes reach the same slots (the output is unchanged).  GGUF packs only (EXL3's
+                // chunks are laid out differently), and at most 10 chunks a part (32 bits a ready word).
                 static const bool stream_env = [] {
                     const char* v = getenv("STRATA_GLM_STREAM_FETCH");
-                    return v != nullptr && std::atoi(v) != 0;
+                    return v == nullptr || std::atoi(v) != 0;
                 }();
                 const bool stream = stream_env && nr > 0 && 3 * rch <= 32 && pack_layers_[(size_t) il].x_cb < 0;
                 gf::MoeResponse* Rp = F->resp_h;
@@ -4525,7 +4525,7 @@ void Glm5Model::fast_service() {
                     if (!said) {
                         said = true;
                         std::fprintf(stderr, "glm fast: CUDA%d disk misses stream to the GPU behind their reads "
-                                     "(STRATA_GLM_STREAM_FETCH, %d chunks a part)\n", dev_, rch);
+                                     "(%d chunks a part; STRATA_GLM_STREAM_FETCH=0 turns it off)\n", dev_, rch);
                     }
                     if (nw > 0) wait_ahead();
                     const auto& Lys = F->L[(size_t) il];
