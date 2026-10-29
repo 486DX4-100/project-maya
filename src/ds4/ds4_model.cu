@@ -3175,9 +3175,22 @@ struct Model::Impl {
             CK(cudaSetDevice(d.id));
             // the layers' streams at the device's greatest priority: the expert cache's and the prompt path's other
             // streams (the least, the default) never hold a multiprocessor a layer's kernel could take.
-            // DS4_STREAM_PRIO=0: the default priority
-            static const bool prio_on =
-                std::getenv("DS4_STREAM_PRIO") == nullptr || std::atoi(std::getenv("DS4_STREAM_PRIO")) != 0;
+            // DS4_STREAM_PRIO=0: the default priority; =1: the greatest on every device. Unset: the greatest except on
+            // RDNA 2 (gfx103x, HIP), where a layer kernel waiting at the greatest priority for work queued at the least
+            // (on HIP a copy may run as a kernel on that queue) could stall a short prompt for many seconds or for good
+            // (#621, 2x / 4x Radeon PRO V620) - there every stream keeps the default priority, as before v1.1.31.
+            static const char* prio_env = std::getenv("DS4_STREAM_PRIO");
+            bool prio_on = prio_env == nullptr || std::atoi(prio_env) != 0;
+#if defined(STRATA_USE_HIP)
+            if (prio_env == nullptr) {
+                cudaDeviceProp prop{};
+                if (cudaGetDeviceProperties(&prop, d.id) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx103", 6) == 0) {
+                    prio_on = false;
+                    std::fprintf(stderr, "ds4: CUDA%d (%s): layer streams at the default priority (RDNA 2; "
+                                         "DS4_STREAM_PRIO=1 to raise them)\n", d.id, prop.gcnArchName);
+                }
+            }
+#endif
             int least = 0, greatest = 0;
             if (!prio_on || cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess) {
                 cudaGetLastError();
