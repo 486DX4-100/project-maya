@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define DS4_LP_HD __host__ __device__
 #else
 #define DS4_LP_HD
