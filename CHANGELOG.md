@@ -4,6 +4,59 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.39 - 2026-10-29
+
+DeepSeek reuses a shared system prompt across conversations (a new conversation's first token about 19x sooner),
+GLM decodes about 22% faster when it reads experts from the SSD, more Strix Halo builds read GLM prompts with a tuned
+table, and model files downloaded some other way can be imported.
+
+- **DeepSeek: a new conversation behind the same system prompt and tools answers about 19x sooner** (#607): the
+  engine keeps the state at the end of a system prompt and its tools apart from any one conversation (in RAM, about
+  20 MB for an 11K-token prompt with 12 tools), so a new chat, a sub-agent or another `--parallel` conversation reads
+  only its own part instead of the whole system prompt again. On one V100 with Maya-XS the first token came about 19x
+  sooner after an unrelated chat, and about 25x sooner with `--parallel 2` while another conversation was answering.
+- **GLM: decode about 22% faster when experts are read from the SSD** (#570, thanks @pschaub for the idea): an expert
+  read from the SSD now goes to the GPU piece by piece as it arrives instead of after the whole read. Measured on a
+  V100 PC whose RAM holds only part of the experts; a PC that holds every expert in RAM is unchanged.
+  `MAYA_GLM_STREAM_FETCH=0` turns it off.
+- **Strix Halo: GLM prompts about 1.9x faster on hipBLASLt 1.4.1 builds that rejected the shipped table** (#631,
+  thanks @mrsirg97-rgb): a second tuned table ships beside the first, and the engine now uses, for each prompt shape,
+  the first table the installed hipBLASLt accepts, so both AMD's Windows wheels and Linux ROCm 7.15 builds get a
+  tuned table. On Windows a table on another drive than the engine now loads too.
+- **Import model files downloaded some other way** (#666): `./maya.sh --import-model FOLDER` finds Maya's published
+  model files in a folder (any names, subfolders, a Hugging Face cache) by size and sha256, moves them into place
+  (`--copy` copies them instead) and says what is still missing. Files that do not match are never touched.
+- **Chat: the text-file limit follows the context** (#635): instead of a fixed 512 KB it goes from 512 KB to 16 MB
+  with the context; a file over it gets a message that names the context and where to raise it.
+- **DeepSeek: the prompt ring is sized by each GPU's link** (#609), measured at load: a slow PCIe link gets a smaller
+  ring and waits less for each batch, a fast link keeps the 400 MB it had.
+- **MiniMax setup: the recommended context counts where its KV cache lives** (#663): on a Windows APU with about
+  32 GB of RAM beside its GPU memory, and on a 24 GB card with 128 GB of RAM, it now suggests 128K instead of the 256K
+  that about halved the speed there. Other PCs, GLM, DeepSeek and Qwen are unchanged; `--context` still wins.
+- **Monitor on Windows + AMD** (#102): GPU load and memory are now shown, from Windows' own GPU counters.
+- Every prompt read logs one line for GLM and DeepSeek with the tokens read, the time and the free VRAM before and
+  after, per GPU (#648).
+- A stopped request is now drained to its end with one conversation (#603, thanks @merbanan; #536): a client that
+  went away during a long prompt read could make every later request get the answer of the one before.
+- DeepSeek: the restore point near a prompt's tail now leaves itself out where it costs more than it saves, so a fresh
+  long prompt on a PC with most experts outside VRAM is no longer about 13% slower than before v1.1.37; an edited last
+  message still restarts from the last user message (#668).
+- The thinking budget closes the reasoning at a sentence or line end instead of mid-word, and a malformed tool call
+  no longer fails the whole answer (#613).
+- DeepSeek on Radeon PRO V620 (gfx1030, 2 or 4 cards): short prompts no longer hang (#621).
+- DeepSeek on Windows with NVIDIA: a PC with a lot of RAM for copied experts no longer fails to start with
+  "cudaHostAlloc failed" (#589).
+- Qwen on 2 GPUs: no more "illegal memory access" on the first long prompt (#645); GLM's prompt path got the same
+  safety margin.
+- `--dump-logits` writes every row with a native (IQ) pack too (#658).
+- After an update, a shared build compiles the other model's engine before it starts (#665, thanks @tobitege; #664).
+- Windows ROCm wheels: the GPU library links a long folder path left out are made after setup (#574).
+- `CMAKE_CUDA_ARCHITECTURES=native` builds for the PC's compute GPUs, not a display card beside them (#56).
+- The GLM engine names the GLM settings set in the environment in one start-up line, with the value used where one
+  is clamped (#6).
+- Docs: running the Maya-XS DeepSeek GGUFs on Intel Arc with llama.cpp's SYCL backend (#401, thanks @Jumbomuffin777).
+- README: speed rows from community reports (#566 #577 #585 #586 #594 #614 #653 #659 #663) and a Sponsors section.
+
 ## v1.1.38 - 2026-10-29
 
 Qwen CYBER-FROST runs faster on PCs with little RAM, a new chat shows the model that answers it, and the web app's
