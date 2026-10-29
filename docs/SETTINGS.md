@@ -906,7 +906,7 @@ other types, MiniMax's kernels and AMD (HIP) are unchanged.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_IQ_PERSIST` | on (CUDA) | `0`: the full grids for IQ1_S / IQ1_M / IQ2_S as before (a block a tile, each loading the codebook); the same answers. `DS4_IQ_RP=4` or `DS4_IQ_AHEAD=1` also keep the full grids for the IQ1 types' token kernels |
+| `MAYA_DS4_IQ_PERSIST` | on (CUDA, compute capability 8.0 and up) | `0`: the full grids for IQ1_S / IQ1_M / IQ2_S as before (a block a tile, each loading the codebook); the same answers; `1` turns them on for older cards too (a V100 runs about 2% slower with them). `DS4_IQ_RP=4` or `DS4_IQ_AHEAD=1` also keep the full grids for the IQ1 types' token kernels |
 
 ## DeepSeek: IQ4_NL experts
 

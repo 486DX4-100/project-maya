@@ -1392,17 +1392,34 @@ const Iq1Var& iq1_var() {
     return v;
 }
 
-// the persistent grids (kPersist): DS4_IQ_PERSIST (MAYA_DS4_IQ_PERSIST, read as STRATA_DS4_IQ_PERSIST), on unless 0;
-// set_persist over it (tests)
+// the persistent grids (kPersist): DS4_IQ_PERSIST (MAYA_DS4_IQ_PERSIST, read as STRATA_DS4_IQ_PERSIST): 0 off, 1 on,
+// unset: on for a device of compute capability 8.0 and up (measured about 2% slower on a V100); set_persist over it (tests)
 std::atomic<int> g_persist_set{-1};
 #if DS4_IQ_PERSIST_BUILD
-bool persist_env() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_DS4_IQ_PERSIST");
-        if (v == nullptr) v = std::getenv("DS4_IQ_PERSIST");
-        return v == nullptr || std::atoi(v) != 0;
+int persist_env() {   // -1: not set
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_DS4_IQ_PERSIST");
+        if (e == nullptr) e = std::getenv("DS4_IQ_PERSIST");
+        return e == nullptr ? -1 : (std::atoi(e) != 0 ? 1 : 0);
     }();
-    return on;
+    return v;
+}
+// the current device's default: compute capability 8.0 and up
+bool persist_dev_default() {
+    static std::atomic<signed char> known[64];   // 0: not asked yet, 1: off, 2: on
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        v = major >= 8 ? 2 : 1;
+        known[dev].store((signed char) v, std::memory_order_relaxed);
+    }
+    return v == 2;
 }
 #endif
 // the token kernels' persistent form: their plain variant (RP 1, no early loads - DS4_IQ_RP=4 / DS4_IQ_AHEAD=1 keep
@@ -1714,7 +1731,9 @@ bool persist_on() {
     return false;
 #else
     const int t = g_persist_set.load(std::memory_order_relaxed);
-    return t >= 0 ? t != 0 : persist_env();
+    if (t >= 0) return t != 0;
+    const int e = persist_env();
+    return e >= 0 ? e != 0 : persist_dev_default();
 #endif
 }
 void set_persist(int on) { g_persist_set.store(on < 0 ? -1 : on != 0 ? 1 : 0, std::memory_order_relaxed); }
