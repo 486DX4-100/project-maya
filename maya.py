@@ -5536,10 +5536,12 @@ def qwen_kv_gb(ctx: int) -> float:
     return ctx * QWEN_KV_BYTES / 2**30
 
 
-def qwen_recommended_context(vram: float) -> int:
+def qwen_recommended_context(vram: float, starved: bool = False) -> int:
     """The context the setup recommends here: the largest whose KV cache takes at most ~12% of the VRAM (the rest stays
-    the experts' - a longer context makes every answer slower), at least the smallest."""
-    fits = [c for c in QWEN_CONTEXTS if qwen_kv_gb(c) <= 0.12 * vram]
+    the experts' - a longer context makes every answer slower), at least the smallest.  On a PC where VRAM and RAM
+    together cannot hold every expert (starved) the rest are read from the SSD, and every expert slot in VRAM saves
+    those reads - the KV cache then takes at most ~6% (a V100 32 GB with 30 GB of RAM: 128K, not 256K)."""
+    fits = [c for c in QWEN_CONTEXTS if qwen_kv_gb(c) <= (0.06 if starved else 0.12) * vram]
     return max(fits) if fits else QWEN_CONTEXTS[0]
 
 
@@ -5759,7 +5761,7 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     step(2, "your choices")                            # 2
     ok(f"model: {Q.shown('qwen', 'q5_k_m', m['download_gb'])} - a fine-tune of Qwen3.8-Flash-Next "
        "(Qwen Community License 1.0: LICENSE.qwen-community-1.0; a Model-as-a-Service business needs Qwen's own license)")
-    rec = qwen_recommended_context(vram)
+    rec = qwen_recommended_context(vram, vram + total < m["memory_gb"])
     ctx = choose_context(a, prev_ctx, QWEN_CONTEXTS, rec)
     ok(f"context: {ctx} tokens" + (" (recommended for this PC's VRAM)" if ctx == rec else "") +
        f"; its KV cache: {qwen_kv_gb(ctx):.1f} GB of VRAM")
