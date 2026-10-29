@@ -4525,7 +4525,7 @@ void Glm5Model::fast_service() {
                     if (!said) {
                         said = true;
                         std::fprintf(stderr, "glm fast: CUDA%d disk misses stream to the GPU behind their reads "
-                                     "(%d chunks a part; STRATA_GLM_STREAM_FETCH=0 turns it off)\n", dev_, rch);
+                                     "(%d chunks a part; MAYA_GLM_STREAM_FETCH=0 turns it off)\n", dev_, rch);
                     }
                     if (nw > 0) wait_ahead();
                     const auto& Lys = F->L[(size_t) il];

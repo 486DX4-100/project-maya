@@ -36,6 +36,9 @@ int main() {
     expect({"STRATA_GLM_PREFETCH_N=-1"}, "glm env: STRATA_GLM_PREFETCH_N=-1 (used: 0, at most kSpares-1)");
     expect({"MAYA_GLM_PREFILL_SUB=8", "STRATA_GLM_PREFETCH_N=0"},
            "glm env: STRATA_GLM_PREFETCH_N=0, MAYA_GLM_PREFILL_SUB=8 (used: 16, 16-8192)");
+    // the server's own vision setting is not a user setting
+    expect({"STRATA_GLM_VISION_LEND_MB=2048"}, "");
+    expect({"STRATA_GLM_VISION_LEND_MB=2048", "MAYA_GLM_SLOTS=4"}, "glm env: MAYA_GLM_SLOTS=4");
     // a prefix alone, or an entry without '=', is not a setting
     expect({"STRATA_GLM", "MAYA_GLMX=1", "STRATA_GLM_RAM_GB"}, "");
 

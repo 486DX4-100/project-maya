@@ -34,6 +34,7 @@ inline std::string env_report(char** env, const char* group, const char* what, c
         const char* rest = maya ? s + 5 : strata ? s + 7 : nullptr;
         if (rest == nullptr || rest >= eq || std::strncmp(rest, group, gl) != 0) continue;
         const std::string key(rest, eq), full(s, eq);
+        if (key == "GLM_VISION_LEND_MB") continue;   // the server sets it itself when vision is on, not the user
         auto it = set.find(key);
         if (it == set.end() || maya) set[key] = {full, std::string(eq + 1)};   // (MAYA_X wins, as env_aliases does)
     }
