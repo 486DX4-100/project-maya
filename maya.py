@@ -613,6 +613,16 @@ MM3_TESTED_CONTEXT = 262144                        # (past it: not run end to en
 # bytes BF16, 128 + 4 INT8 / FP8, 64 + 8 FP4); "K,V" mixes add K's half and V's half
 MM3_KV_BYTES = {"bf16": 122880, "int8": 63360, "fp8": 63360, "fp4": 34560}
 MM3_KV_FORMAT = "int8"                             # the format the engine uses when the config names none
+# VRAM a context takes with KV streaming: the ring of each layer's newest K / V (MM3_KV_RING positions, any context
+# past it) and every position's indexer key (60 layers x 128 dims in BF16) - the share of it that grows with the
+# context is bounded where it would push experts out of VRAM (mm3_context_limit: as Qwen's, 12% of the VRAM, 6% on a
+# PC that reads experts from the SSD)
+MM3_KV_RING = 32768
+MM3_INDEX_BYTES = 60 * 128 * 2
+# Windows on an APU (Strix Halo): the GPU's carve-out holds the model, and the pinned KV cache is GPU-visible RAM, which
+# Windows caps at half of the RAM it has (its "shared GPU memory") - the cache takes at most three quarters of that, the
+# rest left to the engine's other host buffers (#663: a 31.7 GB Radeon 8065S PC halved its decode with 256K's 15.5 GB)
+MM3_WIN_APU_KV_SHARE = 0.5 * 0.75
 # --parallel above 1: no KV streaming, every conversation's whole cache in VRAM (~61 KB a position with INT8) - the setup
 # recommends the context at which the caches take at most this share of the GPUs' memory, the rest left to the dense
 # weights and the expert pool (the engine shortens a context that does not fit, with a NOTE)
@@ -5217,28 +5227,65 @@ def mm3_kv_gb(ctx: int, fmt: str) -> float:
     return ctx * (half(k) + half(v or k)) / 2**30
 
 
-def mm3_recommended_context(vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB, parallel: int = 1) -> int:
-    """The context the setup recommends on this PC: the largest (up to MM3_TESTED_CONTEXT) whose KV cache fits in
-    what VRAM + RAM hold beyond the model (need: MM3_MEMORY_GB, a GGUF quant's own) - so the cache does not push experts
-    out of RAM - else the smallest; MM3_DEFAULT_CONTEXT when the RAM could not be read.  parallel: --parallel's
-    conversations (above 1: no KV streaming - each conversation's whole cache in VRAM, MM3_PARALLEL_VRAM_SHARE)."""
+def mm3_kv_vram_gb(ctx: int, fmt: str) -> float:
+    """GB of VRAM the KV cache takes at a context with KV streaming: the ring of the newest positions, the index keys."""
+    return mm3_kv_gb(min(ctx, MM3_KV_RING), fmt) + ctx * MM3_INDEX_BYTES / 2**30
+
+
+def apu_kind(gpus: list) -> str | None:
+    """"win" / "linux" when the GPUs include a unified-memory APU (hip_unified_memory: Strix Halo) on Windows / Linux,
+    else None.  Windows gives it a fixed carve-out (its VRAM) beside the RAM it counts; Linux's engine draws the GPU's
+    memory from the RAM, so there VRAM and RAM are one memory."""
+    if not any(hip_unified_memory(g) for g in gpus or []):
+        return None
+    return "win" if WIN else "linux"
+
+
+def mm3_context_limit(ctx: int, vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB,
+                      apu: str | None = None) -> str | None:
+    """Why a context's KV cache (streamed: all of it pinned in RAM, a ring and the index keys in VRAM) would cost speed
+    on this PC, None when it does not: "ram" - the pinned cache does not fit in the RAM the model leaves (a VRAM that has
+    room beyond the model does not hold it: the cache is in RAM); "shared" - a Windows APU, the cache past what Windows
+    maps for the GPU (MM3_WIN_APU_KV_SHARE of the RAM); "vram" - what the context adds in VRAM pushes experts out of it
+    beyond the share Qwen's context keeps (12% of the VRAM, 6% when VRAM + RAM do not hold the model; not on a Linux
+    APU, where the GPU's memory is the RAM)."""
+    kv = mm3_kv_gb(ctx, fmt)
+    if kv > ram - max(0.0, need - vram):
+        return "ram"
+    if apu == "win" and kv > MM3_WIN_APU_KV_SHARE * ram:
+        return "shared"
+    grown = mm3_kv_vram_gb(ctx, fmt) - mm3_kv_vram_gb(MM3_CONTEXTS[0], fmt)
+    if apu != "linux" and need + mm3_kv_vram_gb(ctx, fmt) > vram and \
+            grown > (0.06 if vram + ram < need else 0.12) * vram:
+        return "vram"
+    return None
+
+
+def mm3_recommended_context(vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB, parallel: int = 1,
+                            apu: str | None = None) -> int:
+    """The context the setup recommends on this PC: the largest (up to MM3_TESTED_CONTEXT) whose KV cache costs no
+    speed here (mm3_context_limit: it fits in the RAM the model leaves - need: MM3_MEMORY_GB, a GGUF quant's own -, on a
+    Windows APU in what Windows maps for the GPU, and pushes no more experts out of VRAM than Qwen's) - else the
+    smallest; MM3_DEFAULT_CONTEXT when the RAM could not be read.  parallel: --parallel's conversations (above 1: no KV
+    streaming - each conversation's whole cache in VRAM, MM3_PARALLEL_VRAM_SHARE).  apu: apu_kind(the GPUs)."""
     n = max(1, int(parallel or 1))
     if n > 1:
         fits = [c for c in MM3_CONTEXTS if c <= MM3_TESTED_CONTEXT and n * mm3_kv_gb(c, fmt) <= vram * MM3_PARALLEL_VRAM_SHARE]
         return max(fits) if fits else MM3_CONTEXTS[0]
     if ram <= 0:
         return MM3_DEFAULT_CONTEXT
-    spare = vram + ram - need
-    fits = [c for c in MM3_CONTEXTS if c <= MM3_TESTED_CONTEXT and mm3_kv_gb(c, fmt) <= spare]
+    fits = [c for c in MM3_CONTEXTS if c <= MM3_TESTED_CONTEXT and mm3_context_limit(c, vram, ram, fmt, need, apu) is None]
     return max(fits) if fits else MM3_CONTEXTS[0]
 
 
 def mm3_context_notes(ctx: int, vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB,
-                      parallel: int = 1) -> None:
+                      parallel: int = 1, apu: str | None = None) -> None:
     """What a context costs here, and the warnings (as the dashboard's): past what was run end to end, a cache that
-    takes RAM the experts need.  With --parallel above 1 the caches are in VRAM, a whole context each."""
+    costs speed here (mm3_context_limit).  With --parallel above 1 the caches are in VRAM, a whole context each."""
     n = max(1, int(parallel or 1))
-    kv, spare = mm3_kv_gb(ctx, fmt), vram + ram - need
+    kv = mm3_kv_gb(ctx, fmt)
+    why = mm3_context_limit(ctx, vram, ram, fmt, need, apu) if n == 1 and ram > 0 else None
+    rec = context_label(mm3_recommended_context(vram, ram, fmt, need, n, apu))
     if n > 1:
         ok(f"{n} conversations at once (--parallel): each its own KV cache of about {kv:.1f} GB ({fmt.upper()}), "
            f"{n * kv:.1f} GB of VRAM in all - no KV streaming and no DSpark while it is above 1")
@@ -5251,11 +5298,18 @@ def mm3_context_notes(ctx: int, vram: float, ram: float, fmt: str, need: float =
         if n * kv > vram * MM3_PARALLEL_VRAM_SHARE:
             warn(f"{vram:.0f} GB of VRAM: {n} caches of a {context_label(ctx)} context leave fewer experts in VRAM "
                  "(answers slower), and the engine shortens the context where they do not fit - "
-                 f"{context_label(mm3_recommended_context(vram, ram, fmt, need, n))} fits this PC for {n}")
-    elif kv > max(0.0, spare):
+                 f"{rec} fits this PC for {n}")
+    elif why == "ram":
         warn(f"{vram:.0f} GB of VRAM and {ram:.0f} GB of RAM: with a {context_label(ctx)} context's cache, fewer "
-             "experts stay in RAM (answers slower) and the engine may not start - "
-             f"{context_label(mm3_recommended_context(vram, ram, fmt, need))} fits this PC")
+             f"experts stay in RAM (answers slower) and the engine may not start - {rec} fits this PC")
+    elif why == "shared":
+        warn(f"{ram:.0f} GB of RAM beside the GPU's {vram:.0f} GB: a {context_label(ctx)} context's {kv:.0f} GB cache "
+             "fills the RAM Windows lets the GPU use (answers slower) - "
+             f"{rec} fits this PC")
+    elif why == "vram":
+        warn(f"{vram:.0f} GB of VRAM: a {context_label(ctx)} context's index keys "
+             f"({mm3_kv_vram_gb(ctx, fmt):.1f} GB in VRAM) leave fewer experts there (answers slower) - {rec} "
+             "keeps more of them")
 
 
 def mm3_models() -> tuple:
@@ -5656,11 +5710,12 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     ok(f"files: {name}" + (" (Maya's quant)" if gguf else " (your EXL3 folder)" if own else " (Mia-AiLab's EXL3 quant)"))
     fmt = mm3_kv_format(prev_args)                     # (a setup again keeps the config's --kv-cache)
     par = getattr(a, "parallel", None) or int(flag_value(prev_args, "--parallel") or 1)   # (--parallel: kept)
-    rec = mm3_recommended_context(vram, total, fmt, need, par)
+    apu = apu_kind(pc["gpus"])
+    rec = mm3_recommended_context(vram, total, fmt, need, par, apu)
     ctx = choose_context(a, prev_ctx, MM3_CONTEXTS, rec)
     ok(f"context: {ctx} tokens" + (" (recommended for this PC's memory)" if ctx == rec else "") +
        (f", for each of {par} conversations at once (--parallel)" if par > 1 else ""))
-    mm3_context_notes(ctx, vram, total, fmt, need, par)
+    mm3_context_notes(ctx, vram, total, fmt, need, par, apu)
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
     d = mm3_dir(a, models, prev, quant)
