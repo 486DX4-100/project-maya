@@ -25,7 +25,8 @@ it on for that request when the server has it off).
 """
 from __future__ import annotations
 
-from typing import NamedTuple
+import re
+from typing import Callable, NamedTuple
 
 P_MIN = 8               # the shortest block: shorter loops (one token, "0, 0, 0") repeat a multiple of it in 8..15
 P_MAX = 2048            # the longest: a loop of whole paragraphs or a plan written again (Maya-S thought a ~1,170-
@@ -187,3 +188,67 @@ class LoopGuard:
 
     def summary(self) -> list[str]:
         return [a.describe() for a in self.events]
+
+
+# ------------------------------------------------------------------ never inside a tool call
+# A tool call is written as text between the family's markers - `<tool_call>` ... `</tool_call>` (GLM, and MiniMax with
+# its namespace in front), DeepSeek's `<｜DSML｜ calls>` ... `</｜DSML｜ calls>` - and calls that repeat (three alike in
+# one reply: three files read, three commands run) are legitimate: dropping "the repeats" would cut a call in half and
+# hand the client broken JSON.  So a loop whose repeated tokens touch a tool call is never cut and never closes the
+# thinking; a loop inside one call's own text (a line written again and again) only gets the short repetition
+# penalty, once a call.  Outside tool calls nothing changes.
+_TOOL_OPEN = re.compile(r"<tool_call>|<｜DSML｜\s*(?:tool_)?calls[^>]*>")
+_TOOL_CLOSE = re.compile(r"</tool_call>|</｜DSML｜\s*(?:tool_)?calls\s*>")
+_TAIL = 48              # the text kept to find a marker split across tokens
+
+
+class ToolSafeGuard(LoopGuard):
+    """LoopGuard that leaves tool calls alone.  `piece(id)` is the id's text (a server Detokenizer's push): without
+    it this is the plain LoopGuard."""
+
+    def __init__(self, think_end: int | None = None, in_think: bool = False, detector: LoopDetector | None = None,
+                 piece: Callable[[int], str] | None = None):
+        super().__init__(think_end, in_think, detector)
+        self.piece = piece
+        self.in_tool = False
+        self.tool_penalised = False             # (the penalty went to this call's loop already)
+        self.call_n = 0                         # the tokens written in the tool call now
+        self.since_tool = 1 << 60               # the tokens written since the last one in a tool call
+        self.tail = ""
+
+    def _follow(self, t: int) -> bool:
+        """Read token t's text for the markers; True when it is in a tool call (or ends one)."""
+        was = self.in_tool
+        buf = self.tail + (self.piece(t) or "")
+        while True:
+            m = (_TOOL_CLOSE if self.in_tool else _TOOL_OPEN).search(buf)
+            if m is None:
+                break
+            self.in_tool = not self.in_tool
+            if self.in_tool:
+                self.tool_penalised, self.call_n = False, 0
+            buf = buf[m.end():]
+        self.tail = buf[-_TAIL:]
+        return was or self.in_tool
+
+    def push(self, t: int, written: int | None = None) -> Action | None:
+        if self.piece is None:
+            return super().push(t, written)
+        inside = self._follow(t)
+        self.since_tool = 0 if inside else self.since_tool + 1
+        self.call_n += self.in_tool
+        act = super().push(t, written)
+        if act is None or (not inside and self.since_tool >= act.drop):
+            return act                          # (no loop, or one wholly outside the tool calls: as ever)
+        self.events.pop()                       # a loop that touches a tool call: not counted, nothing dropped
+        self.hits[act.where] -= 1
+        if not self.in_tool or self.tool_penalised or self.call_n < act.period + act.drop:
+            return None                         # (a loop of whole calls, or one this call began with: nothing)
+        self.tool_penalised = True              # (inside one call's text: only the penalty, the tokens stay)
+        act = act._replace(kind=PENALTY, drop=0, where="tool call")
+        self.events.append(act)
+        return act
+
+    def resume(self, kept: list[int], act: Action) -> None:
+        self.since_tool = max(0, self.since_tool - act.drop)
+        super().resume(kept, act)

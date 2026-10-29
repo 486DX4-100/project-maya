@@ -212,6 +212,123 @@ class Policy(unittest.TestCase):
         self.assertEqual(LG.penalty_window(300), 600)
 
 
+def chars(text):
+    """A text as ids (its code points); the guard's `piece` is chr."""
+    return [ord(c) for c in text]
+
+
+class ToolCalls(unittest.TestCase):
+    """The guard never cuts inside a tool call: calls written alike, three in a row, stay whole."""
+    CALL = "<tool_call>read_file<arg_key>path</arg_key><arg_value>/src/main.py</arg_value></tool_call>"
+    PROSE = "xyz" + "1017, 245, 26, 100, 47, 187, " * 12
+    SHORT = "xyz" + "1017, 245, 26, 100, 47, 187, " * 4     # (one loop, no more)
+
+    def guard(self, **kw):
+        return LG.ToolSafeGuard(piece=chr, **kw)
+
+    def feed(self, g, text):
+        """Every action the guard returns for `text`, and what a server keeps (the ids minus what an action drops)."""
+        acts, kept = [], []
+        for t in chars(text):
+            kept.append(t)
+            act = g.push(t, len(kept))
+            if act is not None:
+                acts.append(act)
+                del kept[len(kept) - act.drop:]
+                g.resume(kept, act)
+                if act.kind == LG.STOP:
+                    break
+        return acts, "".join(map(chr, kept))
+
+    def test_three_identical_calls_stay_whole(self):
+        text = "Reading the files.\n" + (self.CALL + "\n") * 3 + "Done."
+        self.assertIsNotNone(first_loop(chars(text)))       # (the plain detector does see it as a loop)
+        plain, _ = self.feed(LG.LoopGuard(), text)
+        self.assertTrue(plain and plain[0].drop > 0)
+        g = self.guard()
+        acts, kept = self.feed(g, text)
+        self.assertEqual((acts, kept), ([], text))
+        self.assertEqual(kept.count(self.CALL), 3)
+        self.assertEqual((g.events, g.hits), ([], {"thinking": 0, "answer": 0}))
+
+    def test_three_identical_calls_with_json_arguments_stay_valid_json(self):
+        args = json.dumps({"path": "/src/main.py", "lines": [1, 2, 3]})
+        call = "<tool_call>read_file<arg_key>args</arg_key><arg_value>" + args + "</arg_value></tool_call>"
+        acts, kept = self.feed(self.guard(), "\n".join(["ok"] + [call] * 4))
+        self.assertEqual(acts, [])
+        bodies = re.findall(r"<arg_value>(.*?)</arg_value>", kept)
+        self.assertEqual([json.loads(b) for b in bodies], [json.loads(args)] * 4)
+
+    def test_calls_of_the_other_families(self):
+        ns = "]<]minimax[>["
+        mm = (f'{ns}<tool_call>{ns}<invoke name="read_file">{ns}<path>/src/main.py{ns}</path>{ns}</invoke>'
+              f"{ns}</tool_call>")
+        one = ('<｜DSML｜ invoke name="read_file"><｜DSML｜ parameter name="path" string="true">/src/main.py'
+               "</｜DSML｜ parameter></｜DSML｜ invoke>")
+        dsml = "<｜DSML｜ calls>" + one * 3 + "</｜DSML｜ calls>"
+        for text in ("Reading.\n" + (mm + "\n") * 3 + "Done.", "Reading.\n" + dsml + "\nDone.",
+                     "Reading.\n" + (dsml + "\n") * 3 + "Done."):
+            g = self.guard()
+            acts, kept = self.feed(g, text)
+            self.assertEqual(kept, text)
+            self.assertTrue(all(a.kind == LG.PENALTY and a.drop == 0 for a in acts), acts)
+            self.assertEqual(g.hits, {"thinking": 0, "answer": 0})
+
+    def test_a_loop_in_prose_is_still_cut(self):
+        text = "Reading the files.\n" + self.PROSE
+        acts, kept = self.feed(self.guard(), text)
+        plain, plain_kept = self.feed(LG.LoopGuard(), text)
+        self.assertEqual([(a.kind, a.drop) for a in acts], [(a.kind, a.drop) for a in plain])
+        self.assertEqual(kept, plain_kept)
+        self.assertEqual(acts[0].kind, LG.PENALTY)
+        self.assertGreater(acts[0].drop, 0)
+        self.assertLess(len(kept), len(text))
+
+    def test_a_loop_in_prose_after_a_call_is_cut_and_the_call_stays(self):
+        text = "Reading.\n" + self.CALL + "\nThe numbers:\n" + self.PROSE
+        acts, kept = self.feed(self.guard(), text)
+        self.assertEqual(acts[0].kind, LG.PENALTY)
+        self.assertGreater(acts[0].drop, 0)
+        self.assertIn(self.CALL, kept)
+        self.assertLess(len(kept), len(text))
+
+    def test_a_cut_in_prose_then_three_calls(self):
+        g = self.guard()
+        acts, kept = self.feed(g, self.SHORT)
+        self.assertEqual([a.kind for a in acts], [LG.PENALTY])
+        acts, kept2 = self.feed(g, "\n" + self.CALL * 3)
+        self.assertEqual(kept2.count(self.CALL), 3)
+        self.assertTrue(all(a.drop == 0 for a in acts))
+
+    def test_a_loop_inside_one_call_only_gets_the_penalty_and_keeps_every_token(self):
+        body = "".join(f"line {i % 3}: alpha beta gamma delta\n" for i in range(40))
+        text = "<tool_call>write_file<arg_key>content</arg_key><arg_value>" + body + "</arg_value></tool_call>"
+        g = self.guard(think_end=1, in_think=True)
+        acts, kept = self.feed(g, text)
+        self.assertEqual(kept, text)
+        self.assertEqual([(a.kind, a.drop, a.where) for a in acts], [(LG.PENALTY, 0, "tool call")])
+        self.assertEqual(g.hits, {"thinking": 0, "answer": 0})
+        self.assertTrue(g.in_think)                         # (the thinking is not closed)
+        smp, _ = g.sampling({"temperature": 0}, acts[0].at, 100)
+        self.assertEqual(smp["repetition_penalty"], LG.LOOP_PENALTY)
+
+    def test_without_a_piece_it_is_the_plain_guard(self):
+        acts, _ = self.feed(LG.ToolSafeGuard(), "x" + self.CALL * 3)
+        self.assertTrue(acts and acts[0].drop > 0)
+
+    def test_a_marker_split_across_tokens(self):
+        g = self.guard()
+        for t in chars("<tool_"):
+            g.push(t)
+        self.assertFalse(g.in_tool)
+        for t in chars("call>abc"):
+            g.push(t)
+        self.assertTrue(g.in_tool)
+        for t in chars("</tool_call>"):
+            g.push(t)
+        self.assertFalse(g.in_tool)
+
+
 class Settings(unittest.TestCase):
     def test_on_by_default_and_the_ways_to_turn_it_off(self):
         self.assertTrue(loop_guard_setting({}, {}))
@@ -325,6 +442,24 @@ class Server(unittest.TestCase):
         self.assertEqual(len(m["requests"][0]["loop_guard"]), 1)
         self.assertIn(f"a {period}-token block", m["requests"][0]["loop_guard"][0])
         self.assertIn("maya:loop_guard_detected_total 1", svc.prometheus())
+
+    def test_three_identical_tool_calls_in_one_reply_are_not_cut(self):
+        call = "<tool_call>read_file<arg_key>path</arg_key><arg_value>/src/main.py</arg_value></tool_call>"
+        script = "Reading the file three times.\n" + (call + "\n") * 3
+        eng = LoopingEngine(Tok(), None, None, script=script)
+        svc = self.service(eng)
+        calls, text = [], ""
+        for kind, val in svc.run(svc.tok.encode("go"), False, [{"name": "read_file", "parameters": {
+                "type": "object", "properties": {"path": {"type": "string"}}}}], 3000, {}, threading.Event()):
+            if kind == "event" and val.kind == "tool_call" and val.complete:
+                calls.append(json.dumps(val.call.arguments))
+            elif kind == "event" and val.kind == "content":
+                text += val.text
+        self.assertEqual(calls, [json.dumps({"path": "/src/main.py"})] * 3)
+        self.assertEqual(len(eng.calls), 1)                 # (no restart: the guard did nothing)
+        m = svc.metrics()
+        self.assertEqual({k: m["loop_guard"][k] for k in ("detected", "penalised", "thinking_closed", "stopped")},
+                         dict.fromkeys(("detected", "penalised", "thinking_closed", "stopped"), 0))
 
     def test_the_request_sampling_comes_back_after_the_window(self):
         long_escape = " ".join(f"Step {i}: the term at {i} is {i * i % 97}." for i in range(30))

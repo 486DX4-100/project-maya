@@ -3080,6 +3080,12 @@ class Service:
         own = (sampling or {}).get("loop_guard")
         return own if isinstance(own, bool) else bool(self.loop_guard)
 
+    def _guard_piece(self):
+        """The text of a token for the loop guard's tool-call markers: incremental (a character split across tokens
+        whole), and a tokenizer without bytes decodes the token alone (no decode of the whole answer a token)."""
+        d = Detokenizer(self.tok)
+        return d.push if d.inc is not None else (lambda t: self.tok.decode([t]))
+
     def _loop_noted(self, act, written: int):
         """A loop the guard broke: a line in the server window, and the Monitor's count."""
         print(f"[maya] loop guard: {act.describe()}"
@@ -3341,8 +3347,9 @@ class Service:
                     engine's ERR says "non-finite") before the first token, the engine has dropped that conversation's
                     state and the request runs once more, its prompt read from token 0."""
                     for again in (False, True):
-                        guard = loop_guard.LoopGuard(self.think_end_id, parser.state == "reasoning") \
-                            if guard_on else None       # (serve/loop_guard.py; a fresh one for a run again)
+                        guard = loop_guard.ToolSafeGuard(self.think_end_id, parser.state == "reasoning",
+                                                         piece=self._guard_piece()) \
+                            if guard_on else None       # (serve/loop_guard.py; a fresh one for a run again; leaves tool calls alone)
                         guards[:] = [guard] if guard is not None else []
                         sliced, got = self._sliced(ids, max_new, sampling, cancel, emb, hold, stat, guard), 0
                         try:
