@@ -37,11 +37,11 @@ struct MarkAt {
 // The restore points the read of a prompt's tokens [from, total) keeps, in order, from the positions a request asks
 // for (`asked`, and `shared`: -1 none): those the read starts at or goes past - from `from` (the state there, kept
 // before the read) to short of the prompt's last token (checkpoint 1 keeps the state before it).  One inside a
-// picture's span (`spans`: start, length) is moved to the span's start (a span is read whole); one fewer than `near`
-// tokens past `from` is kept at `from` (no read of its own for a few tokens), and of two fewer than `near` apart the
+// picture's span (`spans`: start, length) is moved to the span's start (a span is read whole); one fewer than `gap`
+// tokens past `from` is kept at `from` (no read of its own for a few tokens), and of two fewer than `gap` apart the
 // first is kept, with the second's role too.  At most `cap`: the shared start first, then the latest.
 inline std::vector<MarkAt> mark_plan(const std::vector<int64_t>& asked, int64_t shared, int64_t from, int64_t total,
-                                     int cap, int64_t near,
+                                     int cap, int64_t gap,
                                      const std::vector<std::pair<int64_t, int64_t>>& spans = {}) {
     std::vector<MarkAt> v;
     if (cap <= 0 || from < 0 || total - from < 2) return v;
@@ -49,7 +49,7 @@ inline std::vector<MarkAt> mark_plan(const std::vector<int64_t>& asked, int64_t 
         for (const auto& s : spans)
             if (p > s.first && p < s.first + s.second) p = s.first;
         if (p < from || p >= total - 1) return;
-        if (p - from < near) p = from;
+        if (p - from < gap) p = from;
         v.push_back({p, sh});
     };
     for (int64_t p : asked) add(p, false);
@@ -57,7 +57,7 @@ inline std::vector<MarkAt> mark_plan(const std::vector<int64_t>& asked, int64_t 
     std::stable_sort(v.begin(), v.end(), [](const MarkAt& a, const MarkAt& b) { return a.pos < b.pos; });
     std::vector<MarkAt> out;
     for (const MarkAt& m : v) {
-        if (!out.empty() && m.pos - out.back().pos < std::max<int64_t>(near, 1)) {
+        if (!out.empty() && m.pos - out.back().pos < std::max<int64_t>(gap, 1)) {
             out.back().shared = out.back().shared || m.shared;
             continue;
         }

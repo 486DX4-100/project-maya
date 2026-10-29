@@ -2529,12 +2529,12 @@ Chi two_sample(const std::vector<int>& a, const std::vector<int>& b) {
     std::map<int, std::pair<double, double>> n;
     for (int t : a) n[t].first += 1.0;
     for (int t : b) n[t].second += 1.0;
-    const double na = (double) a.size(), nb = (double) b.size(), small = std::min(na, nb);
+    const double na = (double) a.size(), nb = (double) b.size(), fewer = std::min(na, nb);
     std::vector<std::pair<double, double>> g;
     double ra = 0.0, rb = 0.0;
     for (const auto& kv : n) {
         const auto& c = kv.second;
-        if ((c.first + c.second) * small / (na + nb) >= 5.0) {
+        if ((c.first + c.second) * fewer / (na + nb) >= 5.0) {
             g.push_back(c);
         } else {
             ra += c.first;
