@@ -7469,7 +7469,16 @@ struct Model::Impl {
     // pin fails or STRATA_DS4_PIN_GB is reached: those are pulled in place, the others pass the staging.  Without it a
     // failed pin leaves every copy to the staging.  A device that does not address registered memory at its host
     // address (Windows' WDDM) takes its mapped pointer (cudaHostGetDevicePointer, one GPU)
-    const bool pin_by_need = env_f("STRATA_DS4_PIN_BY_NEED", 0.0f) != 0.0f;
+    const bool pin_by_need_env = env_f("STRATA_DS4_PIN_BY_NEED", 0.0f) != 0.0f;
+    // Windows' one-GPU path pins by need by default (STRATA_DS4_PIN_BY_NEED=0 turns it off): WDDM locks about half
+    // the RAM, so pinning every copy fails, and its mapped pointer (one GPU) is what pin by need already takes
+    bool pin_by_need() const {
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+        const char* v = std::getenv("STRATA_DS4_PIN_BY_NEED");
+        if (ln_one && (v == nullptr || v[0] == '\0')) return true;
+#endif
+        return pin_by_need_env;
+    }
     const double pin_cap_gb = env_f("STRATA_DS4_PIN_GB", 0.0f);
     std::vector<char> zc_slot;             // ram_part slot -> its copy is pinned (pin by need)
     std::vector<ptrdiff_t> zc_delta;       // ram_part slot -> device address - host address (0: the same)
@@ -7484,9 +7493,10 @@ struct Model::Impl {
         }
         return true;
     }
-    // ln_one and the settings that follow it (see ln_one): Linux + NVIDIA + one discrete GPU in a group of its own and
-    // no helper GPU - the setup #476's path was measured on.  Windows, AMD, several GPUs or groups, an integrated GPU or
-    // a helper GPU: off, as in v1.1.27 (DS4_STREAM_WIN / DS4_LAND / DS4_STREAM_ZC = 1 turn one on anyway, 0 off)
+    // ln_one and the settings that follow it (see ln_one): NVIDIA + one discrete GPU in a group of its own and no
+    // helper GPU - the setup #476's path was measured on (Linux; Windows with pin by need, see pin_by_need).  AMD,
+    // several GPUs or groups, an integrated GPU or a helper GPU: off, as in v1.1.27 (DS4_STREAM_WIN / DS4_LAND /
+    // DS4_STREAM_ZC = 1 turn one on anyway, 0 off)
     static int env_tri(const char* name) {   // -1: not set, else its value != 0
         const char* v = std::getenv(name);
         return v == nullptr || v[0] == '\0' ? -1 : std::atoi(v) != 0;
@@ -7503,8 +7513,8 @@ struct Model::Impl {
     bool one_auto = false;   // the one-GPU path on by default (not by DS4_STREAM_WIN / DS4_LAND): one_gpu_plan may end it
     void one_gpu_path() {
         bool one = false;
-        const char* why = "off (v1.1.27's path: not Linux + NVIDIA + one GPU)";
-#if !defined(STRATA_USE_HIP) && !defined(_WIN32)
+        const char* why = "off (v1.1.27's path: not NVIDIA + one GPU)";
+#if !defined(STRATA_USE_HIP)
         one = devs.size() == 1 && groups.size() == 1 && groups[0].mem.size() == 1 && helper_id < 0;
         if (one) {
             cudaDeviceProp pr{};
@@ -7512,7 +7522,7 @@ struct Model::Impl {
             if (!one) (void) cudaGetLastError();
         }
         if (one) {
-            why = "on for now (Linux, NVIDIA, one GPU: kept if the PCIe lane's plan streams experts from RAM)";
+            why = "on for now (NVIDIA, one GPU: kept if the PCIe lane's plan streams experts from RAM)";
             const std::string lf = lane_file();
             if (lane_env_off()) {
                 one = false;
@@ -7576,10 +7586,10 @@ struct Model::Impl {
         const char* v = std::getenv("DS4_STREAM_ZC");
         if ((v != nullptr && std::atoi(v) == 0) || lane_env_off() || !pk.gguf) return false;
         // (off the one-GPU path: only when asked - DS4_STREAM_ZC=1, or MAYA_DS4_PIN_BY_NEED's own opt-in)
-        if (!ln_one && v == nullptr && !pin_by_need) return false;
+        if (!ln_one && v == nullptr && !pin_by_need()) return false;
         for (const LaneDev& D : ln_dev)   // (an integrated GPU's kernels may read the staging in place: theirs)
             if (D.integrated) return false;
-        return zc_host_ptr() || (pin_by_need && devs.size() == 1);
+        return zc_host_ptr() || (pin_by_need() && devs.size() == 1);
     }
     void zc_pin() {   // (copy_mode)
         if (NH != 1 || ram_chunks.empty() || !zc_allowed()) return;
@@ -7595,7 +7605,7 @@ struct Model::Impl {
                     chunk_of[sl] = (int) c;
                     break;
                 }
-        if (pin_by_need) {
+        if (pin_by_need()) {
             std::vector<double> need(nc, 0.0);
             for (const Layer& l : L)
                 for (int e = 0; e < l.n_exp && !l.ram.empty(); ++e)
@@ -7607,7 +7617,7 @@ struct Model::Impl {
         }
         std::vector<char> done(nc, 0);
         const unsigned pin_fl = copy_pin_flags(cudaHostRegisterPortable | cudaHostRegisterMapped);
-        if (pin_by_need) {   // (in order, until one fails or the cap: one at a time)
+        if (pin_by_need()) {   // (in order, until one fails or the cap: one at a time)
             double gb = 0;
             for (size_t k = 0; k < nc; ++k) {
                 const size_t c = order[k];
@@ -7665,7 +7675,7 @@ struct Model::Impl {
             }
         zc_chunk = std::move(done);
         ln_zc = gb > 0;
-        if (pin_by_need)
+        if (pin_by_need())
             std::fprintf(stderr, "ds4: PCIe lane: pin by need: %.1f of the copies' %.1f GB pinned, the most-used layers first "
                                  "(%.1f s): those pulled in place, the rest through the staging\n", gb, all,
                          (now_ms() - t0) / 1000.0);
