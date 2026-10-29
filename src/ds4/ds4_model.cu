@@ -1087,6 +1087,17 @@ struct Model::Impl {
     std::mutex halt_mu;
     int halt_k = INT_MAX, halt_seen = -1;
     bool halted = false;                      // the last run ended early on a Stop
+    // a yield (Model::set_yield, asked while forward_chunks waits): the run ends at a chunk every device reaches, as on
+    // a Stop, but the chunks before it stay read - feed() returns true with fed() the tokens it took.  One GPU too ends
+    // at a chunk there, never mid-chunk (halt_now), unless a Stop follows
+    std::function<bool()> yield_to;
+    std::atomic<bool> yielding{false};
+    // a run a yield may end: no device starts chunk k before chunk k - (the stages + kYieldSlack) is through every
+    // layer - the stages all still busy, and the chunks a yield waits for no more than that (a device's host otherwise
+    // runs chunks ahead of its GPU, and its stage ahead of the next: a yield's cut came 5 chunks past the done ones)
+    static constexpr int kYieldSlack = 1;
+    bool run_yields = false;
+    int fed_n = 0;   // the last feed's tokens read (fewer than it was given: a yield)
     static constexpr const char* kHalted = "stopped";
     bool past_halt(int k) {   // a Stop came and chunk k is one no device starts
         if (!halt.load(std::memory_order_acquire)) return false;
@@ -1099,7 +1110,9 @@ struct Model::Impl {
         halt_seen = std::max(halt_seen, k);
         return true;
     }
-    bool halt_now() const { return devs.size() == 1 && halt.load(std::memory_order_acquire); }
+    bool halt_now() const {
+        return devs.size() == 1 && halt.load(std::memory_order_acquire) && !yielding.load(std::memory_order_acquire);
+    }
     // a run's early end on device di: the expert reads still in flight land first (they count down items the next run
     // clears), then its streams are idle
     bool halt_end(int di, std::string& err) {
@@ -16598,6 +16611,15 @@ struct Model::Impl {
         std::future<void> eg_next;
         if (!egs.empty() && eg_src == di) eg_next = std::async(std::launch::async, read_eg, 0);
         for (int k = 0; k < nk; ++k) {
+            if (run_yields) {
+                const int back = k - ((int) groups.size() + kYieldSlack);
+                if (back >= 0)
+                    while (!(chunk_rec[(size_t) back].load(std::memory_order_acquire) &&
+                             cudaEventQuery(chunk_done[(size_t) back]) == cudaSuccess)) {
+                        if (eg_abort.load(std::memory_order_acquire) || past_halt(k)) break;
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    }
+            }
             if (!chunk_go(k)) return halt_end(di, err);   // (a Stop: the chunks every device reaches are done)
             c.at_k.store(k, std::memory_order_relaxed);
             c.at_il.store(-1, std::memory_order_relaxed);
@@ -17607,7 +17629,7 @@ struct Model::Impl {
     // start: chunk cut_k's rows go to the other groups whole); with the suffix on one GPU of a layer split, or one
     // tensor-parallel group under DS4_YOCO_TP (yoco_tp_group), as on one GPU.  DS4_YOCO=1 (0: off); not with every
     // row's logits (tests)
-    void plan_chunks(int n, int logits_rows, FeedPlan& fp) {
+    void plan_chunks(int n, int logits_rows, FeedPlan& fp, int after = 0) {
         fp.ends.clear();
         fp.skip = -1;
         fp.cut_k = fp.cut_r = 0;
@@ -17618,7 +17640,10 @@ struct Model::Impl {
         const int keep = yl <= 0 ? 0
                          : keep_env > 0 ? std::max(keep_env, g.win)
                          : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
-        const int a = yl > 0 && n - keep >= kYocoMin ? n - keep : 0;
+        // (a piece of a longer prompt, `after` more of its tokens in later feeds: the kept rows are the prompt's last,
+        //  so a piece wholly before them is KV-only past yoco - as its rows are in the prompt read whole)
+        const int skip = std::min(n, n + after - keep);
+        const int a = yl > 0 && skip >= kYocoMin ? skip : 0;
         const bool cut_rows = a > 0 && (yoco_one_gpu() || yoco_suffix_gpu(yl) || yoco_tp_group());
         if (a > 0 && yoco_tp_group()) {   // (DS4_YOCO_TP: once)
             static bool said = false;
@@ -17635,7 +17660,7 @@ struct Model::Impl {
             for (int x = a0; x < a1; x += w) fp.ends.push_back(std::min(x + w, a1));
             per = std::max(per, w);
         };
-        if (a > 0 && !cut_rows) {
+        if (a > 0 && (!cut_rows || a == n)) {   // (every row KV-only: no chunk cut)
             part(0, a);
             fp.skip = yl;
             fp.cut_k = (int) fp.ends.size();
@@ -17657,9 +17682,10 @@ struct Model::Impl {
     // n tokens at positions pos .. in chunks of equal size (at most `chunk`), pipelined over the groups; the logits of
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits).
     // whole (Model::feed_part): the n tokens are chunks [k0, k1) of that plan, read as its one call reads them - the
-    // same chunks, the skip's cut where the whole run has it, the buffers laid out for its widest chunk
+    // same chunks, the skip's cut where the whole run has it, the buffers laid out for its widest chunk.
+    // after: a piece of a longer prompt (whole: none), its tokens still to come in later feeds (plan_chunks)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1,
-                        const FeedPlan* whole = nullptr, int k0 = 0, int k1 = 0) {
+                        const FeedPlan* whole = nullptr, int k0 = 0, int k1 = 0, int after = 0) {
         if (lend_broken) {
             err = kLendBroken;
             return false;
@@ -17676,7 +17702,7 @@ struct Model::Impl {
             }
         FeedPlan own;
         if (whole == nullptr) {
-            plan_chunks(n, logits_rows, own);
+            plan_chunks(n, logits_rows, own, after);
             k0 = 0;
             k1 = (int) own.ends.size();
         }
@@ -17872,12 +17898,14 @@ struct Model::Impl {
         std::vector<std::string> errs(devs.size());
         halted = false;
         halt.store(false);
+        yielding.store(false);
         {
             std::lock_guard<std::mutex> lk(halt_mu);
             halt_k = INT_MAX;
             halt_seen = -1;
         }
-        bool halting = false;
+        bool halting = false, stopping = false;
+        run_yields = yield_to != nullptr && !lm && !logits_all;
         eg_abort.store(false);
         if (prefetch) prefetch->start();
         // (DS4_FLOW_HELPER_CHECK: the load's first N runs)
@@ -17910,10 +17938,16 @@ struct Model::Impl {
         for (;;) {
             bool all = true;
             for (auto& w : workers) all = all && w->idle();
-            if (!all && !halting && cancel && cancel()) {   // a Stop: the devices end the run early
+            // a Stop, or a yield (a chunk run layer by layer has no chunk to end at; every row's logits: tests): the
+            // devices end the run early
+            const bool stop = !all && !stopping && cancel && cancel();
+            const bool yield = !all && !halting && !lm && !logits_all && yield_to && yield_to();
+            if (stop || yield) {
+                stopping = stopping || stop;
+                yielding.store(!stopping, std::memory_order_release);
                 halting = true;
                 std::lock_guard<std::mutex> lk(halt_mu);
-                halt_k = halt_seen + 1;
+                if (halt_k == INT_MAX) halt_k = halt_seen + 1;
                 halt.store(true, std::memory_order_release);
                 if (eg_pf != nullptr) eg_pf->wake();
             }
@@ -17936,15 +17970,20 @@ struct Model::Impl {
                 err = e;
                 return false;
             }
+        const bool yielded = yielding.load(std::memory_order_acquire);
         for (const std::string& e : errs)
-            if (e == kHalted) {
+            if (e == kHalted && !yielded) {
                 halted = true;
                 err = "stopped while reading the prompt";
                 return false;
             }
+        // (a yield: the chunks before halt_k read, every device through them; none past it - all of them when every
+        //  chunk had started)
+        const int took = yielded && halt_k < (int) run.T.size() ? (int) (run.p0[(size_t) halt_k] - run.p0[0]) : n;
+        fed_n = took;
         // (before the cache looks at the slots again; no decode after a mismatch or a failure) - or, a part of a prompt
         // read in parts with more to come, its room kept for the next part (DS4_PROMPT_KEEP_LEND=0: handed back)
-        if (!run_end && whole != nullptr && keep_lend_on() && lend_hold(fp.at, k1, per)) {
+        if (took == n && !run_end && whole != nullptr && keep_lend_on() && lend_hold(fp.at, k1, per)) {
             lent_.keep = true;
             if (lend_broken) {
                 err = kLendBroken;
@@ -18025,8 +18064,9 @@ struct Model::Impl {
                              devs[di].id, (unsigned long long) c.chk_n, (unsigned long long) c.it_helper);
             }
         flow_check_now = false;
-        // (the picks' spread for pick_path: the CPU-lane experts this run picked - a prompt's own run, not a part)
-        if (pm.on && run.T.size() == 1 && whole == nullptr) {
+        // (the picks' spread for pick_path: the CPU-lane experts this run picked - a prompt's own run, not a part, nor
+        //  one a yield ended)
+        if (pm.on && run.T.size() == 1 && whole == nullptr && took == n) {
             bool tp = false;
             for (const Layer& l : L) tp = tp || l.nm > 1;
             double picked = 0;
@@ -18036,20 +18076,28 @@ struct Model::Impl {
             if (!tp) pm_learn(n, picked);
         }
         if (logits_all) n_logits = (T_last - 1) % kWin + 1;   // (sample() takes the last row of d.logits)
-        pos += n;
-        st.tokens += n;
+        if (took < n) {   // (a yield: the rest of the tokens are a later feed's; no logits)
+            toks.resize((size_t) (pos + took));
+            ctoks.resize((size_t) (pos + took));
+            n_logits = 0;
+        }
+        pos += took;
+        st.tokens += took;
         if (settle) settle_learn();
-        cache_tick(n);
+        cache_tick(took);
         // (a part with more to come: the next part reads on, and the last one seeds the drafter - its last chunk's
         //  taps, as one call's; a part before the skip's cut never reaches the layers they are taken at - and settles
         //  the cache once, after the whole prompt)
         if (run_end) {
             if (settle) cache_settle();
-            warm_after(n);
+            warm_after(took);
         }
+        // the drafter seeded from the run's last rows - when they went through every layer: not after a yield, nor a
+        // run wholly KV-only past the skip (a piece of a longer prompt, `after`: the piece that ends it seeds it)
+        const bool kv_only = fp.skip >= 0 && fp.cut_k >= k1;
         const int nr = std::min(T_last, tap_cap);
-        if (run_end && !seed_drafter(pos - nr, nr, 0, err)) return false;
-        if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
+        if (run_end && took == n && !kv_only && !seed_drafter(pos - nr, nr, 0, err)) return false;
+        if (snap_slot >= 0 && took == n) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
             // the next feed seeds them again from its own rows, past this position)
             Check& ckp = ck[snap_slot & 1];
             ckp.pos = run.snap_pos;
@@ -19888,15 +19936,16 @@ Model::~Model() = default;
 bool Model::load(const Options& o, std::string& err) { return p_->load(o, err); }
 bool Model::step(int token, bool logits, std::string& err) { return p_->step(token, logits, err); }
 std::string Model::where() const { return p_->where(); }
-bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
+bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err, int after) {
     Impl& p = *p_;
     if (!feed_release(err)) return false;   // (another read: a prompt's room kept between its parts handed back first)
     p.main_at.store("reading a prompt", std::memory_order_relaxed);
     p.pm.last = -1;
     p.halted = false;
+    p.fed_n = n;
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
         const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all)
-        const bool ok = logits_rows > kWin || p.pick_path(n) ? p.forward_chunks(tokens, n, logits_rows, err)
+        const bool ok = logits_rows > kWin || p.pick_path(n) ? p.forward_chunks(tokens, n, logits_rows, err, -1, nullptr, 0, 0, after)
                                                              : p.feed_windows(tokens, n, logits_rows, err);
         if (ok) p.path_done(now_ms() - t0);
         return ok;
@@ -19909,6 +19958,7 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     p.main_at.store("reading a prompt", std::memory_order_relaxed);
     p.pm.last = -1;
     p.halted = false;
+    p.fed_n = n;
     const double t0 = now_ms();
     if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n)) {   // (the last token rides along; its layers
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
@@ -19971,8 +20021,12 @@ bool Model::feed_part(const FeedPlan& plan, const int* tokens, int k0, int k1, s
     const bool last = k1 == nk;
     return p.forward_chunks(tokens + a, b - a, last ? plan.logits_rows : 0, err, last ? plan.slot : -1, &plan, k0, k1);
 }
+int Model::prompt_chunk() const { return p_->chunk; }
+int Model::pipeline_stages() const { return std::max(1, (int) p_->groups.size()); }
 void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
 void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
+void Model::set_yield(std::function<bool()> f) { p_->yield_to = std::move(f); }
+int Model::fed() const { return p_->fed_n; }
 bool Model::cancelled() const { return p_->halted; }
 void Model::begin_request() { p_->begin_request(); }
 int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
