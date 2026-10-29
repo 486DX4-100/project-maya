@@ -4,6 +4,24 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.38 - 2026-10-29
+
+Qwen CYBER-FROST runs faster on PCs with little RAM, a new chat shows the model that answers it, and the web app's
+home-screen icon opens the page.
+
+- **Qwen CYBER-FROST on RAM-short PCs: decode +26%** (#654): on Linux, the experts that neither the VRAM nor the RAM
+  holds are now read straight from the model file, without the system's file cache, which such a PC cannot spare.
+  Maya checks a sample of experts against the file when it opens it and keeps the old path on a file system that does
+  not allow these reads (`MAYA_EXPERT_DIRECT=0` turns them off). On a PC where VRAM and RAM together cannot hold every
+  expert, the setup now suggests a context that leaves more of the VRAM to experts (a 32 GB card with 30 GB of RAM:
+  128K instead of 256K). Measured on a V100 32 GB with 30 GB of RAM; PCs that hold every expert are unchanged.
+- **New chat** (#662, thanks @needmorevram): a card shows the model that answers it (ready or busy, its context, the
+  last answer's speed, images, what it saved) with Switch model, and the ideas to start from stay below the message
+  box. On a phone the card is one row that opens the Models page. An answer's numbers (tokens, speed) are now behind
+  an info button next to Copy and Regenerate.
+- **Web app on a phone's home screen** (#656, thanks @needmorevram): the saved icon opens the page instead of a
+  not-found error; icons saved with an older version are sent to the page too.
+
 ## v1.1.37 - 2026-10-29
 
 DeepSeek keeps restore points so an edited long chat answers about 50x sooner (#639), `--parallel` reads prompts
