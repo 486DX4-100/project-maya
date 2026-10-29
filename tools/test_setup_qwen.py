@@ -106,6 +106,10 @@ class Setup(unittest.TestCase):
         self.assertEqual(maya.qwen_recommended_context(16), 131072)
         self.assertEqual(maya.qwen_recommended_context(8), 65536)
         self.assertEqual(maya.qwen_recommended_context(4), 32768)
+        # (the experts do not all fit in VRAM and RAM: the VRAM goes to expert slots, the context shrinks)
+        self.assertEqual(maya.qwen_recommended_context(32, True), 131072)
+        self.assertEqual(maya.qwen_recommended_context(96, True), 262144)
+        self.assertEqual(maya.qwen_recommended_context(8, True), 32768)
         self.assertIn(maya.QWEN_DEFAULT_CONTEXT, maya.QWEN_CONTEXTS)
 
     def test_drafting_chosen(self):
