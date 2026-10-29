@@ -599,8 +599,10 @@ def _quiet_seconds() -> float:
 REQUEST_QUIET_S = _quiet_seconds()
 
 
-# The longest a stopped request's own lines (T / PP / DONE) are waited for when it is drained after a cancel: a STOP
-# an engine does not honour (or a rid it has already let go) would otherwise hold the FIFO place for ever.
+# The longest a stopped request's own lines (T / PP / DONE) are waited for when it is drained after a cancel with
+# --parallel: a STOP an engine does not honour (or a rid it has already let go) would otherwise hold the FIFO place for
+# ever.  With one conversation the drain waits for the DONE (its lines share one queue with the next request's) and
+# this is only when it says it is still waiting; a stuck engine there is ended by the stall watchdog (ENGINE_STALL_S).
 def _drain_seconds() -> float:
     try:
         return max(1.0, float(os.environ.get("STRATA_DRAIN_S", "60")))
@@ -1264,13 +1266,16 @@ class StrataEngine:
                 said, stall = False, {}
                 while True:
                     try:
-                        line = self.lines.get(timeout=5)
+                        line, quiet = self.lines.get(timeout=5), False
                     except queue.Empty:
-                        if not said and time.monotonic() - t0 >= DRAIN_S:
-                            said = True
-                            print(f"[maya] stopped, and the engine has not said the request ended after {DRAIN_S:.0f} s "
-                                  "(STRATA_DRAIN_S) - it is still working on it (a long prompt is stopped between its "
-                                  "chunks); waiting for it", flush=True)
+                        line, quiet = None, True
+                    # (looked at on every line too: a prompt's progress lines go on while its chunk is read)
+                    if not said and time.monotonic() - t0 >= DRAIN_S:
+                        said = True
+                        print(f"[maya] stopped, and the engine has not said the request ended after {DRAIN_S:.0f} s "
+                              "(STRATA_DRAIN_S) - it is still working on it (a long prompt is stopped between its "
+                              "chunks); waiting for it", flush=True)
+                    if quiet:
                         why = self._stall_check(heard, stall) if ENGINE_STALL_S > 0 else None
                         if why:
                             self._end(why)

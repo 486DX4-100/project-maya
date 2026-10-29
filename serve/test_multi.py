@@ -301,7 +301,7 @@ class AWedgedRequest(unittest.TestCase):
 # One conversation, and STOP is looked at only after a slow "prompt chunk" (1.5 s): the stopped request's tokens and
 # DONE come long after the drain started.
 SLOW_STOP_ENGINE = r'''#!/usr/bin/env python3
-import sys, threading, time
+import os, sys, threading, time
 lock = threading.Lock()
 def out(s):
     with lock:
@@ -315,7 +315,7 @@ def reader():
         elif line.startswith("GEN"):
             work.append(line.split()[-1].split(","))
         elif line.startswith("QUIT"):
-            sys.exit(0)
+            os._exit(0)                              # (the whole engine: sys.exit in this thread ended only it)
 threading.Thread(target=reader, daemon=True).start()
 out("READY 4096 stop")
 while True:
@@ -359,6 +359,26 @@ class AStoppedLongPrompt(unittest.TestCase):
         gen.close()                                                # the client went away mid-read
         got = [t for t in self.engine.generate([5, 6], 3, {}, threading.Event()) if t is not None]
         self.assertEqual(got, [500, 501, 502])                     # not the stopped one's 7xx
+
+    def test_it_says_it_waits_while_progress_lines_go_on(self):
+        # the chunk's progress lines (PP every 0.1 s) keep the line queue busy: the wait is said all the same, and
+        # the next request still gets its own tokens
+        import contextlib
+        import io
+        self.engine.close()
+        self.path.write_text(SLOW_STOP_ENGINE.replace(
+            "time.sleep(1.5)", "for _ in range(15):\n        out('PP 1 %d' % len(ids)); time.sleep(0.1)"))
+        self.engine = StrataEngine(str(self.path), [])
+        self.srv.DRAIN_S = 0.3
+        said = io.StringIO()
+        gen = self.engine.generate([7, 8, 9], 3, {}, threading.Event())
+        next(gen)
+        with contextlib.redirect_stdout(said):
+            gen.close()
+        self.assertIn("it is still working on it", said.getvalue())
+        self.assertIn("the stopped request ended after", said.getvalue())
+        got = [t for t in self.engine.generate([5, 6], 3, {}, threading.Event()) if t is not None]
+        self.assertEqual(got, [500, 501, 502])
 
 
 if __name__ == "__main__":
