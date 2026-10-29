@@ -639,6 +639,13 @@ std::vector<strata::ds4::LogprobRow> lp_take(const strata::ds4::Model& m, size_t
     std::reverse(v.begin(), v.end());
     return v;
 }
+// a MAYA_ setting as the engine gets it: the server passes a config's MAYA_X on as STRATA_X (maya_names.env_in), so
+// both names are read
+static const char* read_env(const char* maya_name) {
+    if (const char* v = std::getenv(maya_name)) return v;
+    return std::getenv((std::string("STRATA_") + (maya_name + 5)).c_str());
+}
+
 // ... and a token's LP line after its T line (rid >= 0: --parallel's tag)
 void lp_out(long long rid, int tok, const strata::ds4::LogprobRow& row) {
     if (row.id == tok) std::printf("%s\n", strata::ds4::lp_line(rid, row).c_str());
@@ -1733,7 +1740,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::deque<std::string> waiting;   // GEN lines no conversation is free for yet
         std::deque<Act*> read_line;        // the prompts being read, in turn: a piece each, then to the back
         const bool read_pieces = [] {
-            const char* v = std::getenv("MAYA_DS4_READ_ORDER");
+            const char* v = read_env("MAYA_DS4_READ_ORDER");
             return v == nullptr || std::string(v) != "arrival";
         }();
         // MAYA_DS4_READ_PIECE=<chunks>: a piece is that many chunks a pipeline stage (1); MAYA_DS4_READ_ROUNDS=<n>: the
@@ -1741,7 +1748,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // they write for that share of the time, their rounds' against the last piece's (a round at least; 0: off)
         constexpr int kReadPieceChunks = 1, kReadRounds = 1, kReadShareMax = 90;
         const auto env_count = [](const char* name, int dflt) {
-            const char* v = std::getenv(name);
+            const char* v = read_env(name);
             const int x = v != nullptr ? std::atoi(v) : 0;
             return x > 0 ? x : dflt;
         };
