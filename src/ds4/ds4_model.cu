@@ -10177,6 +10177,17 @@ struct Model::Impl {
         }
     }
 
+    // (pr/rc-fill-error, test-only) DS4_FAULT_RC_FILL=N: every Nth recent-slot fill fails at issue (as if its first
+    // H2D enqueue failed - nothing copied) while the completion event still records, so the fill error path can be
+    // exercised on demand.  0/absent: off.
+    static int rc_fill_fault_rate() {
+        static const int rate = [] {
+            const char* v = std::getenv("DS4_FAULT_RC_FILL");
+            return v && *v ? (int) std::strtol(v, nullptr, 10) : 0;
+        }();
+        return rate;
+    }
+
     void rc_loop() {
         std::vector<RcJob> fly;     // issued, not yet done
         std::deque<RcJob> held;     // waiting for their group's turn to end (copy_open)
@@ -10198,16 +10209,41 @@ struct Model::Impl {
                     ++i;
                     continue;
                 }
+                // (a failed fill: the event still records - a member's copy may be partly under way - but the job never
+                // reaches fly, so nothing stores rc_done and the tick's rc_done != rc_gen check never publishes the
+                // slot: its mapping stays as it was, the expert routes over the RAM lane (correct, slower), and the
+                // slot retires (rc_fill keeps holding it out of the free list).  Before, the return value was
+                // discarded, rc_done was stored on the event alone, and the tick published the slot over stale bytes.)
+                const int fault_rate = rc_fill_fault_rate();
+                bool injected = false;
+                if (fault_rate > 0) {
+                    static std::atomic<int> seq{0};
+                    injected = seq.fetch_add(1, std::memory_order_relaxed) % fault_rate == fault_rate - 1;
+                }
+                bool ok = true;
                 for (int m = 0; m < l.nm; ++m) {
                     Layer& x = member(l, m);
                     const int di = x.dev;
                     cudaSetDevice(devs[(size_t) di].id);
                     cudaStreamWaitEvent(rc_cs[(size_t) di], rc_go[(size_t) di], 0);   // (after the tick's tables)
                     copy_after_idle(di, rc_cs[(size_t) di]);
-                    stream_expert(l, m, j.expert, sat(l, x, l.rc_base + j.slot, unit(x)), rc_cs[(size_t) di], err);
+                    if (injected) {
+                        err = "DS4_FAULT_RC_FILL: injected recent-slot fill failure (nothing was copied)";
+                        ok = false;
+                    } else if (!stream_expert(l, m, j.expert, sat(l, x, l.rc_base + j.slot, unit(x)), rc_cs[(size_t) di], err))
+                        ok = false;
                     cudaEventRecord(l.rc_ev[(size_t) j.slot * l.nm + m], rc_cs[(size_t) di]);
                 }
-                fly.push_back(j);
+                if (ok)
+                    fly.push_back(j);
+                else {
+                    if (injected)
+                        std::fprintf(stderr, "ds4: FAULT recent-slot fill: layer %d expert %d slot %d fails at issue\n",
+                                     l.il, j.expert, l.rc_base + j.slot);
+                    std::fprintf(stderr, "ds4: recent-slot fill failed, slot left unmapped: layer %d expert %d slot %d: %s\n",
+                                 l.il, j.expert, l.rc_base + j.slot, err.c_str());
+                    rc_pending.fetch_sub(1);   // (nothing will store rc_done for it: rc_drain must not count it)
+                }
                 held.erase(held.begin() + (std::ptrdiff_t) i);
             }
             for (size_t i = 0; i < fly.size();) {   // the ones whose copies are all done: marked
