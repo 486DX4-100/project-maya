@@ -8057,6 +8057,7 @@ int main(int argc, char** argv) {
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     std::vector<std::pair<int32_t, int32_t>> lent;     // (residency index, slot) lent to the prompt path
     const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
+    bool spec_go = false;   // the speculative loop runs (spec_pos can be 0: a native pack's prompt read by windows)
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
@@ -8113,6 +8114,35 @@ int main(int argc, char** argv) {
                 return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
             };
         }
+        // --dump-logits (issue #658): the header announces a row for every position from 0, and the batched path
+        // computes no head - so each chunk's rows go through the token path's head from the final residuals the
+        // chunk leaves (what the draft layer reads too).  The prompt is read as without the dump: the same answer.
+        if (dump != nullptr) {
+            auto mtp_chunk = prefill.on_chunk;   // (empty without --mtp)
+            prefill.on_chunk = [&, mtp_chunk](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                strata::core::BlockBuffers bb = ss.block;
+                for (int64_t t = 0; t < T; ++t) {
+                    if (!strata::program::logits_selection::selected(p0 + t, dump_positions, o.logits_stride)) continue;
+                    bb.R = const_cast<float*>(R_rows) + (size_t) t * (size_t) (g.hc * g.n_embd);
+                    const bool ok = native_head.loaded()
+                                        ? strata::core::lm_head_mix(wt, g, bb, main_cs, e) &&
+                                              native_head.run(bb.mixed, d_logits, main_cs, e)
+                                        : strata::core::lm_head(wt, g, bb, d_logits, main_cs, e);
+                    if (!ok) return false;
+                    if (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4, cudaMemcpyDeviceToHost,
+                                        (cudaStream_t) main_cs) != cudaSuccess ||
+                        cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
+                        e = "reading a prompt row's logits back failed";
+                        return false;
+                    }
+                    if (std::fwrite(logits.data(), sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
+                        e = "cannot write logits at position " + std::to_string(p0 + t);
+                        return false;
+                    }
+                }
+                return !mtp_chunk || mtp_chunk(R_rows, T, p0, e);
+            };
+        }
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
@@ -8157,7 +8187,7 @@ int main(int argc, char** argv) {
 
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
-        if (native_pack) { spec_pos = pos; break; }
+        if (native_pack) { spec_pos = pos; spec_go = true; break; }
         if (pos >= o.max_context) {
             std::fprintf(stderr, "maya generate: ran out of context at position %lld\n", (long long) pos);
             return 2;
@@ -8366,7 +8396,7 @@ int main(int argc, char** argv) {
         ss.ple_prev[1] = (int32_t) tok;
         tok = (pos + 1 < n_prompt) ? o.tokens[(size_t) (pos + 1)] : next;
         // Plan v0.3 P6: from the first generated token on, the speculative loop below takes over.
-        if (o.spec > 0 && pos >= n_prompt - 1) { spec_pos = pos + 1; break; }
+        if (o.spec > 0 && pos >= n_prompt - 1) { spec_pos = pos + 1; spec_go = true; break; }
     }
 
     // ================================ plan v0.3 P6: SPECULATIVE DECODING ================================
@@ -8376,7 +8406,7 @@ int main(int argc, char** argv) {
     // round emits (accepted drafts + 1) tokens.  `commit` keeps the state of the tokens that were emitted.
     const bool ended = o.stop_eos && !produced.empty() &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
-    if (spec_pos > 0 && (int64_t) produced.size() < o.max_new && !ended) {
+    if (spec_go && (int64_t) produced.size() < o.max_new && !ended) {
         std::vector<int64_t> oracle;
         if (!o.spec_oracle.empty()) {
             std::ifstream in(o.spec_oracle);
@@ -8495,6 +8525,48 @@ int main(int argc, char** argv) {
         };
         int64_t p = spec_pos;
         int32_t x = (int32_t) tok;
+        // --dump-logits (issue #658): the rows of the positions a window keeps, in order.  A native pack's prompt
+        // positions the batched path left (--prefill-until) are read here first, through teacher-forced windows
+        // (every token committed, the draft layer given their residuals as the batched chunks give it), so their rows
+        // are written too and the answer starts after the whole prompt
+        std::vector<float> dump_rows(dump != nullptr ? (size_t) o.spec * (size_t) n_vocab : 0);
+        auto dump_window = [&](int64_t pos0, int rows) -> bool {
+            if (dump == nullptr || rows <= 0) return true;
+            if (!ver.read_head_logits(rows, dump_rows.data(), err)) return false;
+            for (int r = 0; r < rows; ++r) {
+                if (!strata::program::logits_selection::selected(pos0 + r, dump_positions, o.logits_stride)) continue;
+                if (std::fwrite(dump_rows.data() + (size_t) r * (size_t) n_vocab, sizeof(float), (size_t) n_vocab, dump) !=
+                    (size_t) n_vocab) {
+                    err = "cannot write logits at position " + std::to_string(pos0 + r);
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (dump != nullptr && native_pack && p < n_prompt - 1) {
+            ver.set_head_sampling(false);
+            std::vector<int32_t> win((size_t) o.spec), outw((size_t) o.spec), nxt((size_t) o.spec);
+            while (p < n_prompt - 1) {
+                const int T = (int) std::min<int64_t>(o.spec, n_prompt - 1 - p);
+                for (int t = 0; t < T; ++t) {
+                    win[(size_t) t] = (int32_t) o.tokens[(size_t) (p + t)];
+                    nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p + t + 1)];
+                }
+                drive.d.layers = 0;
+                drive.d.experts = 0;
+                drive.d.failed = false;
+                if (!ver.run(T, win.data(), p, &drive_pool_multi, &drive, outw.data(), err) || drive.d.failed ||
+                    !ver.commit(T, err) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, p, err)) ||
+                    !dump_window(p, T)) {
+                    if (drive.d.failed && drive.d.fail) err = drive.d.fail;
+                    std::fprintf(stderr, "maya generate: reading the prompt for --dump-logits: %s\n", err.c_str());
+                    return 1;
+                }
+                p += T;
+            }
+            ver.set_head_sampling(true);
+            x = (int32_t) o.tokens[(size_t) p];
+        }
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
@@ -8590,10 +8662,16 @@ int main(int argc, char** argv) {
             ++accepted_hist[(size_t) a];
             if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
             bool eos = false;
+            const size_t produced0 = produced.size();
             for (int i = 0; i <= a && (int64_t) produced.size() < o.max_new && !eos; ++i) {
                 produced.push_back(outv[(size_t) i]);
                 if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+            }
+            if (!dump_window(p, (int) (produced.size() - produced0))) {
+                if (adapt_thr.joinable()) adapt_thr.join();
+                std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+                return 1;
             }
             if (eos) {
                 if (adapt_thr.joinable()) adapt_thr.join();
