@@ -43,6 +43,23 @@ inline int staging_ring_mb(double room_bytes) {
     return (int) std::min(1200.0, std::max(400.0, mb));
 }
 
+// ---- the staging ring's slots by default (#609): the prompt path streams a layer's CPU-lane experts through the ring
+// in `parts` batches, so a batch is what a layer waits for before it computes on it.  A batch of about kRingBatchS of
+// this device's measured link (link: bytes a second, 0 = not measured) - a slow link waits less for each, a fast one
+// keeps the batch it had - at least one slot, never more than kRingMaxMB (the fixed default before) and never more
+// than 1/16 of the device's VRAM room for experts (room: bytes, 0 = not known).  Measured: 2x CMP 170HX on PCIe Gen2
+// x4 / x16 read prompts fastest at 1-3 slots a batch, an L40S at 5 of 18.8 MB (the most tried), a V100 on PCIe 3 x16
+// (6.9 MB experts) at 15, the 400 MB ring - smaller rings were slower there.  -> the slots (a multiple of parts)
+constexpr double kRingBatchS = 0.010;
+constexpr int kRingMaxMB = 400;
+inline int ring_slots(double link, size_t stride, double room, int parts) {
+    if (stride == 0 || parts <= 0) return parts;
+    const double cap_b = std::min((double) ((size_t) kRingMaxMB << 20), room > 0 ? room / 16.0 : 1e300);
+    const int cap = std::max(1, (int) (cap_b / (double) stride) / parts);   // (batches of the cap)
+    const int want = link > 0 ? (int) (link * kRingBatchS / (double) stride) : cap;
+    return std::max(1, std::min(cap, want)) * parts;
+}
+
 // ---- --mmap-experts auto: every CPU-lane expert copied into RAM (all bytes) when they fit what the process can get
 // (can) with `spare` more - never beside an integrated GPU, whose own allocations come out of the same RAM (force:
 // DS4_COPY_ALL, -1 unset, 0 never, 1 the fit alone decides, integrated or not)

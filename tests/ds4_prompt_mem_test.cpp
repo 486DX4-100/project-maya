@@ -57,6 +57,18 @@ int main() {
         CHECK(d::staging_ring_mb(18.75 * GB) == 1200);
         CHECK(d::staging_ring_mb(80 * GB) == 1200);
     }
+    {   // the ring's slots by the link (#609): ~10 ms of it a batch, 1 to 400 MB's worth, at most 1/16 of the room
+        const double GB = 1e9;
+        const size_t v100 = 6912000, cmp = 10234000, l40s = 18800640;   // (an expert blob: 256-aligned stride)
+        CHECK(d::ring_slots(0, v100, 0, 4) == 4 * (int) (((size_t) 400 << 20) / v100 / 4));   // (not measured: 400 MB)
+        CHECK(d::ring_slots(11.5 * GB, v100, 22 * GB, 4) == 60);   // (PCIe 3 x16: the 400 MB ring, as before)
+        CHECK(d::ring_slots(1.63 * GB, cmp, 50 * GB, 4) == 4);     // (Gen2 x4: one a batch)
+        CHECK(d::ring_slots(6.2 * GB, cmp, 50 * GB, 4) == 24);     // (Gen2 x16: 6 a batch)
+        CHECK(d::ring_slots(25 * GB, l40s, 30 * GB, 4) == 20);     // (PCIe 4 x16, big blobs: 400 MB, as before)
+        CHECK(d::ring_slots(11.5 * GB, v100, 1 * GB, 4) == 8);     // (1 GB of room: 62 MB, 2 a batch)
+        CHECK(d::ring_slots(11.5 * GB, v100, 0.01 * GB, 4) == 4);  // (at least one a batch)
+        CHECK(d::ring_slots(11.5 * GB, 0, 0, 4) == 4);
+    }
     {   // --mmap-experts auto beside an integrated GPU: none, unless DS4_COPY_ALL=1 (and they fit); =0 never
         const double GB = 1e9, spare = 8.0 * (1ull << 30);
         CHECK(d::copy_all_auto(100 * GB, 200 * GB, spare, false, -1));

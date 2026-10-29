@@ -4713,6 +4713,40 @@ struct Model::Impl {
         }
     }
 
+    // this device's host-to-device link (bytes a second): 32 MB from pinned memory, the best of three (~10 ms on
+    // PCIe 3 x16), once a device; 0: not measured
+    std::map<int, double> link_bw;
+    double link_h2d(Dev& d) {
+        if (auto it = link_bw.find(d.id); it != link_bw.end()) return it->second;
+        const size_t nb = (size_t) 32 << 20;
+        void* h = nullptr;
+        void* v = nullptr;
+        cudaStream_t s = nullptr;
+        cudaEvent_t e0 = nullptr, e1 = nullptr;
+        double best = 0;
+        cudaSetDevice(d.id);
+        if (cudaHostAlloc(&h, nb, cudaHostAllocPortable) == cudaSuccess && cudaMalloc(&v, nb) == cudaSuccess &&
+            cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess &&
+            cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess) {
+            std::memset(h, 0, nb);
+            for (int rep = 0; rep < 4; ++rep) {
+                float ms = 0;
+                if (cudaEventRecord(e0, s) != cudaSuccess || cudaMemcpyAsync(v, h, nb, cudaMemcpyHostToDevice, s) != cudaSuccess ||
+                    cudaEventRecord(e1, s) != cudaSuccess || cudaEventSynchronize(e1) != cudaSuccess ||
+                    cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess)
+                    break;
+                if (rep > 0 && ms > 0) best = std::max(best, (double) nb / (ms / 1000.0));   // (the first warms up)
+            }
+        }
+        if (e0) cudaEventDestroy(e0);
+        if (e1) cudaEventDestroy(e1);
+        if (s) cudaStreamDestroy(s);
+        if (v) cudaFree(v);
+        if (h) cudaFreeHost(h);
+        cudaGetLastError();
+        link_bw[d.id] = best;
+        return best;
+    }
     bool alloc_chunks(std::string& err) {
         chunks.resize(devs.size());
         const int D = g.dim;
@@ -4778,23 +4812,32 @@ struct Model::Impl {
                 c.room = c.own;
             }
             if (!halloc(c.bounds_pin, 2048, err)) return false;
-            if (stride > 0) {   // DS4_RING_MB (400) of slots in kParts batches
+            if (stride > 0) {   // slots in kParts batches: by this device's link (ring_slots, #609), or DS4_RING_MB
                 // (DS4_RING_MB=auto, opt-in until measured: from this device's VRAM room for experts, what is free now
                 // less --reserve-mib - 64 MB a GB of it, 400 to 1200 MB: the deeper ring lets a prompt queue more of
                 // its likely experts early where the cards cannot hold them, for that much VRAM less for experts)
                 const char* rm = std::getenv("DS4_RING_MB");
-                size_t mb = rm != nullptr ? (size_t) std::atoi(rm) : 400;
-                if (rm != nullptr && std::strcmp(rm, "auto") == 0) {
-                    size_t fr = 0, tot = 0;
-                    CK(mem_info(&fr, &tot));
-                    const double room =
-                        std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
-                    mb = (size_t) staging_ring_mb(room);
-                    std::fprintf(stderr, "ds4: CUDA%d staging ring (DS4_RING_MB=auto): %.1f GB of VRAM room -> %zu MB\n",
-                                 d.id, room / 1e9, mb);
-                }
+                size_t fr = 0, tot = 0;
+                CK(mem_info(&fr, &tot));
+                const double room =
+                    std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
                 c.ring_stride = stride;
-                c.ring_n = std::max(Chunk::kParts, (int) ((mb << 20) / stride) / Chunk::kParts * Chunk::kParts);
+                if (rm == nullptr || rm[0] == '\0') {
+                    const double link = link_h2d(d);
+                    c.ring_n = ring_slots(link, stride, room, Chunk::kParts);
+                    std::fprintf(stderr, "ds4: CUDA%d prompt ring: %d slots of %.1f MB, %d a batch (%.0f MB) for its "
+                                         "%.1f GB/s link (DS4_RING_MB sets it)\n",
+                                 d.id, c.ring_n, stride / 1048576.0, c.ring_n / Chunk::kParts,
+                                 (double) c.ring_n * stride / 1048576.0, link / 1e9);
+                } else {
+                    size_t mb = (size_t) std::atoi(rm);
+                    if (std::strcmp(rm, "auto") == 0) {
+                        mb = (size_t) staging_ring_mb(room);
+                        std::fprintf(stderr, "ds4: CUDA%d staging ring (DS4_RING_MB=auto): %.1f GB of VRAM room -> %zu MB\n",
+                                     d.id, room / 1e9, mb);
+                    }
+                    c.ring_n = std::max(Chunk::kParts, (int) ((mb << 20) / stride) / Chunk::kParts * Chunk::kParts);
+                }
                 if (!dalloc(d, c.ring, (size_t) c.ring_n * stride, err)) return false;
             }
             const size_t down_b = flow_down_bytes((int) di);   // (the flow's down scratch, where it takes one)
