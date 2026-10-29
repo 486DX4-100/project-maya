@@ -369,6 +369,20 @@ LOOP_STOP = object()
 LOOP_STOP_NOTE = "(The answer was stopped: the model kept repeating itself.)"
 # a request's max_tokens lowers the thinking budget only at or below this (Service.run)
 THINK_TINY_LIMIT = 1024
+# A reasoning block that reaches the thinking budget is closed at the end of its sentence or line, not mid-sentence
+# (#613: an agent's turn closed in the middle of a formula, and the answer after it was garbled): Service._sliced
+# closes it at the first boundary past the budget, and the engine's own close (its think_budget) only comes this many
+# tokens later, for reasoning with no boundary at all - at most half the room the request's max_tokens leaves after
+# the budget, so the answer keeps the rest.
+THINK_GRACE = 512
+_THINK_BOUNDARY = re.compile(r"(?:\n|(?<![\d.])[.!?][\"')\]]*|[。！？])[ \t]*$")
+
+
+def think_boundary(text: str) -> bool:
+    """The reasoning so far (its last characters will do) ends a line or a sentence: a newline, or . ! ? after
+    something other than a digit or another dot (not "3." of "3.0", not "..."), closing quotes or brackets allowed
+    after it."""
+    return bool(_THINK_BOUNDARY.search(text))
 
 # ---- log-probabilities (OpenAI's `logprobs` / `top_logprobs`; the DeepSeek engine's GEN logprobs=<n> and LP lines).
 # The engine reports, for each token it writes, the token's logprob and its row's n most likely, from the model's
@@ -3009,6 +3023,15 @@ class Service:
         return {"tokens": len(self.render_ids(messages, tools, kw)), "images": len(media),
                 "approximate": bool(media), "max_context": self.engine.max_context}
 
+    @staticmethod
+    def _say_malformed(parser):
+        """A tool call the parser could not read (it went out as text, or as an incomplete call: OutputParser): the
+        whole body in the server window (#613)."""
+        while parser.malformed:
+            body = parser.malformed.pop(0)
+            print(f"[maya] a malformed tool call, sent on as written instead of failing the answer "
+                  f"({len(body)} characters): {body!r}", flush=True)
+
     def _note(self, n, evs, stat):
         with self.status_lock:
             s = self.status
@@ -3108,6 +3131,7 @@ class Service:
         if (sampling or {}).get("_think_end") in produced:
             smp.pop("_think_budget", None)
             smp.pop("_think_end", None)
+            smp.pop("_think_soft", None)
         else:
             smp["_think_budget"] = max(1, tb - len(produced))
         return smp
@@ -3152,13 +3176,19 @@ class Service:
         produced, cur, left, smp = [], list(ids), max_new, sampling
         segments = []                                   # each slice's DONE (engine.last), summed at the end
         sent = 0                                        # produced[:sent] went to the caller (the guard holds the rest)
+        # the thinking budget closed at a sentence's or line's end (THINK_GRACE, #613): past `soft` tokens of
+        # reasoning, the first token that ends one is followed by the end of the thinking - this call stops there and
+        # the next goes on with it (the engine's own close, its think_budget, comes later, for reasoning with none)
+        soft, think_end = (sampling or {}).get("_think_soft"), (sampling or {}).get("_think_end")
+        soft_text = self._guard_piece() if isinstance(soft, int) and isinstance(think_end, int) else None
+        tail_text = ""
         while True:
             last0 = getattr(self.engine, "last", None)
             smp_call, n_call = guard.sampling(smp, len(produced), left) if guard is not None else (smp, left)
             gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb) if emb else \
                 self.engine.generate(cur, n_call, smp_call, cancel)
             slice_s, t0, cut, pausing = fair_slice_seconds(), None, False, False
-            act, got = None, 0                          # the loop guard's action; this call's tokens
+            act, got, closed = None, 0, False           # the loop guard's action; this call's tokens; a soft close
             try:
                 for t in gen:
                     if guard is None:
@@ -3168,14 +3198,23 @@ class Service:
                     if t is None:
                         continue
                     produced.append(t)
+                    if soft_text is not None:
+                        if t == think_end:
+                            soft_text = None            # (closed: by the model, or the engine's budget)
+                        else:
+                            tail_text = (tail_text + (soft_text(t) or ""))[-16:]
+                            if len(produced) >= soft and think_boundary(tail_text) and len(produced) < max_new - 1:
+                                closed = True
                     if guard is not None:
                         got += 1
-                        act = guard.push(t, len(produced))
+                        act = guard.push(t, len(produced)) if not closed else None
                         if act is not None:
                             break                       # (gen.close(): STOP + drain, still holding the FIFO)
-                        while sent < len(produced) - guard.hold:
+                        while sent < len(produced) - (guard.hold if not closed else 0):
                             sent += 1
                             yield produced[sent - 1]
+                    if closed:
+                        break                           # (gen.close(): STOP + drain, still holding the FIFO)
                     if t0 is None:
                         t0 = time.monotonic()
                     if slice_s > 0 and not pausing and not emb and not self.stopping and len(produced) < max_new \
@@ -3196,6 +3235,20 @@ class Service:
                 fresh = getattr(self.engine, "last", None)
                 if fresh is not None and fresh is not last0:
                     segments.append(fresh)
+            if closed:                                  # the budget, at a sentence's or line's end: the thinking ends
+                produced.append(think_end)
+                sent = len(produced)
+                soft_text = None
+                yield think_end
+                if guard is not None:
+                    guard.thinking_closed(produced)
+                print(f"[maya] thinking reached its budget ({soft} tokens): closed at the end of a sentence or line, "
+                      f"{len(produced) - 1 - soft} tokens later; answering", flush=True)
+                if cancel.is_set() or self.stopping:
+                    break
+                cur, left = list(ids) + produced, max_new - len(produced)
+                smp = self._resumed_sampling(sampling, produced)
+                continue
             if act is not None:                         # a loop: what is kept, then on from there - or the end
                 del produced[max(sent, len(produced) - act.drop):]   # (what was sent stays sent: only the held tail goes)
                 if act.kind == loop_guard.CLOSE_THINKING:
@@ -3365,12 +3418,22 @@ class Service:
                 # max_tokens=4096 used to cut the thinking to ~3K tokens and close it while the model was still
                 # reasoning. The forced </think> also consumes one token of max_new, so account for it.
                 think_budget = self.think_budget
+                soft = None                             # (the budget closed at a sentence's or line's end: _sliced)
                 if in_think and max_new and int(max_new) <= THINK_TINY_LIMIT:
                     reserve_floor = max(0, int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024))
                     reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
                     think_budget = max(1, min(think_budget, int(max_new) - reserve - 1))
+                elif in_think:
+                    # the engine's own close THINK_GRACE tokens later (at most half the room max_tokens leaves after
+                    # the budget); the reasoning ends at its first sentence or line end past the budget (#613)
+                    room = (int(max_new) - think_budget - 1) // 2 if max_new else THINK_GRACE
+                    grace = max(0, min(THINK_GRACE, room))
+                    if grace > 0:
+                        soft, think_budget = think_budget, think_budget + grace
                 if in_think:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
+                    if soft is not None:
+                        sampling["_think_soft"] = soft
                 # MAYA_DS4_RESTORE_POINTS: where the DeepSeek engine keeps restore points for this prompt (never a
                 # client's own `_restore`; not with pictures, whose spans the engine reads whole)
                 if sampling and "_restore" in sampling:
@@ -3432,8 +3495,9 @@ class Service:
                         if in_think and t == self.think_end_id:
                             in_think = False
                             if n == think_budget + 1:
-                                print(f"[maya] thinking reached its budget ({think_budget} tokens): closed, "
-                                      "answering", flush=True)
+                                print(f"[maya] thinking reached its budget ({think_budget} tokens"
+                                      f"{f', {soft} + {think_budget - soft} without a sentence end' if soft else ''})"
+                                      ": closed, answering", flush=True)
                         if t in self.stop_ids:
                             finish = "stop"
                             raw_ids.append(t)
@@ -3462,6 +3526,7 @@ class Service:
                                 text, held = held[:len(held) - k], held[len(held) - k:]
                         was = parser.state
                         evs = with_lp(parser.feed(text), was)
+                        self._say_malformed(parser)
                         self._note(n, evs, stat)
                         last_print = self._progress(last_print)
                         for ev in evs:
@@ -3580,6 +3645,7 @@ class Service:
         was = parser.state
         for ev in with_lp(parser.finish(), was):
             yield "event", ev
+        self._say_malformed(parser)
         yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
                        "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}

@@ -2302,5 +2302,136 @@ for line in sys.stdin:
         self.assertEqual(self.run_gen(3), [66, 67])
 
 
+class ThinkTok(ByteTokenizer):
+    SPECIALS = ByteTokenizer.SPECIALS + ["<think>", "</think>"]
+
+
+class BudgetEngine(MockEngine):
+    """Thinks `reasoning` (one id a byte) until the request's think_budget, where it closes the thinking itself as the
+    real engines do; a prompt that ends with the end of the thinking (the server closed it) gets the answer only."""
+
+    def __init__(self, tok, reasoning, answer):
+        super().__init__(tok, answer)
+        self.tok, self.calls = tok, []
+        self.end = tok.encode("</think>", parse_special=True)[0]
+        self.reasoning, self.answer = tok.encode(reasoning), tok.encode(answer) + tok.encode("<|im_end|>",
+                                                                                               parse_special=True)
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        sampling = dict(sampling or {})
+        self.calls.append(sampling)
+        if ids and ids[-1] == self.end:
+            yield from self.answer[:max_new]
+            return
+        budget = sampling.get("_think_budget") or 1 << 30
+        out = self.reasoning[:budget] + ([self.end] if budget < len(self.reasoning) else []) + self.answer
+        for t in out[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class ThinkingBudgetAtASentenceEnd(unittest.TestCase):
+    """#613: the thinking budget closed an agent turn's reasoning mid-sentence (in the middle of a formula), and the
+    answer after it was garbled.  Past the budget the reasoning now ends at its first sentence or line end."""
+
+    # sentences of 72 tokens (one a byte; numbered, so no loop for the loop guard): a budget of 100 lands in the second
+    SENT = "".join(f"Roof {i:02d} at its ridge is storyHalf_i+0.3 wide, so the eave sits above it. " for i in range(40))
+
+    def run_one(self, reasoning, budget, max_tokens, tools=None):
+        tok = ThinkTok()
+        engine = BudgetEngine(tok, reasoning, "Done.")
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.think_budget = budget
+        body = {"messages": [{"role": "user", "content": "Plan the roofs."}], "max_tokens": max_tokens,
+                "reasoning_effort": "high"}
+        if tools:
+            body["tools"] = tools
+        from serve.frontend import openai_to_messages
+        from serve.server import openai_chunks, openai_collect
+        msgs, schemas, kw = openai_to_messages(body)
+        ids, thinking, max_new = svc.prepare(msgs, schemas, kw, max_tokens)
+        out = openai_collect(openai_chunks(svc, body, ids, thinking, schemas, max_new, threading.Event()))
+        return out["choices"][0]["message"], engine.calls
+
+    def test_boundary(self):
+        from serve.server import think_boundary
+        for text in ("so the eave sits above it.", "wide.\n", "a line\n", 'he said "go."', "really?", "(see above.)"):
+            self.assertTrue(think_boundary(text), text)
+        for text in ("storyHalf_i+0.", "storyHalf_i+0.3", "and so", "wait...", "x = 3"):
+            self.assertFalse(think_boundary(text), text)
+
+    def test_closed_at_the_end_of_its_sentence(self):
+        msg, calls = self.run_one(self.SENT, 100, 8192, tools=[{"type": "function", "function": {
+            "name": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}])
+        thought = msg.get("reasoning_content") or ""
+        self.assertEqual(msg.get("content"), "Done.")
+        self.assertTrue(thought.endswith("Roof 01 at its ridge is storyHalf_i+0.3 wide, so the eave sits above it."),
+                        f"closed mid-sentence: {thought[-60:]!r}")
+        self.assertEqual(calls[0]["_think_budget"], 100 + 512)    # (the engine's own close: THINK_GRACE later)
+        self.assertEqual(calls[0]["_think_soft"], 100)
+        self.assertNotIn("_think_budget", calls[-1])              # (the call after the close: no budget left)
+
+    def test_no_sentence_end_closes_at_the_engines_budget(self):
+        words = "".join(random.Random(7).choices(string.ascii_lowercase + "  ", k=2000))   # (no sentence end, no loop)
+        msg, calls = self.run_one(words, 100, 8192)
+        self.assertEqual(len(msg.get("reasoning_content") or ""), 612)   # (the engine's close, as before)
+        self.assertEqual(msg.get("content"), "Done.")
+
+    def test_little_room_after_the_budget_keeps_half_of_it(self):
+        _, calls = self.run_one(self.SENT, 1100, 1301)            # (200 tokens after the budget: 100 of grace)
+        self.assertEqual(calls[0]["_think_budget"], 1100 + 100)
+        _, calls = self.run_one(self.SENT, 1500, 1501)            # (no room: the budget alone, as before)
+        self.assertEqual(calls[0]["_think_budget"], 1500)
+        self.assertNotIn("_think_soft", calls[0])
+
+
+class MalformedToolCallAnswers(unittest.TestCase):
+    """#613: a tool call the parser could not read failed the whole request - 24K tokens of work lost, only an error
+    for the client.  Now it goes on as written: as the answer's text, or (once announced) as an incomplete call."""
+
+    BAD = "write<arg_key>path</arg_key>oops<arg_value>PLAN.md</arg_value>"
+    TOOLS = [{"name": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]
+
+    def test_the_parser_never_raises(self):
+        from serve.frontend import CALL_END, CALL_START, OutputParser
+        for stream in (False, True):
+            p = OutputParser(thinking=False, tools=self.TOOLS, stream_tools=stream)
+            evs = p.feed("Let me write it." + CALL_START + self.BAD + CALL_END + " Then more.") + p.finish()
+            self.assertEqual(p.malformed, [self.BAD])
+            calls = [e for e in evs if e.kind == "tool_call"]
+            text = "".join(e.text for e in evs if e.kind == "content")
+            if stream:                                     # (announced as it streamed: an incomplete call)
+                self.assertEqual([(c.call.name, c.complete) for c in calls], [("write", False)])
+                args = "".join(e.text for e in evs if e.kind == "tool_args")
+                json.loads(args)                           # (its arguments still close as JSON)
+            else:                                          # (never announced: the text as the model wrote it)
+                self.assertEqual(calls, [])
+                self.assertIn(CALL_START + self.BAD + CALL_END, text)
+            self.assertIn("Then more.", text)
+
+    def test_the_request_answers(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>Let me write it.<tool_call>" + self.BAD + "</tool_call>"), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps({
+                "model": "m", "max_tokens": 512, "messages": [{"role": "user", "content": "Write the plan."}],
+                "tools": [{"type": "function", "function": self.TOOLS[0]}]}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                self.assertEqual(r.status, 200)
+                out = json.loads(r.read())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        msg = out["choices"][0]["message"]
+        self.assertNotIn("error", out)
+        self.assertIn("Let me write it.", msg.get("content") or "")
+        self.assertEqual([c["function"]["name"] for c in msg.get("tool_calls") or []], ["write"])
+
+
 if __name__ == "__main__":
     unittest.main()

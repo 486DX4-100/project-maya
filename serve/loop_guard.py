@@ -191,6 +191,12 @@ class LoopGuard:
             self.window = penalty_window(act.period)
             self.until = len(kept) + 2 * act.period + PENALTY_EXTRA
 
+    def thinking_closed(self, kept: list[int]) -> None:
+        """The server closed the thinking itself (its budget, at a sentence's end: `kept` ends with think_end): check on
+        from what is kept, with no penalty - nothing looped."""
+        self.in_think = False
+        self.det.reset(kept)
+
     def sampling(self, base: dict | None, written: int, left: int) -> tuple[dict | None, int]:
         """The sampling for an engine call that starts after `written` tokens, and how many tokens it may write:
         the request's own (and `left`) - unless the temporary penalty runs, which then ends that call where it ends.
