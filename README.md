@@ -14,8 +14,9 @@ Anthropic-compatible API · several requests at once</p>
 <p align="center">Created and led by <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>), co-maintained
 with <b><a href="https://github.com/needmorevram">@needmorevram</a></b></p>
 
-<p align="center"><a href="https://buymeacoffee.com/peasantsmith"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Project Maya is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
+<p align="center"><a href="https://github.com/sponsors/mw00"><img src="https://img.shields.io/badge/Sponsor-mw00-ea4aaa?logo=githubsponsors&logoColor=white&style=for-the-badge" alt="Sponsor on GitHub" height="50"></a>
+<a href="https://buymeacoffee.com/peasantsmith"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
+<sub>Project Maya is free. If it runs well on your PC, sponsoring it pays for the test hardware and the work on it.</sub></p>
 
 Models this size usually need a datacenter. Maya runs three of them on the hardware you already have:
 **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017** and **MiniMax-M3.1-Flash**. Each model has an engine built for it. It
@@ -263,9 +264,18 @@ your setup and the engine's speed lines; nothing is sent anywhere by itself. The
 
 ## Support
 
-Project Maya is free and open source. If it's useful to you, you can support it here - thank you!
+Project Maya is free and open source. Every release is tested on real machines before it ships, and sponsorship
+pays for that test hardware (the current goal: 50 monthly sponsors for a Mac and new GPUs, so Maya runs well on more hardware), for building
+new quants and models, and for faster fixes. If Maya saves you a cloud bill, consider sponsoring a small part of it
+back - thank you!
 
-<p align="center"><a href="https://buymeacoffee.com/peasantsmith"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+<p align="center"><a href="https://github.com/sponsors/mw00"><img src="https://img.shields.io/badge/Sponsor-mw00-ea4aaa?logo=githubsponsors&logoColor=white&style=for-the-badge" alt="Sponsor on GitHub" height="50"></a>
+<a href="https://buymeacoffee.com/peasantsmith"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+
+### Sponsors
+
+Thank you to everyone who sponsors Project Maya. Sponsors at $15 a month and up are listed here -
+[become the first](https://github.com/sponsors/mw00).
 
 Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md) says what helps most.
 
