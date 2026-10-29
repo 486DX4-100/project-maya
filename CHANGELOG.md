@@ -4,6 +4,63 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.37 - 2026-10-29
+
+DeepSeek keeps restore points so an edited long chat answers about 50x sooner (#639), `--parallel` reads prompts
+a piece at a time (#587), faster prompts on Strix Halo and less memory on Windows, and the loop guard never cuts a
+tool call.
+
+- **DeepSeek: editing the last message of a long chat gives the first token about 50x sooner** (#639, thanks @needmorevram):
+  the engine now keeps restore points in a conversation (the start of the last user message, a point near the
+  prompt's tail, the end of the system prompt and tools), so a chat edited at its end or a request that went away
+  mid-read no longer reads the whole conversation again. On a 20K-token chat on our 3 V100s the first token after an
+  edit came in 0.3 s instead of 18 s. A long cold prompt now takes a slightly different (equally valid) path
+  through the last tokens, so its exact words can differ from v1.1.36 on long chats, as they already do after any
+  cache hit; `MAYA_DS4_RESTORE_POINTS=0` turns the points off.
+- **DeepSeek `--parallel` is faster and DeepSeek can answer with log-probabilities** (#639): a step's attention for all
+  its requests runs in one launch (up to ~8% more total speed at four conversations; with DSpark 2 requests together
+  +7% and 4 requests +8-12% on our 3 V100s; one request +4%); `logprobs` / `top_logprobs` work on the OpenAI API;
+  faster IQ1/IQ2 GPU kernels (the persistent form is on by default for compute capability 8.0 and up) and AVX-512
+  CPU rows; IQ4_NL experts; a RAM expert store (`--ssd-cache`, opt-in); `--pack-info`, `--version`, `--profile-run`
+  and `tools/ds4/concurrent_check.py` (conversations at once must not see each other's state). Every exactness
+  check (together vs alone, `--multi-check`) came out bit for bit. We fixed its Windows and AMD builds and kept the
+  RAM copy of the CPU lane's experts on AMD APUs.
+- **Web UI follow-ups** (#632, thanks @needmorevram): on a phone the chats slide in beside the page and push it aside,
+  and Saved opens as a bottom sheet; the thinking chip opens a thick bar with a segment per level; the Models page
+  can delete a model (and its downloaded files if asked, never a file another model runs from), delete the running
+  model after a switch, list the files in the models folders that no model uses, and sets more DeepSeek and
+  MiniMax engine options; the Monitor shows the peak decode speed since Maya started.
+- **The loop guard never cuts inside a tool call:** repeated identical tool calls stay whole and are all delivered; a
+  loop inside a single call only gets the repetition penalty.
+- **Open WebUI streaming** (#605): the stream is at most 64 tokens behind the model (a block the model copies from its
+  own draft streams as it is written, where it used to go silent for 10-20 s and then arrive in a burst); the guard
+  closes the thinking far more rarely (more copies are needed inside the thinking, the first two loops only get the
+  penalty, the output is never stopped while still thinking, and a stop before any answer says so in one line instead
+  of ending empty); a client's `max_tokens` above 1024 no longer shortens the thinking budget; and MiniMax's second
+  thinking block after an answer part or tool call is shown as thinking.
+- DeepSeek `--tp 3`: new opt-in `DS4_TP_SHARES` gives each tensor-parallel member its own share of a group's expert
+  FFN (for example `2,3,4`), so a member that also holds the DSpark drafter and has less free VRAM can hold a smaller
+  part and the other members use their room; unset changes nothing (#591, thanks @NenadSteric).
+- DeepSeek: a client that sends the same tools in a different order (an MCP hub's server order, plugins registered
+  late) no longer makes the engine read the whole conversation again; the tools keep their first-seen order, as on
+  the other models. In our test a reordered request went from 15.7 s to 0.3 s (#625, thanks @SeriousRising).
+- DeepSeek `--parallel`: prompts are read a piece at a time on an event-driven scheduler, so answers keep writing
+  and short questions no longer wait behind a long read. A mixed four-agent run's first token came 16% sooner on
+  average and 1.4x sooner at the 95th percentile on our 3 V100s, total time unchanged (#587, thanks @mrsirg97-rgb).
+- DeepSeek: a recent-slot fill that fails no longer publishes its slot, so a failed copy can never be used as an
+  expert's weights; the expert is read over the RAM lane instead (#646, thanks @handmade0octopus).
+- **DeepSeek prompts faster on Strix Halo** (#643, @mrsirg97-rgb): on gfx1151 the prompt's routed experts now go through the
+  fused int8 experts GLM already uses (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS gate/up; where a layer's
+  formats are not covered the old path stays): prompt speed up ~8% at 2K and 8K on Maya-S, decode unchanged, perplexity
+  unchanged (the exact words of a greedy answer can differ, as the prompt's experts now use int8 activations); Maya-XS does not use it. `MAYA_DS4_PREFILL_FUSED=0` turns it off.
+- **DeepSeek on Windows: the one-GPU decode path for NVIDIA** (#567, @TheSmokeDev): the single-GPU path that reads streamed
+  experts in place now runs on Windows too, with the experts' copies pinned layer by layer as far as Windows allows
+  (`MAYA_DS4_PIN_BY_NEED=0` turns that off). Measured by the author on an RTX 3090.
+- **DeepSeek on Windows: far less memory held by the experts in the files** (#588, @handmade0octopus): the copied source pages
+  leave the process's working set as soon as they are copied, and the in-place experts the CPU lane reads are trimmed back
+  to the standby list past a ceiling (`MAYA_DS4_INPLACE_TRIM_GB`, default 6): the peak working set on a 32 GB Halo box fell
+  by 42% on Maya-S and the lowest free RAM went from about 1-3 GB to about 9-10 GB, decode unchanged, prompts ~2% slower.
+
 ## v1.1.36 - 2026-10-28
 
 DeepSeek drafting now works with `--parallel` (#611), MiniMax keeps its experts once in RAM instead of twice, the same
