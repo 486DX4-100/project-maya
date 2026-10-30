@@ -351,11 +351,33 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
   restated plan) streams on as it is written. What was sent stays; a loop's repeats past the tail are cut from what
   follows.
 - **Nothing changes without a loop:** the same engine calls with the same sampling, the same tokens.
+- **Across turns (agents):** an agent can loop with every answer short and fine - the same tool call, the same result,
+  the same call again. When a request ends with tool results and its last call (name, arguments and result all the
+  same) is the 3rd of its kind among the last 12 calls since the user's last message, a short message follows that
+  result, marked as the server's: the call gave nothing new, so use what is there, try a different approach or answer.
+  Only that prompt changes; the model goes on. A command run again after an edit gives another result, so it does not
+  count. The note is worded differently at the 3rd, 4th and 5th run; the last one says a block comes next. A call
+  made again after those three notes is **blocked**: it never reaches the client, the server answers it in the prompt
+  ("not run") with a firmer note and the model goes on in the same answer, its thinking started for it a step away from
+  the call (worded differently each time). It is never stopped: if it writes the blocked call again, the same happens,
+  a little hotter (temperature +0.15 a time from the 2nd, at most 1.5), until it does something else. A user's bare
+  "continue" / "proceed" / "ok" does not start the count over, and the model is told at once which calls stay blocked.
+  Within a row of the same call, a result that differs only in numbers or garbled bytes counts as the same (not for a
+  wait with `sleep`). Blocks count in `/metrics`
+  `loop_guard.tool_blocked` and `maya:loop_guard_tool_blocked_total`.
+- **A conversation that repeats itself:** once one piece of the model's own text turns up in 3 of its messages (or
+  one call with the same result has run 3 times), the prompt leaves out what the model already wrote: a sentence of
+  its reasoning or a paragraph of its answer text that it wrote before, and a tool round whose calls and results all
+  repeat earlier ones with nothing new said. The model then reads what it found once, not dozens of copies of the
+  same thoughts to go on from (GLM-5.3 had one sentence 543 times in an 88K prompt). Only the prompt changes, and each
+  message depends only on the ones before it, so the next request's prompt starts the same and the cache holds.
+  Counted in `loop_guard.collapsed` and `maya:loop_guard_collapsed_total`.
 
 The server window gets a line for each loop broken (`[maya] loop guard: a 19-token block 5 times in the answer at
 token 1,763: repeats dropped, a short repetition penalty`); the dashboard's Monitor marks that request (Loop guard,
 on hover what it did) and counts the loops since the start, as do `/metrics` (`loop_guard`) and
-`/metrics/prometheus` (`maya:loop_guard_*_total`).
+`/metrics/prometheus` (`maya:loop_guard_*_total`; the notes across turns: `[maya] loop guard: `bash` 3 times with the
+same arguments and result: a note after it`, `maya:loop_guard_tool_repeats_total`).
 
 Off for the server: `MAYA_LOOP_GUARD=0`, or `"loop_guard": false` in the run config. A request can choose for itself
 with `"loop_guard": false` (or `true`) beside its sampling fields (Chat Completions, Anthropic Messages).
