@@ -200,6 +200,23 @@ text (`MAYA_GLM_MTP_DECODE`, on by default on `gfx115x` only). On the Gorgon Hal
 3K- and 8K-token prompts, against 18.4-19.7 without it; 3K- and 8K-token prompts read at 271 and 278 tokens/s
 (the fused prompt experts and the `wmma2` attention, both on by default on `gfx1151`).
 
+## Instinct MI300X / MI325X
+
+AMD Instinct MI300X / MI325X (`gfx942`, CDNA3) is accepted as experimental, on one GPU. Like the MI100 it is a wave64
+card and runs through the hip_compat half-wavefront layer.
+
+Install ROCm's development packages for the card first (ROCm 7.14: `amdrocm-core-dev7.14-gfx942` and
+`amdrocm-blas-dev7.14`), then run the setup above without the `MAYA_GLM_RAM_GB` override. On an MI325X (256 GB) every
+expert of Maya-L fits in HBM next to a 1M-token context; with that much room, `"--kv-streaming", "off"` in the config's
+`"args"` keeps the whole latent cache on the card too.
+
+```sh
+./maya.sh --backend hip --gpu 0 --context 1048576 --no-vision --yes --model Maya-L --download-model
+```
+
+`./maya.sh --bench` on one MI325X (v1.1.27, Maya-L, 1M context, `--kv-streaming off`): answers at 84.0 tokens/s,
+prompts at 1307 tokens/s (2K tokens) and 1663 tokens/s (8K tokens). Not tried yet: the MI300X itself, more than one GPU.
+
 ## Windows
 
 `START-MAYA.bat --backend hip` sets Maya up natively on Windows 10/11 for the same GPUs, Strix Halo and Gorgon Halo
