@@ -1318,6 +1318,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         } else if (cx == 0) {   // (the storage's reads not measured here - but no expert ran on the CPU lane)
             out += " disk=0 ram_fetch=0";
         }
+        // Existing host timers, over the same interval as this STAT: one request in serial mode, the engine's
+        // busy interval with --parallel. These are measured regions, not GPU-only times or a wall-time breakdown.
+        std::snprintf(b, sizeof b, " draft_rounds=%lld draft_ms=%.3f verify_ms=%.3f",
+                      (long long) (s.drafts_rounds - s_dec.drafts_rounds), s.draft_ms - s_dec.draft_ms,
+                      s.verify_ms - s_dec.verify_ms);
+        out += b;
         if (d_off > 0) {
             std::snprintf(b, sizeof b, " drafts=%.3f", (double) d_acc / (double) d_off);
             out += b;

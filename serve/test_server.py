@@ -774,6 +774,7 @@ class PrometheusMetrics(unittest.TestCase):
         tok = ByteTokenizer()
         eng = MockEngine(tok, "</think>\n\nok", max_context=CTX)
         eng.stat = {"tok_s": 21.5, "vram_hit": 0.95, "promo": "x", "time": 1.0,
+                    "draft_rounds": 12, "draft_ms": 123.5, "verify_ms": 456.75,
                     "eg_cache_rows": 10, "eg_cache_cap": 100, "eg_cache_row_bytes": 264,
                     "eg_lookup_rows": 20, "eg_lookup_hits": 15, "eg_lookup_reads": 5}
         svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
@@ -793,6 +794,9 @@ class PrometheusMetrics(unittest.TestCase):
             self.assertGreater(int(lines["llamacpp:tokens_predicted_total"]), 0)
             self.assertEqual(lines["llamacpp:requests_deferred"], "0")
             self.assertEqual((lines["maya:engine_tok_s"], lines["maya:engine_vram_hit"]), ("21.5", "0.95"))
+            for key, value in (("draft_rounds", "12"), ("draft_ms", "123.5"), ("verify_ms", "456.75")):
+                self.assertEqual(lines["maya:engine_" + key], value)
+                self.assertIn("# TYPE maya:engine_" + key + " gauge", text)
             self.assertNotIn("maya:engine_promo", lines)          # not a number: left out
             self.assertEqual((lines["maya:engine_eg_cache_rows"], lines["maya:engine_eg_cache_cap"],
                               lines["maya:engine_eg_cache_row_bytes"]), ("10", "100", "264"))

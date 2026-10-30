@@ -2770,6 +2770,9 @@ class Service:
 
     # the GLM engine's live STAT values (StrataEngine._parse_stat) exported as gauges: key -> help
     PROM_STAT = {"tok_s": "Decode rate over the running request, tokens/s",
+                 "draft_rounds": "DSpark draft calls in the current decode interval (all requests with parallel serving)",
+                 "draft_ms": "DSpark drafter measured host time in the current decode interval, ms",
+                 "verify_ms": "DSpark verification forward measured host time in the current decode interval, ms",
                  "vram_hit": "Share of the routed experts found in VRAM (0..1)",
                  "ram_fetch": "Experts a token read from the RAM tier",
                  "disk": "Experts a token read from the SSD",
