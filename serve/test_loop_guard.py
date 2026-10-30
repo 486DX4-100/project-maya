@@ -545,7 +545,8 @@ class Server(unittest.TestCase):
         self.assertEqual(len(eng.calls), 4)                         # two penalties first, then the close
         self.assertEqual(eng.calls[3][0][-1], think_end)           # the thinking closed by its own token
         self.assertEqual(eng.calls[3][0].count(think_end), 1)
-        self.assertEqual(svc.loop_guard_counts, {"detected": 3, "penalised": 2, "thinking_closed": 1, "stopped": 0})
+        self.assertEqual(svc.loop_guard_counts, {"detected": 3, "penalised": 2, "thinking_closed": 1, "stopped": 0,
+                                                 "tool_repeats": 0, "tool_blocked": 0, "collapsed": 0, "kept_going": 0})
 
     def test_a_stop_before_any_answer_text_says_so(self):
         # a model with no end-of-thinking token that loops in its reasoning: the guard can only end it - never with
