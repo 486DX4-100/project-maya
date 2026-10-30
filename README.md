@@ -267,8 +267,9 @@ your setup and the engine's speed lines; nothing is sent anywhere by itself. The
 
 ## Support
 
-Project Maya is free and open source. Every release is tested on real machines before it ships, and sponsorship
-pays for that test hardware (the current goal: 50 monthly sponsors for a Mac and new GPUs, so Maya runs well on more hardware), for building
+Project Maya is free and open source. Every release is tested on our own NVIDIA and AMD machines before it ships (the
+Mac support so far only on GitHub's virtual Macs), and sponsorship pays for that test hardware (the current goal: 50
+monthly sponsors for a real Mac and new GPUs, so Maya runs well on more hardware), for building
 new quants and models, and for faster fixes. If Maya saves you a cloud bill, consider sponsoring a small part of it
 back - thank you!
 
