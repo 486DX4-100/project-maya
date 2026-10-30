@@ -253,6 +253,7 @@ function fieldsOf(m, d) {
     ["kv_streaming", "kv_resident", "parallel"]);
   const images = html`<${Row} label="Images" flag=${glm ? "vision" : "--vision"} changed=${ch("images")}
     hint=${m.choices.images ? "Reads images in chats. Off leaves its memory to the experts."
+      : glm && m.backend === "hip" ? "The setup does not build GLM's image encoder for AMD GPUs (HIP) yet: this model reads text only."
       : glm ? "This model was set up without its image encoder: the setup adds it." : "This pack has no vision tower."}>
     <${Switch} label="Images" on=${d.images} disabled=${!m.choices.images && !d.images} onChange=${(v) => setDraft({images: v})}/><//>`;
   const gpus = html`<${Row} label="GPUs" flag="gpu" changed=${ch("gpus")} hint="The engine splits the model across the GPUs picked. At least one."
