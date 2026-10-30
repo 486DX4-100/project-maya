@@ -765,6 +765,23 @@ split fail loading. Unset it to restore the first-group placement; it changes no
 execution devices or changing expert residency can change floating-point results, so this is not a bit-exactness
 or universal speedup claim. Measure your workload with drafting enabled and disabled.
 
+## DeepSeek: long prompts on two tensor-parallel groups
+
+A long prompt's chunks go through the GPU groups as a pipeline, and past the prompt skip's first layer (V4.1: 20)
+the layers run only on the prompt's last rows - so the layers before it set a chunk's pace. One wide group
+holding them all is slow: its members wait on the host-memory sums every layer, and DeepSeek-V4.1's 2304-wide
+experts (18 blocks of 128) split over 8 GPUs leave two of them 3 blocks a layer that every sum waits for. Two
+groups of four, each taking about half of those layers, run two chunks at once. `--tp 4` makes the groups (the
+RTX 3090 alone, then two of four RTX 5060 Ti) and `DS4_SPLIT=3,10,27` gives the 3090 layers 0-2 and the drafter,
+the first group layers 3-12 and the second 13-39 with the head (the automatic split does not yet weigh the skip:
+it puts every layer before it on one group). RTX 3090 + eight RTX 5060 Ti, EXL3 3.5 bpw, `--prefill-chunk 8192`
+(6400 lent), a fresh 118K-token prompt: `--tp 8` 1,775-1,786 tok/s, this 2,307 (each stage ~1.8-2.1 s a chunk);
+decode at 118K context the same (33.0 against 31.9 tok/s, 32 greedy tokens); perplexity 3.4080 against 3.4083
+(47,081 tokens). `DS4_RECENT=40` lends chunks of 8192: 2,389 tok/s, but fewer experts stay in VRAM (decode at
+118K 28.6). `DS4_SPLIT=3,9,28`: 2,128; `2,10,28`: 2,071; `--tp 9`: 1,558. At short context it answers slower: 12
+short prompts with DSpark (temperature 1) 63.7 against 69.8 tok/s - the first group's 10 layers keep ~89% of their
+experts in VRAM, the second's 27 only ~23%, and each token waits on the second's CPU lane.
+
 ## DeepSeek: skipping light experts the SSD would read (experimental)
 
 When DeepSeek-V4.1-Flash's experts do not fit in VRAM and RAM, a token waits for the SSD to read the experts it was
@@ -1113,6 +1130,7 @@ for bit.
 | `MAYA_DS4_FLOW_DOWN_SHARE` | off | `1` (with `DS4_FLOW_TP=1`): a group's members read each streamed expert's down from the files once, through the page cache (dropped once every member read it), where each member read it from the disk itself - the same bytes |
 | `MAYA_DS4_FLOW_DOWN_PART` | off | `1` (with `DS4_FLOW_TP=1` and `MAYA_DS4_TP_GGUF_UNEVEN`): each member copies only its own columns of a streamed expert's down to the GPU, compacted where it was read, not the whole down and a gather there - the same bytes in its slot (`MAYA_DS4_TP_CHECK` checks them at load) |
 | `MAYA_DS4_TP_BORROW` | off | `1` (with `DS4_FLOW_TP=1`): a group's members lend the prompt path the room of their last expert slots for its buffers, as one GPU does, so larger chunks (16K / 32K tokens) leave the decode as many VRAM experts; the experts under the buffers stream during the prompt and are read back after it (its time logged, as the decode waits for it) |
+| `MAYA_DS4_EXL3_LEND` | on | an EXL3 pack (its CPU-lane experts copied into RAM) with the expert cache on: every GPU lends the prompt path the expert cache's recent slots for its chunk buffers while a prompt runs - copies of CPU-lane experts, which stream from RAM meanwhile and are copied back after it - so the chunk buffers hold no VRAM of their own between prompts and a larger `--prefill-chunk` costs the decode nothing (8192: as large as the recent slots and the RAM allow - the chunk is lowered to what each GPU's recent slots hold, and the host buffers grow with it). On such a GPU the cache's swap slot sits before the recent slots, so no expert without a copy in RAM is ever lent. A layer of a lending GPU that every expert fitted keeps one of them in RAM, so it has the cache's slots to lend. RTX 3090 + eight RTX 5060 Ti, EXL3 3.5 bpw, `--prefill-chunk 8192` (7424 lent) against 4096 without it: a fresh 118K-token prompt 1,490 -> 1,748 tok/s, an agent's turn of 4,100 tokens 10.1 -> 8.1 s, 1,040 tokens 4.4-4.9 -> 4.1-4.7 s, 5,456 experts a 5060 Ti in VRAM instead of 5,040 (decode at 130K context 54-64 -> 64-70 tok/s), perplexity 3.4117 -> 3.4083. `DS4_CHECK_LEND=1` compares each lent slot's bytes before and after; `0`: the chunk buffers' own room, as before |
 
 A group of two sums its members' partial rows (the attention output's and the MoE's, every layer) by writing its whole
 partial out to host-mapped memory and then reading the other's in, four bytes a lane - one direction of the links at a
@@ -1565,14 +1583,22 @@ keep the state at three more places of each prompt it reads:
 - the end of the system prompt and its tools (the first user turn), given up last: another conversation behind the same
   start reads only its own part.
 
-None under 1,024 tokens, and none for a prompt with pictures. The read stops at each point and copies the state there to
-RAM - the window rings and the compressors' partial groups, a few MB (V4.1: its 43 layers' 128-row rings; the engine's
-log gives the size at the first one) - and a later prompt that leaves this one past a point reads on from there, from
-exactly the state the read kept. Each piece is read as a prompt of its own: with the prompt skip
-(`MAYA_DS4_PROMPT_SKIP`), layers 20-39 then also run on up to ~2,700 tokens before a point, which a read without the
-point would have skipped (as many as lie between the point and the prompt's end, when that is fewer), and the pieces'
-chunks end at the point, so that first read's answer can differ from a read without points the way another
-`--prefill-chunk` can. Each conversation `--parallel` holds has its own points, and a kept conversation keeps them and
+None under 1,024 tokens, and none for a prompt with pictures. The read keeps the state at each point - the window rings
+and the compressors' partial groups, a few MB in RAM (V4.1: its 43 layers' 128-row rings; the engine's log gives the
+size at the first one) - and a later prompt that leaves this one past a point reads on from there, from exactly that
+state. Where the points lie near the prompt's end (the tail point, and the last user turn's start when that turn is
+short), the read takes them on the way: one run of chunks, its layers keeping the state before each point as they pass
+it (`MAYA_DS4_MARKS_INSIDE`). Before, the read stopped at each and read the stretch after it as a prompt of its own -
+and with experts on the CPU lane each run of chunks streams them all once, a few seconds on GPUs that cannot hold them,
+so an agent's turn of 1,000 tokens took two of those. Elsewhere it still stops at the point: with the prompt skip
+(`MAYA_DS4_PROMPT_SKIP`) the one run would put the rows between a far point and the prompt's end through layers 20-39,
+which the stretch read alone skips (one read through a point does so only while that costs at most a chunk's rows).
+A read from token 0 also stops at the end of the system prompt and its tools, whose state is kept apart for new
+conversations (below). A tail point taken on the way costs no stop, so the tail point's measured cost (above) counts
+only the reads that stop at it. Each piece read alone, layers 20-39 also run on up to ~2,700 tokens before its point, which a read without the point
+would have skipped, and the pieces' chunks end at the point, so that first read's answer can differ from a read without
+points the way another `--prefill-chunk` can. `maya-ds4 --marks-check --ids ...` compares the two reads: with the skip
+off the same logits bit for bit, and from each point the same state. Each conversation `--parallel` holds has its own points, and a kept conversation keeps them and
 is taken back at them too. An RTX 3090 + eight RTX 5060 Ti, EXL3 3.5 bpw, an 18K-token chat: its last message edited, the
 first token after 15.0 s without the points (every token read again), 0.2 s with them (18,041 tokens kept, 14 read);
 the first read of the chat 16.7 -> 17.7 s.
@@ -1582,6 +1608,7 @@ the first read of the chat 16.7 -> 17.7 s.
 | `MAYA_DS4_RESTORE_POINTS` | 4 | `N` (1-16): the server asks for the points, and the engine keeps up to N a conversation besides its three - the least recently used gives way, the shared start last - in RAM, in every conversation it holds and in every kept conversation's slot; `0`: no GEN line carries them, the engine as before |
 | `MAYA_DS4_RESTORE_TAIL` | 512 | how many tokens before the prompt's end the tail point sits; `0`: no tail point |
 | `MAYA_DS4_RESTORE_TAIL_AUTO` | 1 | the engine leaves the tail point out where it measured its cost higher than reading its tokens again (above); `0`: kept on every read, as before |
+| `MAYA_DS4_MARKS_INSIDE` | on (1) | `0`: the read stops at every point, as before |
 
 ### New conversations behind the same system prompt and tools
 
