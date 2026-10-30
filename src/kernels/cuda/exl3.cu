@@ -2293,8 +2293,8 @@ __global__ void __launch_bounds__(kThreads) hip_rows_kernel(Mat m, const uint16_
     }
 }
 #if defined(STRATA_USE_HIP)
-static const char* hip_scalar_env(const char* strata, const char* maya, const char* native) {
-    const char* v = std::getenv(strata);
+static const char* hip_scalar_env(const char* internal, const char* maya, const char* native) {
+    const char* v = std::getenv(internal);
     if (v == nullptr) v = std::getenv(maya);
     return v != nullptr ? v : std::getenv(native);
 }
