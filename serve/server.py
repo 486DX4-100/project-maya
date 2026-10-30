@@ -504,8 +504,8 @@ def logprob_entry(tok, t, n_top: int) -> dict | None:
 
 def model_management_setting(cfg: dict | None, env=None) -> bool:
     """llama.cpp's model management (/models/load, /models/unload, /models/sse, for Open WebUI's Models page): off
-    unless the run config has "model_management": true or MAYA_MODEL_MANAGEMENT (STRATA_MODEL_MANAGEMENT) says 1 /
-    on / true / yes; the environment, when set, wins over the config."""
+    unless the run config has "model_management": true or MAYA_MODEL_MANAGEMENT says 1 / on / true / yes;
+    the environment, when set, wins over the config."""
     on = ("1", "on", "true", "yes")
     env = os.environ if env is None else env
     v = env.get("STRATA_MODEL_MANAGEMENT", env.get("MAYA_MODEL_MANAGEMENT"))
