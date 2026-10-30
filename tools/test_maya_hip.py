@@ -276,9 +276,27 @@ class HipSetupTests(unittest.TestCase):
             maya.refresh_engine(cfg)                    # compiled from this source already: nothing to do
             compile_hip.assert_not_called()
 
-    def test_hip_skips_vision_without_downloading(self):
+    def test_hip_no_vision_skips_without_downloading(self):
+        self.a.no_vision = True
         with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")):
             self.assertIsNone(maya.vision_step(self.a, {"backend": "hip"}, {}, self.root, self.root, "test"))
+
+    def test_hip_builds_the_vision_encoder(self):
+        # (#345) a HIP setup compiles maya-vision for its own GPUs, as a CUDA one does: the encoder on demand
+        spec = maya.MODELS.get("test") or maya.MODELS[next(iter(maya.MODELS))]
+        m = spec["vision"]
+        (self.root / m["folder"]).mkdir(parents=True, exist_ok=True)
+        for k in ("mmproj", "vocab"):
+            (self.root / m["folder"] / m[k]).write_bytes(b"x")
+        pc = {"backend": "hip", "archs": ["gfx1151"]}
+        self.a.rebuild = False
+        with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")), \
+                patch.object(maya, "compile_vision", return_value=True) as compile_vision, \
+                patch.object(maya, "VEXE", self.root / "no-maya-vision"):
+            v = maya.vision_step(self.a, pc, {"archs": ["gfx1151"]}, self.root, self.root, "test")
+        compile_vision.assert_called_once()
+        self.assertIs(compile_vision.call_args[0][0], pc)
+        self.assertTrue(v["gpu"])
 
     def installed_config(self, backend="hip", gpu=None):
         tp = self.root / "tokenizer"

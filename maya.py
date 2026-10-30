@@ -1976,11 +1976,10 @@ def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
     return (nvccs[0] if nvccs else nvcc_given), hc_given
 
 
-def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya") -> dict | None:
+def hip_toolchain(pc: dict) -> tuple:
+    """(ROCm root, its clang++, its bin folder, the build's environment) for a HIP build - the engine's and, on
+    Windows, the vision encoder's (#345)."""
     root = Path(pc["rocm"])
-    cmake = pick_cmake()
-    if not cmake:
-        fail("CMake 3.24 or newer is needed")
     clang = hip_clang(root) or root / "llvm/bin/clang++"
     bindir = Path(pc.get("rocm_bin") or root / "bin")
     env = dict(os.environ, HIP_PLATFORM="amd", HIP_COMPILER="clang", HIP_RUNTIME="rocclr",
@@ -1991,6 +1990,28 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
         env["LD_LIBRARY_PATH"] = os.pathsep.join(libs + [env.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
     # Keep compiler-cache writes inside this project, including when run in a workspace sandbox.
     env.setdefault("CCACHE_DIR", str(BUILD / ".ccache"))
+    if WIN:
+        env["HIP_DEVICE_LIB_PATH"] = str(clang.parent.parent / "amdgcn" / "bitcode")
+    return root, clang, bindir, env
+
+
+def copy_hip_dlls(bindir: Path, dest: Path) -> None:
+    # Windows takes a program's DLLs from its own folder, then System32 - where AMD's driver puts its own HIP
+    # runtime - and PATH only after: the runtime the program was built with goes next to it (as llama.cpp's
+    # Windows builds do; with the driver's, cudaMemGetInfo failed there)
+    for pattern in ("amdhip64*.dll", "amd_comgr*.dll", "rocm_kpack*.dll"):
+        for dll in bindir.glob(pattern):
+            try:
+                shutil.copy2(dll, dest)
+            except OSError as e:                   # (in use: a program still running keeps the one it has)
+                warn(f"could not copy {dll.name} next to {dest} ({e})")
+
+
+def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya") -> dict | None:
+    cmake = pick_cmake()
+    if not cmake:
+        fail("CMake 3.24 or newer is needed")
+    root, clang, bindir, env = hip_toolchain(pc)
     conf = [cmake]
     if WIN:
         # as tools\hip\build_maya_windows.bat, which built it on Windows (#54): ROCm's clang for the host code too, in
@@ -1998,8 +2019,7 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
         ninja = venv_tool("ninja") or shutil.which("ninja")
         if not ninja:
             fail("Ninja is needed to compile the HIP engine on Windows", f"run {ME} --setup again (pip puts it into .venv)")
-        bitcode = clang.parent.parent / "amdgcn" / "bitcode"
-        env["HIP_DEVICE_LIB_PATH"] = str(bitcode)
+        bitcode = Path(env["HIP_DEVICE_LIB_PATH"])
         conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={Path(ninja).as_posix()}",
                  f"-DCMAKE_C_COMPILER={(clang.parent / 'clang.exe').as_posix()}",
                  f"-DCMAKE_CXX_COMPILER={clang.as_posix()}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}",
@@ -2025,15 +2045,7 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
         fail("the HIP engine build failed", "see the compiler output above" +
              (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
     if WIN:
-        # Windows takes a program's DLLs from its own folder, then System32 - where AMD's driver puts its own HIP
-        # runtime - and PATH only after: the runtime the engine was built with goes next to it (as llama.cpp's
-        # Windows builds do; with the driver's, cudaMemGetInfo failed there). lib_dirs keeps the libraries
-        for pattern in ("amdhip64*.dll", "amd_comgr*.dll", "rocm_kpack*.dll"):
-            for dll in bindir.glob(pattern):
-                try:
-                    shutil.copy2(dll, EXE.parent)
-                except OSError as e:                   # (in use: an engine still running keeps the one it has)
-                    warn(f"could not copy {dll.name} next to the engine ({e})")
+        copy_hip_dlls(bindir, EXE.parent)              # (lib_dirs keeps the libraries)
     old = read_json(STAMP)   # (the targets compiled from this source: a GLM-5.3-Flash and a DeepSeek setup share it)
     same = old.get("backend") == "hip" and old.get("src") == src and old.get("archs") == pc["archs"]
     meta = {"backend": "hip", "src": src, "archs": pc["archs"], "rocm": str(root),
@@ -2941,12 +2953,21 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
              f"-DLLAMA_DIR={llama}"]
     hip = pc.get("backend") == "hip"
+    env = vcvars = bindir = None
     if hip:
         conf += ["-DSTRATA_VISION_HIP=ON",
                  "-DSTRATA_VISION_HIP_TARGETS=" + ";".join(str(x) for x in archs),
                  "-DAMDGPU_TARGETS=" + ";".join(str(x) for x in archs),
-                 "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(str(x) for x in archs),
-                 "-DCMAKE_EXE_LINKER_FLAGS=-no-pie"]
+                 "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(str(x) for x in archs)]
+        if WIN:
+            # ggml's HIP backend compiles its kernels as C++ on Windows (CMake has no HIP language there): ROCm's
+            # clang for C and C++, in Visual Studio's environment, as the engine (compile_engine_hip)
+            root, clang, bindir, env = hip_toolchain(pc)
+            conf += [f"-DCMAKE_C_COMPILER={(clang.parent / 'clang.exe').as_posix()}",
+                     f"-DCMAKE_CXX_COMPILER={clang.as_posix()}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}"]
+            vcvars = S.find_vcvars(cuda=False)
+        else:
+            conf.append("-DCMAKE_EXE_LINKER_FLAGS=-no-pie")
         if S.ARM and S.arm_cpu_arch():
             conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
     elif not metal:                                    # (macOS: ggml builds its Metal backend by default, no CUDA)
@@ -2963,9 +2984,11 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: 10-20 minutes") +
         ", once) ...")
     if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)],
-                   dict(os.environ) if metal else None, "" if metal else "build-maya-vision.bat",
+                   dict(os.environ) if metal else env, "" if metal else "build-maya-vision.bat", vcvars=vcvars,
                    nvcc=None if metal or hip else meta.get("nvcc") or pc["nvcc"]):
         return False
+    if bindir is not None and VEXE.exists():
+        copy_hip_dlls(bindir, VEXE.parent)
     VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
                                   "backend": pc.get("backend"),
                                   "date": time.strftime("%Y-%m-%d %H:%M")}, indent=1), encoding="utf-8")
