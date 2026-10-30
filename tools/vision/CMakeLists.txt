@@ -61,6 +61,13 @@ if(STRATA_VISION_HIP)
 endif()
 
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
+# float32 sums for the encoder's matmuls and attention on the GPU (ggml_vision_precision.py): on maya-vision's own
+# ggml only - the engines compile the same ggml files without it
+foreach(_t ggml-cuda ggml-hip)
+  if(TARGET ${_t})
+    target_compile_definitions(${_t} PRIVATE MAYA_VISION_F32_SUMS)
+  endif()
+endforeach()
 
 add_executable(maya-vision strata_vision.cpp)
 target_link_libraries(maya-vision PRIVATE mtmd llama)
