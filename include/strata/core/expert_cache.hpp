@@ -159,7 +159,35 @@ public:
     /// Slots filled so far, for the startup report.
     int64_t fills() const { return fills_; }
 
+    /// The on-demand vision encoder (serve VLEND / VRECLAIM): with `set_lendable(true)` before `open`, the arena is
+    /// mapped in pieces through CUDA's virtual memory API instead of one cudaMalloc, so pieces at its end can be
+    /// given back to the driver - another process (the encoder) can then allocate that memory - and mapped again
+    /// later at the SAME addresses (every pointer, table and captured graph stays valid; the slots there must be
+    /// filled again).  A device or build without that API gets the plain allocation: `lendable()` is false.
+    void set_lendable(bool on) { want_lend_ = on; }
+    bool lendable() const { return !pieces_.empty(); }
+    /// Unmaps whole pieces from the end until at least `bytes` are given back (never the first `keep_bytes`);
+    /// `from` = the arena offset where the unmapped part starts (a slot ending past it has lost its contents),
+    /// `given` = the bytes given back.  False with `err` when nothing can be given back.
+    bool lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from, uint64_t& given, std::string& err);
+    /// Maps the unmapped pieces again (false while the driver has not got that memory free yet; the pieces mapped
+    /// so far stay mapped, a later call maps the rest).  True when nothing is lent.
+    bool reclaim_tail(std::string& err);
+    /// Bytes `lend_tail` could give back at most, keeping the first `keep_bytes` (0 without lending).
+    uint64_t lendable_bytes(uint64_t keep_bytes) const;
+    bool lent() const { return lent_from_ != UINT64_MAX; }
+
 private:
+    struct Piece { uint64_t off, size; bool mapped; };
+    bool vmm_open(uint64_t bytes);    ///< the lendable arena (false: `vmm_err_` says why; nothing is left allocated)
+    void vmm_close();
+    bool map_piece(Piece& p, std::string& err);
+    std::string vmm_err_;
+    bool want_lend_ = false;
+    std::vector<Piece> pieces_;           ///< the arena's pieces when it is lendable (empty: one cudaMalloc)
+    uint64_t va_bytes_ = 0;               ///< the reserved address range (lendable)
+    uint64_t lent_from_ = UINT64_MAX;     ///< the first unmapped byte while lent
+    int dev_ = 0;
 #if defined(STRATA_USE_HIP)
     bool ensure_blocking_staging(std::size_t bytes, std::string& err);
     uint8_t* blocking_staging_ = nullptr;

@@ -567,6 +567,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
     set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
   endif()
+  # the expert cache's tail lent to the on-demand vision encoder and taken back (needs a GPU: 77 skips)
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_cache_lend_test.cpp")
+    enable_testing()
+    add_executable(expert_cache_lend_test tests/core/expert_cache_lend_test.cpp)
+    target_include_directories(expert_cache_lend_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(expert_cache_lend_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
+    add_test(NAME expert_cache_lend_test COMMAND expert_cache_lend_test)
+    set_tests_properties(expert_cache_lend_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+  endif()
   # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups); the EXL3 prompt
   # experts' tensor-core switch by chunk length (exl3_mma_rows): CPU only
