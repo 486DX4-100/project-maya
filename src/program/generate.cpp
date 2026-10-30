@@ -16,6 +16,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/platform/env_alias.hpp"
+#include "strata/platform/idle_gate.hpp"
 #include "strata/platform/env_report.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/core/expert_source.hpp"
@@ -1238,6 +1239,7 @@ static int glm_pack_generate(const Options& o) {
                 }
             };
             while (getline_fd(l)) {
+                strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
                 if (l.rfind("STOP ", 0) == 0 || (l.rfind("PAUSE ", 0) == 0 && l != "PAUSE keep")) {
@@ -7157,6 +7159,7 @@ int main(int argc, char** argv) {
                 }
             };
             while (getline_fd(l)) {
+                strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
                 std::lock_guard<std::mutex> lk(in_mu);

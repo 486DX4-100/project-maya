@@ -45,6 +45,7 @@
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/platform/dedicated.hpp"
+#include "strata/platform/idle_gate.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -13733,16 +13734,55 @@ struct Model::Impl {
         unsigned next = 1;
         rtrace_open();
         auto last = std::chrono::steady_clock::now();
+        // Idle (through a prompt, between requests) the thread backs off in stages instead of waking every 20 us for
+        // good - a core of a server busy enough to show in `top` while nothing ran (issue #685).  A decode's routes
+        // come ~1 ms apart, so it spins all through one.  After STRATA_DS4_SERVICE_IDLE_MS (200; 0 = the old
+        // 2 ms spin and 20 us sleeps always) without a route it polls every 0.1 ms, after 10x that every 2 ms, and
+        // after STRATA_DS4_SERVICE_DEEP_S (60; 0 = never) of quiet it sleeps on the idle gate, STRATA_DS4_SERVICE_DEEP_MS
+        // (100) at a time: the thread that reads the engine's input pokes the gate at each line, so the next request
+        // finds it awake (strata/platform/idle_gate.hpp).  The first route after a quiet spell is answered up to one
+        // sleep later, as the GLM path's service thread (src/core/glm_fast_path.cu) already does.
+        static const int kIdleMs = [] {
+            const char* v = ds4_env("DS4_SERVICE_IDLE_MS");
+            return v ? std::max(0, std::atoi(v)) : 200;
+        }();
+        static const int kDeepS = [] {
+            const char* v = ds4_env("DS4_SERVICE_DEEP_S");
+            return v ? std::max(0, std::atoi(v)) : 60;
+        }();
+        static const int kDeepMs = [] {
+            const char* v = ds4_env("DS4_SERVICE_DEEP_MS");
+            return v ? std::max(1, std::atoi(v)) : 100;
+        }();
+        strata::platform::IdleGate& gate = strata::platform::idle_gate();
+        uint64_t gate_seen = 0;
+        bool deep = false;
         std::vector<Ent> ents, hents;
         std::vector<std::pair<int, int>> hpicks;   // (expert, t * kPicks + i), the helper's
         while (!quit.load(std::memory_order_relaxed)) {
+            if (deep) gate_seen = gate.epoch();   // (before the look at the ring: a poke after it ends the sleep at once)
             Req& r = reqs[next % kRing];
             if (*(volatile unsigned*) &r.seq != next) {
+                const auto quiet = std::chrono::steady_clock::now() - last;
+                if (kIdleMs > 0 && quiet > std::chrono::milliseconds(kIdleMs)) {
+                    if (kDeepS > 0 && quiet > std::chrono::seconds(kDeepS)) {
+                        deep = true;
+                        if (gate.sleep(kDeepMs, gate_seen)) {   // the engine was written to: awake, as after a route
+                            deep = false;
+                            last = std::chrono::steady_clock::now();
+                        }
+                    } else if (quiet > std::chrono::milliseconds(10 * (int64_t) kIdleMs)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    } else {
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    }
+                    continue;
+                }
                 cpu_relax();
-                if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(2))
-                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                if (quiet > std::chrono::milliseconds(2)) std::this_thread::sleep_for(std::chrono::microseconds(20));
                 continue;
             }
+            deep = false;
             std::atomic_thread_fence(std::memory_order_acquire);
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
             Resp& rp = resps[next % kRing];

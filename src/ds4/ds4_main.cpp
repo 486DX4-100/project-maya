@@ -31,6 +31,7 @@
 #include "ds4_watchdog.hpp"
 #include "strata/core/vram_mark.hpp"
 #include "strata/platform/env_alias.hpp"
+#include "strata/platform/idle_gate.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 
@@ -206,6 +207,7 @@ struct Lines {
                 }
             };
             while (getline_fd(l)) {
+                strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 std::lock_guard<std::mutex> lk(mu);
                 if (l == "STOP" || l.rfind("STOP ", 0) == 0) {

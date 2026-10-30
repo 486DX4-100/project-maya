@@ -291,6 +291,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/env_report_test.cpp")
   add_test(NAME env_report_test COMMAND env_report_test)
 endif()
 
+# ---- idle_gate_test --------------------------------------------------------
+# The gate an idle engine's service threads sleep on, and a request's line wakes (strata/platform/idle_gate.hpp):
+# host code only, like env_report_test above.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/idle_gate_test.cpp")
+  add_executable(idle_gate_test EXCLUDE_FROM_ALL tests/idle_gate_test.cpp)
+  target_include_directories(idle_gate_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_link_libraries(idle_gate_test PRIVATE strata_warnings)
+  find_package(Threads)
+  if(Threads_FOUND)
+    target_link_libraries(idle_gate_test PRIVATE Threads::Threads)
+  endif()
+  add_test(NAME idle_gate_test COMMAND idle_gate_test)
+endif()
+
 # ---- strata_plan ----------------------------------------------------------
 # Also header-only.  A "planner" that hides state would be one whose decision is not inspectable, and the
 # whole point of P1.S9 is that the decision is arithmetic you can check by hand.

@@ -211,6 +211,46 @@ class Sampler(unittest.TestCase):
         self.assertNotIn("gpu_util", s)
         self.assertIn("ram_total", s)
 
+    def test_an_idle_unwatched_server_samples_slower_and_wakes_at_a_look(self):
+        """Issue #685: no request and nobody reading the numbers for a while: a reading every IDLE_S, not every second;
+        a read of the numbers (snapshot), a request (touch) or work in hand brings back the second at once."""
+        r = reader(absent=True)
+        busy = [False]
+        with mock.patch.object(T, "SYSFS", str(ROOT / "no-such-sysfs")), mock.patch.object(T, "WINDOWS", False):
+            t = T.Telemetry(gpu_index=0, reader=r, start=False, busy=lambda: busy[0])
+        self.assertEqual(t.pause(), 1.0)                       # (just started: watched)
+        t.watched_at -= T.WATCH_S + 1
+        self.assertEqual(t.pause(), T.IDLE_S)                  # unwatched and idle
+        busy[0] = True
+        self.assertEqual(t.pause(), 1.0)                       # a request runs
+        busy[0] = False
+        t.snapshot()
+        self.assertEqual(t.pause(), 1.0)                       # somebody read the numbers
+        self.assertEqual(T.Telemetry(gpu_index=0, reader=r, start=False).pause(), 1.0)   # no busy(): as before
+
+    def test_the_loop_keeps_the_series_a_second_apart_and_wakes_from_its_long_pause(self):
+        import threading
+        import time
+        r = reader(absent=True)
+        with mock.patch.object(T, "SYSFS", str(ROOT / "no-such-sysfs")), mock.patch.object(T, "WINDOWS", False), \
+             mock.patch.object(T, "IDLE_S", 3.0), mock.patch.object(T, "WATCH_S", 0.0):
+            t = T.Telemetry(gpu_index=0, reader=r, start=False, busy=lambda: False, extra=lambda: {"tok_s": 7.0})
+            time.sleep(0.01)
+            threading.Thread(target=t._loop, daemon=True).start()
+            time.sleep(0.2)
+            n = len(t.hist["tok_s"])                           # (the first reading; then it pauses IDLE_S)
+            self.assertGreaterEqual(n, 1)
+            self.assertTrue(t._slow)
+            t0 = time.monotonic()
+            t.touch()                                          # a request: the next reading comes now, not in 3 s
+            for _ in range(100):
+                if len(t.hist["tok_s"]) > n:
+                    break
+                time.sleep(0.01)
+            self.assertGreater(len(t.hist["tok_s"]), n)
+            self.assertLess(time.monotonic() - t0, 0.5)
+
+
     def test_gpu_pids(self):
         r = reader()
         self.addCleanup(r._stop)

@@ -30,6 +30,8 @@ import threading
 import time
 
 HISTORY = 60
+IDLE_S = 3.0      # the sampler's pause while no request runs and nothing has read the numbers lately (else 1 s)
+WATCH_S = 15.0    # "lately": how long after a GET /metrics (or a request) the sampler keeps its once-a-second pace
 
 
 # ------------------------------------------------------------------------------------------------ NVML (the server)
@@ -857,7 +859,7 @@ class _CpuRamFallback:
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, reader: _Reader | None = None,
-                 start=True):
+                 start=True, busy=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
@@ -865,8 +867,15 @@ class Telemetry:
         AMD ones read from the sysfs files (the HIP backend); when False and NVML finds no card at all, AMD is
         tried anyway (auto-detection), so the Monitor works on a HIP setup that runs this file's older caller.
         `reader`: the NVML reader process (the server's own by default); `start`: sample in a thread of its own
-        (else sample() only)."""
+        (else sample() only); `busy()` -> whether a request is running: while none is and nobody has read the numbers
+        for WATCH_S, the sampler pauses IDLE_S between readings instead of 1 s (issue #685: every reading wakes the
+        server and the NVML process - for numbers nobody looks at); a reader of the numbers (snapshot) or touch()
+        returns it to once a second at once."""
         self.extra = extra
+        self.busy = busy
+        self.watched_at = time.monotonic()           # (starts watched: the first readings come at the usual pace)
+        self._wake = threading.Event()
+        self._slow = False
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
@@ -978,21 +987,49 @@ class Telemetry:
                 pass
         return s
 
+    def touch(self) -> None:
+        """Someone looks at the numbers, or a request starts: back to once a second, now."""
+        self.watched_at = time.monotonic()
+        if self._slow:
+            self._wake.set()
+
+    def pause(self) -> float:
+        """The seconds to the next reading."""
+        quiet = self.busy is not None and time.monotonic() - self.watched_at > WATCH_S
+        try:
+            return IDLE_S if quiet and not self.busy() else 1.0
+        except Exception:  # noqa: BLE001 - not known: the usual pace
+            return 1.0
+
     def _loop(self):
+        last = time.monotonic()
         while True:
             try:
                 s = self.sample()
             except Exception:  # noqa: BLE001 - a reading that fails is empty this second; the sampler goes on
                 s = {}
+            now = time.monotonic()
+            # (a reading after a long pause stands for each of its seconds: the series stay a second apart)
+            held = max(1, min(int(IDLE_S) + 1, int(round(now - last))))
+            last = now
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
                           "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
-                    self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
-            time.sleep(1.0)
+                    for _ in range(held):
+                        self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
+            wait = self.pause()
+            self._slow = wait > 1.0
+            if self._slow:
+                self._wake.wait(wait)
+                self._wake.clear()
+                self._slow = False
+            else:
+                time.sleep(wait)
 
     def snapshot(self):
+        self.touch()                                 # (somebody reads the numbers)
         with self.lock:
             return {"now": dict(self.now), "history": {k: list(v) for k, v in self.hist.items()},
                     "static": dict(self.static)}

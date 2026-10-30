@@ -2614,10 +2614,17 @@ class Service:
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
-                                       amd=getattr(self, "backend", None) == "hip")
+                                       amd=getattr(self, "backend", None) == "hip",
+                                       busy=lambda: bool(self.active or self.status.get("busy") or self.status.get("queued")))
             if isinstance(self.engine, StrataEngine):
                 self.engine.gpu_busy = self._gpu_busy     # the stall watchdog's third sign of work
         self.start_queue_watch()
+
+    def touch_telemetry(self) -> None:
+        """A request starts: the hardware sampler returns to its once-a-second pace now (an idle server samples slower)."""
+        tel = getattr(self, "telemetry", None)
+        if tel is not None:
+            tel.touch()
 
     def start_queue_watch(self):
         """A queue that has stopped moving says so, every QUEUE_WARN_S, with what holds the engine and what is waiting:
@@ -3442,6 +3449,7 @@ class Service:
                     self.status["queued"] -= 1
             with self.status_lock:
                 self.active += 1
+                self.touch_telemetry()
                 hold[1] = True
                 self.status.update({k: mine[k] for k in ("busy", "phase", "prompt_tokens", "started", "tool", "tail",
                                                          "max_tokens") if k in mine},
@@ -3563,6 +3571,7 @@ class Service:
                                        started=time.time(), tool=None, tail="", max_tokens=max_new)
                     self.latest_request = stat
                     self.active += 1
+                    self.touch_telemetry()
                     counted = hold[1] = True
                     my_started = self.status["started"]
                     self.last_request_at = time.time()
