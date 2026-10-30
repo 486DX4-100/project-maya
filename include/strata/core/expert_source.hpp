@@ -66,6 +66,15 @@ const uint8_t* cache_complement_blob_or_fallback(
     size_t index, const std::vector<uint64_t>& offsets, const uint8_t* complement_host,
     const uint8_t* mapped_fallback);
 
+/// The drive probe's choice: of the reads-at-once counts tried (ascending) and the MB/s each reached, the fewest within
+/// `tol` (0.03: 3%) of the fastest - a drive that gains nothing from more reads in flight keeps few threads.  0: none
+/// measured.
+int pick_reads_at_once(const std::vector<int>& counts, const std::vector<double>& mbps, double tol = 0.03);
+
+/// A drive's line in the per-drive read cache ("<key> reads=<n> ..."): the count cached for `key` in `text` (the last
+/// line for it wins), 0 when there is none.
+int cached_reads_at_once(const std::string& text, const std::string& key);
+
 }  // namespace detail
 
 
