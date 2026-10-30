@@ -1700,3 +1700,28 @@ Engine options, in the config's `"args"`:
 |---|---|---|
 | `MAYA_EXPERT_RAM_GB` | unset (what the RAM allows) | caps the experts' RAM tier, in GB (the dashboard's Models page: Experts in RAM) |
 | `MAYA_EXPERT_STAGERS` | a quarter of the CPU threads, 2 to 8 | the threads that read a layer's experts from the file while the CPU prepares the layer (their reads overlap); `0`: read one by one when the CPU needs them |
+
+## HIP EXL3 single-row matrix jobs
+
+HIP automatically uses a smaller EXL3 matrix-vector kernel when every job in a batch has one activation row.
+It keeps workspace for one row instead of eight. A batch containing any multi-row job keeps the generic kernel.
+No setting is needed. Set `DS4_EXL3_MV1=0` in the engine configuration's `env` and restart to force the generic
+path; unset it or use `1` to restore automatic single-row selection. Use this exact spelling for the kernel switch.
+
+The input-split planner stays unchanged, preserving the order of partial sums. This does not expand weights, reserve
+another expert cache, or change model quantization. It affects native EXL3 matrix jobs; GGUF jobs use their own path.
+
+Validation command after building `exl3_test` on an idle GPU:
+
+```sh
+ctest --test-dir build-hip -R '^(exl3_test|exl3_mv1_test|exl3_mv_generic_test)$' --output-on-failure
+```
+
+The default, explicit-enable and opt-out tests run the existing CPU-reference and exact multi-row checks, plus mixed one-/three-row batches with
+strided inputs and guarded outputs. It includes integer EXL3 bitrates with all three codebooks and the supported
+half-integer bitrates. A controlled DS4 native-driver screen on three R9700s, based on v1.1.27, measured 3.4-5.0% higher generation
+throughput with draft proposals disabled, and about 0.7% with MTP. Expert placement was frozen and adjacent on/off
+requests shared one loaded model; the drafter stayed loaded in both modes. A separate fresh-load comparison was
+inconclusive because the controls drifted. These are limited model measurements, not production API acceptance or
+a general speed guarantee. Full-vocabulary diagnostic dumps matched across settings and repeats on the tested
+states; other GPU architectures and broader workloads remain unvalidated.

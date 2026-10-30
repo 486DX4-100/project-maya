@@ -210,6 +210,60 @@ void test_mv(int k, int n, int k2, int cb, bool q8, int view_c0 = -1, int view_n
     cudaFree(d_y);
 }
 
+// A mixed one-/three-row call must keep its generic fallback, with the same bits as
+// two one-row jobs. Keep both jobs in each reference call so mv_split's call_groups
+// stays unchanged; comparing against a lone job could select a different input split.
+void test_mv_mixed_columns(int k2, int cb) {
+    constexpr int k = 512, n = 512, xs = k + 32, ys = n + 16;
+    constexpr float guard = -7777.0f;
+    HostMat h = make_mat(k, n, k2, cb);
+    ex::Mat m;
+    m.trellis = dev_copy(h.tr);
+    m.suh = dev_copy(h.suh);
+    m.svh = dev_copy(h.svh);
+    m.k = k; m.n = n; m.k2 = k2; m.cb = cb;
+    float* x0 = dev_copy(rand_x(xs));
+    float* x3 = dev_copy(rand_x(3 * xs));
+    std::vector<float> guarded(3 * ys, guard);
+    float* y0 = dev_copy(guarded);
+    float* y3 = dev_copy(guarded);
+    float* r0 = dev_copy(guarded);
+    float* r1 = dev_copy(guarded);
+    ex::MvJob jobs[2];
+    for (auto& j : jobs) { j.m = &m; j.xf_cs = xs; j.y_cs = ys; }
+    jobs[0].xf = x0; jobs[0].y = y0; jobs[0].ncol = 1;
+    jobs[1].xf = x3; jobs[1].y = y3; jobs[1].ncol = 3;
+    for (int rep = 0; rep < 3; ++rep) if (!ex::mv(jobs, 2, 0)) ++g_fail;
+    CK(cudaDeviceSynchronize());
+    const auto mixed0 = host_copy(y0, guarded.size());
+    const auto mixed3 = host_copy(y3, guarded.size());
+    size_t bad = 0;
+    for (size_t i = 0; i < guarded.size(); ++i) {
+        if ((i >= ys || i % ys >= n) && mixed0[i] != guard) ++bad;
+        if (i % ys >= n && mixed3[i] != guard) ++bad;
+        if (!std::isfinite(mixed0[i]) || !std::isfinite(mixed3[i])) ++bad;
+    }
+    for (int row = 0; row < 3; ++row) {
+        jobs[0].y = r0;
+        jobs[1].ncol = 1; jobs[1].xf = x3 + row * xs; jobs[1].y = r1;
+        if (!ex::mv(jobs, 2, 0)) ++g_fail;
+        CK(cudaDeviceSynchronize());
+        const auto one0 = host_copy(r0, guarded.size());
+        const auto one1 = host_copy(r1, guarded.size());
+        for (int i = 0; i < n; ++i) {
+            bad += std::memcmp(&one0[i], &mixed0[i], sizeof(float)) != 0;
+            bad += std::memcmp(&one1[i], &mixed3[row * ys + i], sizeof(float)) != 0;
+        }
+        for (size_t i = n; i < guarded.size(); ++i)
+            bad += one0[i] != guard || one1[i] != guard;
+    }
+    std::printf("  mixed 1/3-row mv K%s cb%d: %zu mismatches/guard failures  %s\n",
+                kname(k2).c_str(), cb, bad, bad ? "FAIL" : "ok");
+    if (bad) ++g_fail;
+    CK(cudaFree((void*) m.trellis)); CK(cudaFree((void*) m.suh)); CK(cudaFree((void*) m.svh));
+    for (float* p : {x0, x3, y0, y3, r0, r1}) CK(cudaFree(p));
+}
+
 void test_batch(int k2a, int k2c) {
     // three jobs, two bit widths: the launch per (K, cb) and the per-job scratch ranges
     const int k = 8192;
@@ -1697,6 +1751,11 @@ int main(int argc, char** argv) {
     test_mv(4096, 1024, 4, 2, false, 384, 256);   // a column view
     test_batch(8, 6);
     test_batch(16, 12);                     // 8-bit attention / shared experts (EXL3-sc_4.10bpw)
+#if defined(STRATA_USE_HIP)
+    for (int k2 = 2; k2 <= 16; k2 += 2)
+        for (int cb = 0; cb < 3; ++cb) test_mv_mixed_columns(k2, cb);
+    for (int k2 : {3, 5, 7}) test_mv_mixed_columns(k2, 2);
+#endif
     // routed experts above 4 bits: EXL3-sc_4.10bpw's first MoE layer is 5-bit
     for (int k2 : {4, 6, 8, 10, 12, 16}) test_moe(k2, 2);
     test_moe(6, 1);

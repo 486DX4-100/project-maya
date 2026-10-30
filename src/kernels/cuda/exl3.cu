@@ -343,6 +343,21 @@ __device__ __forceinline__ void mma_f32(float (&c)[4], uint32_t a0, uint32_t a1,
 }
 #endif
 
+#if defined(STRATA_USE_HIP)
+// Preserve the scalar fallback rounding tree when one-row specialization changes compiler scheduling.
+// Empty VGPR constraints prevent reassociation without adding arithmetic instructions.
+__device__ __forceinline__ float dot4_acc_exact(float a, const float* v, float x0, float x1, float x2, float x3) {
+    float p = __fmul_rn(v[0], x0);
+    asm volatile("" : "+v"(p));
+    p = __fmaf_rn(v[1], x1, p);
+    asm volatile("" : "+v"(p));
+    p = __fmaf_rn(v[2], x2, p);
+    asm volatile("" : "+v"(p));
+    p = __fmaf_rn(v[3], x3, p);
+    asm volatile("" : "+v"(p));
+    return __fadd_rn(a, p);
+}
+#endif
 // a tile's words, and a lane's share of them (word lane + 32 r)
 template <int K2>
 struct Words {
@@ -408,17 +423,17 @@ constexpr int kMinBlocksMv = 2;
 #endif
 
 // the shared memory of a block_gemv block
-template <int K2>
+template <int K2, int Tokens = kTok>
 struct BlockSmem {
-    __half xb[2 * kTok * kCols];       // two chunk buffers, kTok activations each
+    __half xb[2 * Tokens * kCols];       // two chunk buffers, kTok activations each
     uint32_t stage[kWarps * 4 * K2];   // a tile per warp (K != 4)
-    float out[kTok * kCols];
+    float out[Tokens * kCols];
 };
 
 // (kTag 1: the mixed kernels' own copy - sharing one with them changes how AMD compiles the others' arithmetic)
-template <int K2, int cb, class Input = Xin, int kTag = 0>
+template <int K2, int cb, class Input = Xin, int kTag = 0, int Tokens = kTok>
 __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input& x,
-                           const uint16_t* __restrict__ suh, int nc, BlockSmem<K2>& sm) {
+                           const uint16_t* __restrict__ suh, int nc, BlockSmem<K2, Tokens>& sm) {
     constexpr int W = Words<K2>::W, R = Words<K2>::R;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
     const size_t sstride = (size_t) ld * W;
@@ -433,12 +448,12 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #if defined(EXL3_TC)
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #else
-    float acc[kTok][2];
+    float acc[Tokens][2];
 #pragma unroll
-    for (int cc = 0; cc < kTok; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
+    for (int cc = 0; cc < Tokens; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
 #endif
     for (int q = 0; q < nq; ++q) {
-        __half* xq = sm.xb + (q & 1) * (kTok * kCols);
+        __half* xq = sm.xb + (q & 1) * (Tokens * kCols);
         if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
         __syncthreads();
         if (q + 1 < nq) {
@@ -461,7 +476,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #elif defined(EXL3_DOT2)
             // the pairs straight from FP16 (f[i]: steps 2i, 2i + 1; the activation's 2t, 2t + 1 / 2t + 8, 2t + 9)
 #pragma unroll
-            for (int cc = 0; cc < kTok; ++cc)
+            for (int cc = 0; cc < Tokens; ++cc)
                 if (cc < nc) {
                     const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
                     const uint32_t xa = *reinterpret_cast<const uint32_t*>(xr);
@@ -478,13 +493,21 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
                 v[2 * i + 1] = d.y;
             }
 #pragma unroll
-            for (int cc = 0; cc < kTok; ++cc)
+            for (int cc = 0; cc < Tokens; ++cc)
                 if (cc < nc) {
                     const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
                     const float x0 = __half2float(xr[0]), x1 = __half2float(xr[1]);
                     const float x2 = __half2float(xr[8]), x3 = __half2float(xr[9]);
-                    acc[cc][0] = dot4_acc(acc[cc][0], v, x0, x1, x2, x3);
-                    acc[cc][1] = dot4_acc(acc[cc][1], v + 4, x0, x1, x2, x3);
+                    #if defined(STRATA_USE_HIP)
+                    if constexpr (Tokens == 1) {
+                        acc[cc][0] = dot4_acc_exact(acc[cc][0], v, x0, x1, x2, x3);
+                        acc[cc][1] = dot4_acc_exact(acc[cc][1], v + 4, x0, x1, x2, x3);
+                    } else
+#endif
+                    {
+                        acc[cc][0] = dot4_acc(acc[cc][0], v, x0, x1, x2, x3);
+                        acc[cc][1] = dot4_acc(acc[cc][1], v + 4, x0, x1, x2, x3);
+                    }
                 }
 #endif
         }
@@ -507,7 +530,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #else
     // the 4 lanes of one g hold parts of the same two outputs
 #pragma unroll
-    for (int cc = 0; cc < kTok; ++cc)
+    for (int cc = 0; cc < Tokens; ++cc)
         if (cc < nc) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
@@ -564,13 +587,14 @@ struct KBatch {
 // a launch's blocks: its jobs' (output block, input split) pairs, each for all of the job's nc activations at once
 // (block_gemv).  S > 1: the partial sums go to the scratch and the last block of an output block adds them up in split
 // order (deterministic) and runs the epilogue
-template <int K2, int cb>
+template <int K2, int cb, bool Single = false>
 __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
-    __shared__ __align__(16) BlockSmem<K2> sm;
+    __shared__ __align__(16) BlockSmem<K2, Single ? 1 : kTok> sm;
     __shared__ int last;
     int ji = 0;
     while ((int) blockIdx.x >= b.blk_end[ji]) ++ji;
     const KJob& J = b.j[ji];
+    const int nc = Single ? 1 : J.nc;
     const int local = (int) blockIdx.x - (ji > 0 ? b.blk_end[ji - 1] : 0);
     const int g = local / J.S, sp = local % J.S;
     const int k0 = sp * J.kr, k1 = min(J.k, k0 + J.kr);
@@ -579,19 +603,19 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     // every block of the launch returns and no split counter moves
     if (b.skip != nullptr && *b.skip) return;
     Xin x;
-    if (warp < J.nc) {
+    if (warp < nc) {
         if (J.xf != nullptr) x.f = J.xf + warp * J.xf_cs;
         else x.q = (const Q81*) ((const uint8_t*) J.xq + warp * J.xq_cs);
     }
-    block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, J.nc, sm);
+    block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
     const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
     if (J.S == 1) {
-        if (warp < J.nc)
+        if (warp < nc)
             epilogue(sm.out + warp * kCols, J.svh + g * kCols, J.alpha, bias, J.y + warp * J.y_cs + g * kCols);
         return;
     }
     if (threadIdx.x < kCols)
-        for (int c = 0; c < J.nc; ++c)
+        for (int c = 0; c < nc; ++c)
             J.part[((size_t) c * J.S + sp) * J.n + g * kCols + threadIdx.x] = sm.out[c * kCols + threadIdx.x];
     __threadfence();
     __syncthreads();
@@ -600,14 +624,14 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     if (!last) return;
     __threadfence();
     if (threadIdx.x < kCols)
-        for (int c = 0; c < J.nc; ++c) {
+        for (int c = 0; c < nc; ++c) {
             float s = 0.0f;
             for (int i = 0; i < J.S; ++i)
                 s += *(volatile const float*) &J.part[((size_t) c * J.S + i) * J.n + g * kCols + threadIdx.x];
             sm.out[c * kCols + threadIdx.x] = s;
         }
     __syncthreads();
-    if (warp < J.nc)
+    if (warp < nc)
         epilogue(sm.out + warp * kCols, J.svh + g * kCols, J.alpha, bias, J.y + warp * J.y_cs + g * kCols);
     if (threadIdx.x == 0) J.cnt[g] = 0u;
 }
@@ -1818,7 +1842,18 @@ bool dispatch(int K2, int cb, A&&... args) {
 }
 
 template <int K2, int cb> struct RunMv {
-    static void run(const KBatch& b, int blocks, cudaStream_t s) { mv_kernel<K2, cb><<<blocks, kThreads, 0, s>>>(b); }
+    static void run(const KBatch& b, int blocks, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        // A one-row batch needs only one row of accumulators/scratch. Keep the input-split planner
+        // and reduction order unchanged; a mixed/multi-row batch always uses the generic kernel.
+        // Enabled by default on HIP; DS4_EXL3_MV1=0 is the explicit rollback.
+        static const bool enabled = [] { const char* v = std::getenv("DS4_EXL3_MV1"); return !v || std::atoi(v) != 0; }();
+        bool single = enabled;
+        for (int i = 0; i < b.n && single; ++i) single = b.j[i].nc == 1;
+        if (single) { mv_kernel<K2, cb, true><<<blocks, kThreads, 0, s>>>(b); return; }
+#endif
+        mv_kernel<K2, cb><<<blocks, kThreads, 0, s>>>(b);
+    }
 };
 template <int K2, int cb> struct RunWin {
     static void run(const KWin& a, int groups, cudaStream_t s) {
