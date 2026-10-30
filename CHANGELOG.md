@@ -4,6 +4,77 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.41 - 2026-10-30
+
+A community release: 36 contributions. DeepSeek reads the first long prompt after a start about 1.3x faster on
+multi-GPU PCs and is faster on PCs short of RAM, agents get a loop guard that works across turns and a cancelled
+prompt read that is resumed, Open WebUI can manage the model, and AMD GPUs get faster GLM prompts on Strix Halo, the
+DFlash2 drafter on one Ryzen AI Max APU and early Instinct support. Against v1.1.40 on our test PCs, decode and
+prompt speeds are otherwise unchanged (GLM, DeepSeek on one and on three GPUs, MiniMax, Qwen).
+
+- **DeepSeek: the first long prompt after a start is read about 1.3x faster** on a multi-GPU PC (#612, thanks
+  @Whamp): a short warm-up's timing no longer misleads the engine's choice of how to read a long prompt. On three
+  V100s (`--tp 2`) the first 8K-token prompt now reads as fast as the ones after it.
+- **DeepSeek on a PC short of RAM** (#669, thanks @xiongqiyang): with `--mmap-experts off`, the experts copied to RAM
+  are now shared fairly between the layers, so no layer is left with none. On our RAM-limited test (32 GB, one GPU)
+  a long answer took about 20% less time, with the later part about 2x faster, and the same tokens.
+  `--mmap-experts auto` (the default) is unchanged. `DS4_COPY_FAIR=0` restores the old order.
+- **Agents:**
+  - The loop guard now works across turns (#640, thanks @merbanan): an agent that makes the same tool call with the
+    same result a third time gets a short note in its prompt, and one that keeps going is steered off it. Normal
+    agent conversations, and a call repeated after an edit, get exactly the same prompt as before. On by default.
+  - GLM: a cancelled prompt read keeps its last checkpoint, so an agent that times out and retries goes on from there
+    instead of reading the whole prompt again (#573, thanks @rushisan). Keeping the snapshot before the generation
+    prompt, so a cancelled answer's next prompt continues it, is opt-in for now (`MAYA_GLM_SNAP_GEN=1`, #572, thanks
+    @rushisan).
+  - Very long streamed tool arguments no longer slow down as they grow, and streamed replies are sent without delay
+    (#626, thanks @SeriousRising).
+- **Server and clients:**
+  - Open WebUI's Models page can load the model, free its GPU memory and watch its state through llama.cpp's
+    `/models/load`, `/models/unload` and `/models/sse` - off unless `"model_management": true` is in the config
+    (#678, thanks @rilken-star).
+  - `/v1/models` lists each model's `context_length` for clients that size their requests by it (#649, thanks
+    @NorwinYu).
+  - `/status` asks for the API key when one is set, and a request during an engine start gets a retryable 503
+    (#677, thanks @rilken-star). A reply that ends or is cancelled keeps its final statistics (#652, thanks
+    @LostVector).
+- **AMD GPUs:**
+  - Strix Halo: GLM's prompt experts run with a better occupancy for GLM's shape - about 11% less time for that step
+    on our Halo, the same results bit for bit (#634, thanks @mrsirg97-rgb).
+  - One Ryzen AI Max APU (Strix / Gorgon Halo) is offered the DFlash2 drafter for GLM in the setup; MTP stays the
+    default and the speed calibration keeps DFlash2 only where it is faster (#628, thanks @mrsirg97-rgb).
+  - A hipBLASLt tuning preset for GLM's prompt GEMMs, and a warning when a shape is not in the table (#582, thanks
+    @precisionailabsllc-collab).
+  - EXL3: a specialised one-row decode kernel by default (#470), configurable prompt tiles on RDNA4 (#593) and RDNA4
+    matrix prefill, opt-in with `EXL3_WMMA_GFX12=1` until we can measure it (#365) - thanks @LostVector.
+  - Experimental Instinct MI300X / MI325X (gfx942) and MI350X / MI355X (gfx950) support, compile-checked (#468, #581,
+    thanks @yagop).
+  - DeepSeek on two AMD GPUs: an exact peer-VRAM transport for prompts, opt-in (`MAYA_DS4_HIP_PEER_AR=auto`) until a
+    two-GPU AMD PC has measured it (#592, thanks @LostVector). The PCIe lane's timing uses the GPU clock on RDNA3 /
+    RDNA4, and `DS4_IQ1S_ROWS` chooses IQ1_S's own CPU rows (#563, thanks @Cass67).
+- **GLM:**
+  - The expert pool keeps at least one route's experts of every size class, so mixed-recipe GGUFs no longer evict
+    their own route (#660, thanks @Cass67).
+  - IQ1_S / IQ2_S / IQ3_S prompts no longer read garbage on Windows with CUDA 13.2 (#487, thanks @Fringe210).
+  - Prompt GEMVs over IQ weights read each weight block once per batch of columns, bit for bit as before (#560,
+    thanks @precisionailabsllc-collab), and two small route-kernel optimisations (#451, #486, thanks @merbanan).
+  - Windows + NVIDIA, one GPU: a balanced RAM-resident expert plan, opt-in with `MAYA_GLM_RAM_BALANCED=1` (#153,
+    thanks @PhysicistLeon).
+- **DeepSeek:**
+  - Pictures: the vision tower no longer comes out zero when built with C++20 and CUDA 12.1 (#676, thanks
+    @rilken-star).
+  - DSpark's drafter skips the rows a round cannot keep, with the same drafts (#622, thanks @SeriousRising).
+  - `--experts N`: a token takes the router's top N experts (lossy; an engine flag for experiments, #564, thanks
+    @Cass67).
+  - Drafter and verification timings in the STAT line and `/metrics/prometheus` (#647), and opt-in placements for
+    a helper GPU with EXL3 experts and for DSpark's blocks (#527), with the helper's experts shown on their own in
+    the Monitor (#599) - thanks @LostVector.
+- **CPU lane:** IQ1_M and IQ2_XS rows that are faster on AVX2 CPUs (#623, thanks @SeriousRising) and an AVX-512 VNNI tier for EXL3 rows on
+  CPUs that have it (#596, thanks @sbleschke), both bit for bit.
+- **MiniMax:** reports include the engine's load summary and image setting (#667, thanks @tobitege).
+- **Docs:** the Intel Arc page is up to date with stock llama.cpp (#674, thanks @Jumbomuffin777).
+- The README's download badges are served from this repository, so they no longer time out.
+
 ## v1.1.40 - 2026-10-30
 
 Experimental Mac support: GLM-5.3-Flash on Apple silicon, from a community contribution. DeepSeek's restore point
