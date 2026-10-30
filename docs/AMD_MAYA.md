@@ -279,7 +279,11 @@ sub-batches. Two settings matter on AMD:
   without a row, it keeps plain hipBLAS. Builds of one hipBLASLt version can
   number their solutions differently, so a version may have more than one table
   (`<version>.txt`, `<version>-b.txt`): the engine keeps every matching table
-  and takes, per shape, the first whose solution its hipBLASLt accepts. The tuner's absolute-error gate now
+  and takes, per shape, the first whose solution its hipBLASLt accepts. The tuner's default shapes are
+  DeepSeek's, so a table generated from them covers none of another model's
+  projections: pass `--preset glm` for GLM-5.3-Flash (or `--shape T,N,K`) and
+  check the engine's log, which now prints one line per shape that misses the
+  table. On a 8060S, four GLM rows took a prompt from 128 to 168 tok/s. The tuner's absolute-error gate now
   scales with `sqrt(K / 4096)`, so long-K projections are no longer rejected.
 
 Measured prompt speed, GLM-5.3-Flash Maya-S-v2 IQ2_XXS, ROCm 7.2:
