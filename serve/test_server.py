@@ -2447,5 +2447,43 @@ class MalformedToolCallAnswers(unittest.TestCase):
         self.assertEqual([c["function"]["name"] for c in msg.get("tool_calls") or []], ["write"])
 
 
+@unittest.skipUnless(os.name == "posix", "the fake engine uses a script with a shebang")
+class StatsAfterConsumerStops(unittest.TestCase):
+    """An EOS/budget/cancel closes the token consumer before final STAT and DONE are read."""
+
+    def test_final_stats_are_kept_and_next_request_is_clean(self):
+        import tempfile
+        script = r'''import sys
+print("READY 4096 stop", flush=True)
+for line in sys.stdin:
+    if not line.startswith("GEN"):
+        continue
+    print("STAT tok_s=10 cpu_read_proxy=4 rng_begin=0 rng_end=1", flush=True)
+    print("T 66", flush=True)
+    print("STAT tok_s=30 cpu_read_proxy=99 rng_begin=0 rng_end=9", flush=True)
+    print("DONE 1 3 1.0 1.0 stop 0 0 0 0 0", flush=True)
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            exe = Path(directory) / "engine"
+            exe.write_text(f"#!{sys.executable}\n" + script)
+            exe.chmod(0o755)
+            engine = StrataEngine(str(exe), [])
+            try:
+                tokens = engine.generate([1, 2, 3], 16, {}, threading.Event())
+                self.assertEqual(next(tokens), 66)
+                self.assertEqual(engine.stat["tok_s"], 10)
+                tokens.close()  # the frontend found EOS, reached its budget, or was cancelled
+                self.assertEqual(engine.stat["tok_s"], 30)
+                self.assertEqual(engine.stat["cpu_read_proxy"], 99)
+                self.assertEqual(engine.stat["rng_end"], 9)
+                self.assertEqual(engine.last["finish"], "stop")
+                following = engine.generate([1, 2, 4], 16, {}, threading.Event())
+                self.assertEqual([t for t in following if t is not None], [66])
+                self.assertEqual(engine.stat["cpu_read_proxy"], 99)
+            finally:
+                engine.proc.kill()
+                engine.proc.wait()
+
+
 if __name__ == "__main__":
     unittest.main()

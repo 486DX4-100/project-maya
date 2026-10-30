@@ -1331,6 +1331,9 @@ class StrataEngine:
                     if line is None:
                         self.lines.put(None)                # (the engine is gone: the next reader hears it too)
                         break
+                    if line.startswith("STAT "):
+                        self._parse_stat(line)   # the final snapshot can follow EOS or the consumer's last token
+                        continue
                     if line.startswith("ERR"):
                         self._done_after_err()
                         break
