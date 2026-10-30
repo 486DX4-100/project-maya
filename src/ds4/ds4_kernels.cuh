@@ -491,6 +491,46 @@ constexpr int kAr2Piece = 8192;   // (float4s a piece: 128 KB of F32 rows, 64 KB
 void tab_set(const unsigned long long* pairs, int n, cudaStream_t s);
 /// A group of two with pflags (DS4_AR2): ar2_kernel, the put and the sums in one pipelined launch
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
+#if defined(STRATA_USE_HIP)
+constexpr int kPeerArBlocks = 64, kPeerArFlagStride = 32;
+// Optional diagnostic written only by the first block to set the timeout bit.
+struct PeerArFailure {
+    unsigned captured = 0, sequence = 0, observed = 0, block = 0, n4 = 0, rank = 0;
+    uint64_t elapsed_ticks = 0, timeout_ticks = 0;
+};
+/// Experimental exact two-rank push/reduce. All payload/flag buffers are fine-grained device memory,
+/// and both devices must have peer access enabled. Each rank owns two `stride`-float receive slots
+/// and 2*kPeerArBlocks*kPeerArFlagStride flags; `peer_*` points to the other rank's allocations.
+/// Calls on each rank's single stream must have matching shapes/sequence, with no skipped calls.
+/// Initialize all flags to first_seq-1. Sequence wraps modulo2^32, with live distances below2^31.
+/// Two slots are safe because completing a call requires the peer to have started that call: a rank
+/// cannot start call k+2 before the peer has finished reading call k. This is not graph-replay safe
+/// with a frozen host sequence. The bounded wait sets sticky *error on timeout; caller MUST check it.
+struct PeerAr {
+    float* recv = nullptr;
+    float* peer_recv = nullptr;
+    unsigned* flags = nullptr;
+    unsigned* peer_flags = nullptr;
+    unsigned* error = nullptr;
+    PeerArFailure* failure = nullptr; // optional first-timeout record; read only after stream synchronization
+    size_t stride = 0;
+    uint64_t timeout_ticks = 0; // HIP wall_clock64 ticks, calibrated with hipDeviceAttributeWallClockRate.
+};
+bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cudaStream_t s);
+enum class PeerTransport { host, ar2, peer };
+struct PeerCalibration {
+    PeerTransport selected = PeerTransport::host;
+    bool complete = false, quiescent = true, valid = true;
+    int samples = 0;
+    double ms[3] = {0, 0, 0}, elapsed_ms = 0;
+};
+// Startup only, before requests: private input rows/streams, original exact-F32 transport and optional AR2.
+// Both ranks' production flags are reset before returning. budget_ms bounds submission/polling;
+// driver API calls themselves cannot be interrupted by a userspace deadline.
+PeerCalibration calibrate_peer(const int ids[2], const ArGroup& host, const ArGroup* ar2,
+                               const PeerAr peer[2], int n, double budget_ms);
+#endif
+
 /// A chunk's all-reduce (three members or more) through the copy engines: allreduce's FP16 sums bit for bit (each
 /// partial rounded to FP16, each value summed in member order and rounded), the bytes moved by cudaMemcpyAsync where
 /// ar_rs16_kernel's loads read host memory a round trip at a time.  scratch: n * 4 + nm * 8 bytes on the device.

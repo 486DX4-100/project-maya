@@ -1123,6 +1123,7 @@ unchanged. `ds4_gguf_test --ar <GPU> <GPU>` checks both against the host's sums 
 | --- | --- | --- |
 | `MAYA_DS4_AR2` | off (0) | a group of two's prompt-chunk all-reduces: `1` pipelined in one launch, the same sums; `2` FP16 on the wire (half the bytes, the sums FP16's) |
 | `MAYA_DS4_AR2_DECODE` | off (0) | `1`: a group of two's decode-window all-reduces in the same kernel, exact |
+| `MAYA_DS4_HIP_PEER_AR` | auto | HIP: `auto`/unset compares exact host, AR2 (when unset), and peer-VRAM transport once at startup for eligible TP2 prompt groups. `0` disables probing; `1` forces compatible P2P without timing. Requires bidirectional peer access and spare VRAM; explicit AR2 and flow groups retain their paths. Single-GPU runs skip calibration. See [HIP_PEER_PREFILL.md](HIP_PEER_PREFILL.md) |
 
 ## DeepSeek: helper memory in the Monitor
 

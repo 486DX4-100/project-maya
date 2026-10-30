@@ -3306,6 +3306,60 @@ __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, cons
 }
 
 
+#if defined(STRATA_USE_HIP)
+__global__ void __launch_bounds__(kThreads) ar_peer_kernel(float* x, int n4, PeerAr a, int mi, unsigned seq) {
+    __shared__ int ready;
+    if (threadIdx.x == 0) ready = (*reinterpret_cast<volatile unsigned*>(a.error) & 1u) == 0;
+    __syncthreads();
+    if (!ready) return; // a previous timed-out call poisons all subsequently queued calls
+    const int slot = int(seq & 1u);
+    float4* peer = reinterpret_cast<float4*>(a.peer_recv + size_t(slot) * a.stride);
+    const float4* received = reinterpret_cast<const float4*>(a.recv + size_t(slot) * a.stride);
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x)
+        peer[q] = reinterpret_cast<const float4*>(x)[q];
+    // Every producer's stores must reach the peer before this block publishes completion.
+    __threadfence_system();
+    __syncthreads();
+    const size_t fi = (size_t(slot) * kPeerArBlocks + blockIdx.x) * kPeerArFlagStride;
+    if (threadIdx.x == 0) {
+        *reinterpret_cast<volatile unsigned*>(a.peer_flags + fi) = seq;
+        __threadfence_system();
+        // Core cycle counters may move backwards on this hardware; use the steady clock.
+        const uint64_t begin = uint64_t(wall_clock64());
+        ready = 1;
+        unsigned observed;
+        while (int((observed = *reinterpret_cast<const volatile unsigned*>(a.flags + fi)) - seq) < 0) {
+            const uint64_t elapsed = uint64_t(wall_clock64()) - begin;
+            if (elapsed >= a.timeout_ticks) {
+                if ((atomicOr(a.error, 1u) & 1u) == 0 && a.failure != nullptr) {
+                    a.failure->sequence = seq;
+                    a.failure->observed = observed;
+                    a.failure->block = blockIdx.x;
+                    a.failure->n4 = unsigned(n4);
+                    a.failure->rank = unsigned(mi);
+                    a.failure->elapsed_ticks = elapsed;
+                    a.failure->timeout_ticks = a.timeout_ticks;
+                    a.failure->captured = 1;
+                }
+                ready = 0;
+                break;
+            }
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (!ready) return;
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x) {
+        const float4 local = reinterpret_cast<const float4*>(x)[q];
+        const float4 remote = ld_fresh(received + q);
+        const float4 left = mi == 0 ? local : remote;
+        const float4 right = mi == 0 ? remote : local;
+        reinterpret_cast<float4*>(x)[q] = make_float4(__fadd_rn(left.x, right.x), __fadd_rn(left.y, right.y),
+                                                    __fadd_rn(left.z, right.z), __fadd_rn(left.w, right.w));
+    }
+}
+#endif
+
 // two members (DS4_AR2, a chunk's all-reduces): the put and the sums pipelined.  Each block cuts its contiguous range
 // of the row in pieces of kAr2Piece float4s, puts piece k out, flags it (its progress word: seq << 12 | k + 1, after a
 // system fence) and then sums piece k - 1 - so a member's link carries its rows out while it reads the other's in,
@@ -4470,6 +4524,17 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     const int blocks = std::max(1, std::min(64, cdiv(n4, kThreads)));
     pdl_launch(ar_sum_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
 }
+
+#if defined(STRATA_USE_HIP)
+bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cudaStream_t s) {
+    if (!x || (reinterpret_cast<uintptr_t>(x) & 15u) || n <= 0 || n % 4 || mi < 0 || mi > 1 || !a.recv || !a.peer_recv ||
+        (reinterpret_cast<uintptr_t>(a.recv) & 15u) || (reinterpret_cast<uintptr_t>(a.peer_recv) & 15u) || !a.flags ||
+        !a.peer_flags || !a.error || !a.timeout_ticks || a.stride < size_t(n) || a.stride % 4) return false;
+    const int blocks = std::max(1, std::min(kPeerArBlocks, cdiv(n / 4, kThreads)));
+    ar_peer_kernel<<<blocks, kThreads, 0, s>>>(x, n / 4, a, mi, seq);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+#endif
 
 void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void* scratch, cudaStream_t s,
                    const ArAux* aux) {
