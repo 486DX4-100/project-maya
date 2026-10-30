@@ -24,6 +24,9 @@
 #if !defined(STRATA_USE_HIP)
 #include <mma.h>
 #endif
+#if defined(STRATA_USE_HIP)
+#include "exl3_hip_scalar.hpp"
+#endif
 #include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #include <algorithm>
@@ -1452,6 +1455,157 @@ __global__ void __launch_bounds__(kThreads) hip_set_kernel(SetArgs a, const floa
     }
 }
 
+#if defined(STRATA_USE_HIP)
+// Wider scalar tiles reuse each decoded fragment across more routed rows.
+// Keep DOT2/FMA order, rotations and output rounding identical to block_gemv.
+template <int K2, int NR> struct HipScalarSmem {
+    __half xb[2 * NR * kCols];
+    uint32_t stage[kWarps * 4 * K2];
+    float out[NR * kCols];
+};
+template <int K2, int cb, int NR, class Input = Xin>
+__device__ void hip_scalar_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input (&x)[(NR + 7) / 8],
+                           const uint16_t* __restrict__ suh, int nc, HipScalarSmem<K2, NR>& sm) {
+    constexpr int W = Words<K2>::W, R = Words<K2>::R;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    const size_t sstride = (size_t) ld * W;
+    const uint32_t* tile = tr + ((size_t) (k0 / 16) * ld + tc0 + warp) * W;
+    uint32_t* st = sm.stage + warp * W;
+
+    const int nq = (k1 - k0) / kCols;
+    uint32_t wc[8][R], wn[8][R];
+    float xv[(NR + 7) / 8][4], xs4[(NR + 7) / 8][4];
+    load_tiles<K2>(tile, sstride, lane, wc);
+    for (int j = 0; j < (NR + 7) / 8; ++j)
+        if (warp + j * 8 < nc) chunk_load(x[j], suh, k0, lane, xv[j], xs4[j]);
+    float acc[NR][2];
+#pragma unroll
+    for (int cc = 0; cc < NR; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
+
+    for (int q = 0; q < nq; ++q) {
+        __half* xq = sm.xb + (q & 1) * (NR * kCols);
+        for (int j = 0; j < (NR + 7) / 8; ++j)
+            if (warp + j * 8 < nc) chunk_store(xv[j], xs4[j], lane, xq + (warp + j * 8) * kCols);
+        __syncthreads();
+        if (q + 1 < nq) {
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
+            for (int j = 0; j < (NR + 7) / 8; ++j)
+                if (warp + j * 8 < nc) chunk_load(x[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs4[j]);
+        }
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            uint32_t f[4];
+            slice_frags<K2, cb>(wc[s], st, lane, f);
+#if defined(EXL3_DOT2)
+#pragma unroll
+            for (int cc = 0; cc < NR; ++cc)
+                if (cc < nc) {
+                    const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
+                    const uint32_t xa = *reinterpret_cast<const uint32_t*>(xr);
+                    const uint32_t xb = *reinterpret_cast<const uint32_t*>(xr + 8);
+                    acc[cc][0] = dot2_acc(f[1], xb, dot2_acc(f[0], xa, acc[cc][0]));
+                    acc[cc][1] = dot2_acc(f[3], xb, dot2_acc(f[2], xa, acc[cc][1]));
+                }
+#else
+            float v[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 d = __half22float2(u2h(f[i]));
+                v[2 * i] = d.x;
+                v[2 * i + 1] = d.y;
+            }
+#pragma unroll
+            for (int cc = 0; cc < NR; ++cc)
+                if (cc < nc) {
+                    const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
+                    const float x0 = __half2float(xr[0]), x1 = __half2float(xr[1]);
+                    const float x2 = __half2float(xr[8]), x3 = __half2float(xr[9]);
+                    acc[cc][0] = dot4_acc(acc[cc][0], v, x0, x1, x2, x3);
+                    acc[cc][1] = dot4_acc(acc[cc][1], v + 4, x0, x1, x2, x3);
+                }
+#endif
+
+        }
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+#pragma unroll
+            for (int r = 0; r < R; ++r) wc[s][r] = wn[s][r];
+    }
+    const int o = warp * 16 + g;
+    // the 4 lanes of one g hold parts of the same two outputs
+#pragma unroll
+    for (int cc = 0; cc < NR; ++cc)
+        if (cc < nc) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 1);
+                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 2);
+            }
+            if (t == 0) {
+                sm.out[cc * kCols + o] = acc[cc][0];
+                sm.out[cc * kCols + o + 8] = acc[cc][1];
+            }
+        }
+
+    __syncthreads();
+}
+
+template <int K2, int cb, bool gate_up, int NR>
+__global__ void __launch_bounds__(kThreads) hip_scalar_set_kernel(SetArgs a, const float* x, int ldx,
+                                                          const int* idx, uint16_t* h, int ldh,
+                                                          float* y, int ldy) {
+    __shared__ __align__(16) HipScalarSmem<K2, NR> sm;
+    __shared__ float gate[NR * kCols];
+    const int e = blockIdx.z, g = blockIdx.y, warp = threadIdx.x >> 5;
+    const int start = a.bounds[e], end = a.bounds[e + 1];
+    const int row = start - a.row0 + (int) blockIdx.x * NR;
+    const int nc = min(NR, end - start - (int) blockIdx.x * NR);
+    if (nc <= 0) return;
+    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    if constexpr (gate_up) {
+        Xin in[(NR + 7) / 8];
+        for (int j = 0; j < (NR + 7) / 8; ++j)
+            if (warp + j * 8 < nc) in[j].f = x + (size_t) idx[row + warp + j * 8] * ldx;
+        hip_scalar_gemv<K2, cb, NR>((const uint32_t*) (blob + a.lay.trellis[0]), a.n_ff / 16,
+                              g * 8, 0, a.n_embd, in, (const uint16_t*) (blob + a.lay.suh[0]), nc, sm);
+        for (int j = 0; j < (NR + 7) / 8; ++j) {
+            const int c = warp + j * 8;
+            if (c < nc) block_out(sm.out + c * kCols, (const uint16_t*) (blob + a.lay.svh[0]) + g * kCols,
+                                  gate + c * kCols);
+        }
+        __syncthreads();
+        hip_scalar_gemv<K2, cb, NR>((const uint32_t*) (blob + a.lay.trellis[1]), a.n_ff / 16,
+                              g * 8, 0, a.n_embd, in, (const uint16_t*) (blob + a.lay.suh[1]), nc, sm);
+        for (int j = 0; j < (NR + 7) / 8; ++j) {
+            const int r = warp + j * 8;
+            if (r < nc) {
+                const int lane = threadIdx.x & 31;
+                float v[4];
+                for (int i = 0; i < 4; ++i) v[i] = sm.out[r * kCols + lane * 4 + i];
+                had128(v, lane);
+                for (int i = 0; i < 4; ++i) {
+                    const int c = lane * 4 + i;
+                    const float up = v[i] * h2f(((const uint16_t*) (blob + a.lay.svh[1]))[g * kCols + c]);
+                    h[(size_t) (row + r) * ldh + g * kCols + c] =
+                        __half_as_ushort(__float2half_rn(swiglu(gate[r * kCols + c], up, a.limit)));
+                }
+            }
+        }
+    } else {
+        XinHalf in[(NR + 7) / 8];
+        for (int j = 0; j < (NR + 7) / 8; ++j)
+            if (warp + j * 8 < nc) in[j].h = h + (size_t) (row + warp + j * 8) * ldh;
+        hip_scalar_gemv<K2, cb, NR>((const uint32_t*) (blob + a.lay.trellis[2]), a.n_embd / 16,
+                              g * 8, 0, a.n_ff, in, (const uint16_t*) (blob + a.lay.suh[2]), nc, sm);
+        for (int j = 0; j < (NR + 7) / 8; ++j) {
+            const int c = warp + j * 8;
+            if (c < nc) block_out(sm.out + c * kCols, (const uint16_t*) (blob + a.lay.svh[2]) + g * kCols,
+                                  y + (size_t) (row + c) * ldy + g * kCols);
+        }
+    }
+}
+#endif
+
 // set_mix_kernel's share of SetArgs: the fields it reads.  The whole SetArgs (its MixedLayouts ~3.9 KB) beside KMix
 // made 5.8 KB of kernel parameters - over the 4 KB Pascal (sm_6x) allows, so a Pascal build stopped there (#479;
 // Volta and newer take 32 KB).  The same values, the same arithmetic: the same bits everywhere.
@@ -1796,14 +1950,64 @@ __global__ void __launch_bounds__(kThreads) hip_rows_kernel(Mat m, const uint16_
         }
     }
 }
+#if defined(STRATA_USE_HIP)
+static const char* hip_scalar_env(const char* strata, const char* maya, const char* native) {
+    const char* v = std::getenv(strata);
+    if (v == nullptr) v = std::getenv(maya);
+    return v != nullptr ? v : std::getenv(native);
+}
+// RDNA4 only for now. Each launch thread caches capability per visible device, not a workstation GPU ID.
+static bool hip_scalar_device() {
+    thread_local int known[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (known[dev] == 0) {
+        cudaDeviceProp p{};
+        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                     std::strncmp(p.gcnArchName, "gfx12", 5) == 0 ? 2 : 1;
+    }
+    return known[dev] == 2;
+}
+template <int K2, int cb, bool GU>
+static bool hip_scalar_set(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh,
+                            float* y, int ldy, cudaStream_t s) {
+    // Only the tested integer 3/4-bit mul1 layouts. Mixed and other layouts retain their original path.
+    if constexpr ((K2 == 6 || K2 == 8) && cb == 2) {
+        const int mode = hip_scalar::mode(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_ROWS",
+            "MAYA_EXL3_HIP_SCALAR_ROWS", "EXL3_HIP_SCALAR_ROWS"));
+        if (mode == 8 || !hip_scalar_device()) return false;
+        int gu_min = 48, down_min = 128;
+        if (mode == -1) {
+            gu_min = hip_scalar::cutoff(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_GU_MIN_ROWS",
+                "MAYA_EXL3_HIP_SCALAR_GU_MIN_ROWS", "EXL3_HIP_SCALAR_GU_MIN_ROWS"), gu_min);
+            down_min = hip_scalar::cutoff(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS",
+                "MAYA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS", "EXL3_HIP_SCALAR_DOWN_MIN_ROWS"), down_min);
+        }
+        const int nr = hip_scalar::rows(mode, GU, a.max_rows, gu_min, down_min);
+        if (nr == 8) return false;
+        const dim3 grid((a.max_rows + nr - 1) / nr, (GU ? a.n_ff : a.n_embd) / kCols, a.n_exp);
+        if (nr == 12) hip_scalar_set_kernel<K2, cb, GU, 12><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, y, ldy);
+        else if (nr == 16) hip_scalar_set_kernel<K2, cb, GU, 16><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, y, ldy);
+        else hip_scalar_set_kernel<K2, cb, GU, 24><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, y, ldy);
+        return true;
+    }
+    return false;
+}
+#endif
 template <int K2, int cb> struct RunHipGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if (hip_scalar_set<K2, cb, true>(a, x, ldx, idx, h, ldh, nullptr, 0, s)) return;
+#endif
         hip_set_kernel<K2, cb, true><<<dim3((a.max_rows + kTok - 1) / kTok, a.n_ff / kCols, a.n_exp), kThreads, 0, s>>>
             (a, x, ldx, idx, h, ldh, nullptr, 0);
     }
 };
 template <int K2, int cb> struct RunHipDown {
     static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if (hip_scalar_set<K2, cb, false>(a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy, s)) return;
+#endif
         hip_set_kernel<K2, cb, false><<<dim3((a.max_rows + kTok - 1) / kTok, a.n_embd / kCols, a.n_exp), kThreads, 0, s>>>
             (a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
     }

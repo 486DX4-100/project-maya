@@ -1188,6 +1188,25 @@ installs, or checked by hash before each start) can keep them elsewhere.
 | --- | --- | --- |
 | `MAYA_DS4_LT_STORE` | `<pack>/lt-picks.txt` | the picks in this file instead; empty: none kept, each start measures its own |
 
+## EXL3: optional scalar prompt tiles on RDNA4
+
+For uniform 3/4-bit mul1 EXL3 experts on gfx12, larger scalar tiles can share a decoded weight across more routed
+rows. This is opt-in and hardware/workload dependent: a larger tile uses more registers and shared memory, and can
+run fewer blocks at once. Matrix kernels retain priority; mixed layouts, other formats and other GPU architectures
+keep their existing paths. The option changes neither expert selection nor weights and preserves each output's
+DOT2 arithmetic order. Decode/verification-window kernels are unchanged.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_EXL3_HIP_SCALAR_ROWS` | `0` (original 8) | `8`, `12`, `16`, `24`, or `auto`; invalid values retain the original path. `auto` chooses one tile per dispatched expert batch from its maximum routed-row count, without extra GPU readback |
+| `MAYA_EXL3_HIP_SCALAR_GU_MIN_ROWS` | `48` | with `auto`: below this many maximum rows, gate/up uses original 8; otherwise 12 |
+| `MAYA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS` | `128` | with `auto`: below this many maximum rows, down uses 12; otherwise 24 |
+
+The cutoffs are nonnegative integers (`0` always selects the larger tile); invalid or overflowing values use their
+documented defaults. They are starting points from a small R9700 study, not tuning recommendations for every card.
+Serving configs use `MAYA_*`; native launches also accept `STRATA_*` or the unprefixed `EXL3_*` names. See
+[EXL3_HIP_SCALAR_ROWS.md](EXL3_HIP_SCALAR_ROWS.md) for the measured scope and reproducer.
+
 ## DeepSeek: packed EXL3 tensor-parallel cache transfers
 
 `DS4_EXL3_PACKED_HOST=1` stores resident EXL3 host experts as GPU-ready member blobs;
