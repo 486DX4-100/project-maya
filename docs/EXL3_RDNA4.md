@@ -1,8 +1,8 @@
 # RDNA4 EXL3 matrix prefill
 
-On HIP gfx12 devices, grouped EXL3 prefill uses matrix instructions for
-`set_gate_up` and `set_down` by default. `EXL3_WMMA_GFX12=0` selects the portable
-path on gfx12; `EXL3_WMMA=0` disables matrix prefill on both gfx11 and gfx12.
+On HIP gfx12 devices, grouped EXL3 prefill can use matrix instructions for
+`set_gate_up` and `set_down`: opt-in for now with `EXL3_WMMA_GFX12=1` (unset or `0`
+keeps the portable path on gfx12); `EXL3_WMMA=0` disables matrix prefill on both gfx11 and gfx12.
 `EXL3_WMMA_ROWS=16` (default) or `32` selects routed rows per block.
 
 Earlier DeepSeek tests on three R9700s measured about 8–9% higher warm 4K
@@ -18,8 +18,8 @@ It does not accelerate GGUF expert weights. A practical starting point is
 16 routed rows per block; no particular GPU count or tensor-parallel layout
 is required.
 
-No environment overrides are needed for the 16-row default. The explicit
-settings below also work with earlier versions that required an opt-in.
+Turn it on with `EXL3_WMMA_GFX12=1`; 16 rows is the default tile. The explicit
+settings below do that.
 
 First check the GPUs with `./maya.sh --backend hip --check`. Stop any running
 server before setting up again or editing its configuration. To save the
@@ -118,10 +118,10 @@ cmake --build build-hip --target exl3_test -j 2
 ```
 
 ```sh
-# Full suite, RDNA4 matrix default:
+# Full suite, RDNA4 matrix path:
+EXL3_WMMA_GFX12=1 ./build-hip/exl3_test
+# Portable control (the default):
 ./build-hip/exl3_test
-# Portable control:
-EXL3_WMMA=0 ./build-hip/exl3_test
 # Focused grouped-expert cases, both matrix tile sizes:
 EXL3_WMMA_GFX12=1 EXL3_WMMA_ROWS=16 ./build-hip/exl3_test --prefill-only
 EXL3_WMMA_GFX12=1 EXL3_WMMA_ROWS=32 ./build-hip/exl3_test --prefill-only

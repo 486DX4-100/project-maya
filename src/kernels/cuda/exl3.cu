@@ -2672,8 +2672,8 @@ bool mma_now() {
 #endif
 }
 
-// Matrix prompt path: gfx11 and gfx12 by default. EXL3_WMMA_GFX12=0 restores the
-// portable path on gfx12 only; EXL3_WMMA=0 disables both. The RDNA4 numerical
+// Matrix prompt path: gfx11 by default, gfx12 with EXL3_WMMA_GFX12=1 (opt-in until it is measured on an RDNA4 GPU
+// of ours; unset or 0 keeps gfx12 on the portable path); EXL3_WMMA=0 disables both. The RDNA4 numerical
 // differences are accumulation grouping/rounding, as documented above rdna4_block_wmma,
 // with the same weight and operand formats. Decode/verify kernels keep their arithmetic;
 // a changed prefill state can still change later routing or generated tokens.
@@ -2687,7 +2687,7 @@ static bool wmma_now() {
     if (known[dev] == 0) {
         cudaDeviceProp p{};
         const char* v = std::getenv("EXL3_WMMA_GFX12");
-        const bool rdna4 = v == nullptr || std::atoi(v) != 0;
+        const bool rdna4 = v != nullptr && std::atoi(v) != 0;
         known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
                      (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 ||
                       (rdna4 && std::strncmp(p.gcnArchName, "gfx12", 5) == 0)) ? 2 : 1;

@@ -169,7 +169,7 @@ bool mma_supported();
 /// This is separate from the HIP grouped-kernel dispatch (prompt_wmma), so querying it does not change planning.
 bool prompt_tc();
 /// Whether grouped expert kernels select WMMA on the current device, including HIP gfx11/gfx12.
-/// On HIP, EXL3_WMMA=0 disables both, and EXL3_WMMA_GFX12=0 disables gfx12 only.
+/// On HIP, EXL3_WMMA=0 disables both; gfx12 only with EXL3_WMMA_GFX12=1 (opt-in).
 bool prompt_wmma();
 /// A set of n_exp routed experts in VRAM, expert e's blob at wbase + e * stride (the layout in lay), owning the sorted
 /// rows [bounds[e], bounds[e + 1]) (device, n_exp + 1 entries); a sorted row's LOCAL row is bounds[e] - row0 + r.

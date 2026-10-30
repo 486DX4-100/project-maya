@@ -1142,14 +1142,13 @@ choices. Opt-in until measured on GPUs.
 ## RDNA4 EXL3 matrix prefill
 
 For HIP gfx12 GPUs running EXL3 experts, these switches select the matrix
-prefill path, enabled by default on supported RDNA4 devices with 16-row tiles.
-Explicit `1`, `16`, `1` settings reproduce that default.
+prefill path, opt-in on RDNA4 devices for now (`EXL3_WMMA_GFX12=1`), with 16-row tiles.
 Use the exact `EXL3_*` names in the config's `env` or with setup's `--env`;
 these kernel switches do not use the `MAYA_*` alias convention.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `EXL3_WMMA_GFX12` | on | `0`: use portable grouped EXL3 prefill on gfx12; `1`: allow RDNA4 matrix instructions |
+| `EXL3_WMMA_GFX12` | off | `1`: allow RDNA4 matrix instructions; unset or `0`: portable grouped EXL3 prefill on gfx12 |
 | `EXL3_WMMA_ROWS` | `16` | `16` or `32`: routed rows processed per block |
 | `EXL3_WMMA` | enabled where supported | `0`: disable matrix prefill, overriding the gfx12 setting; `1`: allow it |
 

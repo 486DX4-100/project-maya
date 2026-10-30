@@ -110,8 +110,8 @@ sudo systemctl daemon-reload
 
 ## RDNA4 EXL3 prefill
 
-On an R9700 / RX 9070-family GPU, grouped EXL3 prompt processing uses the
-RDNA4 matrix kernels by default, with 16-row tiles. [Guided setup](EXL3_RDNA4.md#guided-setup) shows how to save the
+On an R9700 / RX 9070-family GPU, grouped EXL3 prompt processing can use the
+RDNA4 matrix kernels, with 16-row tiles (opt-in for now: `EXL3_WMMA_GFX12=1`). [Guided setup](EXL3_RDNA4.md#guided-setup) shows how to save the
 settings through `--env` or an existing configuration, verify the build and
 tests, and switch back for comparison. This applies to EXL3 expert weights,
 not GGUF, and floating-point results can differ from the portable path.
