@@ -860,6 +860,22 @@ struct Model::Impl {
         cudaEventRecord(d.jev, d.s2);
         cudaStreamWaitEvent(d.s, d.jev, 0);
     }
+    // the routing the host reads (n ids) names real experts: the router's kernel leaves 0x7fffffff where a token's
+    // logits are NaN (no expert compares better), and the host indexed its per-expert tables with it - an access
+    // violation with nothing in the log (#672: Windows, an RTX 4070 Ti SUPER + 5070 Ti, the first request).  Such a
+    // request now ends with an error that says where.
+    bool routes_ok(const int* top, int n, size_t li, std::string& err) const {
+        for (int i = 0; i < n; ++i)
+            if (top[i] < 0 || top[i] >= g.n_exp) {
+                const cudaError_t e = cudaGetLastError();
+                err = "layer " + std::to_string(li) + ": the router picked expert " + std::to_string(top[i]) +
+                      " of " + std::to_string(g.n_exp) + " (row " + std::to_string(i / std::max(1, g.k_exp)) +
+                      ") - the layer's input holds NaN/Inf or its routing did not run (last CUDA error: " +
+                      cudaGetErrorString(e) + ")";
+                return false;
+            }
+        return true;
+    }
     // a layer's expert blob (the plan's estimate before expert_layout reads it): EXL3's three trellises with their
     // scales, a GGUF's three matrices aligned
     size_t blob_estimate(int li) const {
@@ -1959,6 +1975,7 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(d.s));
         st.t_sync += now() - ts;
         const size_t li = (size_t) (&l - L.data());
+        if (!routes_ok(rtop, T * g.k_exp, li, err)) return false;
         // the plan: each token's experts (its 8 slots, k used), their pointers (0: the CPU lane's), the groups
         unsigned long long* pp = (unsigned long long*) d.win_plan_h;
         float* pw = (float*) (pp + (size_t) kWin * 8);
@@ -2342,6 +2359,7 @@ struct Model::Impl {
         std::memcpy(top, d.plan_h, (size_t) g.k_exp * 4);
         std::memcpy(w, d.plan_h + 4, (size_t) g.k_exp * 4);
         const size_t li = (size_t) (&l - L.data());
+        if (!routes_ok(top, g.k_exp, li, err)) return false;
         for (int i = 0; i < g.k_exp; ++i) ++prof[li * g.n_exp + top[i]];
         st.profiled += g.k_exp;
         std::vector<char> busy((size_t) d.n_slots, 0);
@@ -2596,6 +2614,7 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(d.top_h, d.top, (size_t) T * g.k_exp * 4, cudaMemcpyDeviceToHost, d.s));
         CK(cudaStreamSynchronize(d.s));
         const std::vector<int> top(d.top_h, d.top_h + (size_t) T * g.k_exp);
+        if (!routes_ok(top.data(), (int) top.size(), (size_t) li, err)) return false;
         for (int e : top) ++prof[(size_t) li * g.n_exp + e];
         st.profiled += (long) top.size();
         pmark(d, kPSync);
