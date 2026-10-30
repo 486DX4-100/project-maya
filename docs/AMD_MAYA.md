@@ -2,8 +2,9 @@
 
 This branch adds a Linux HIP build and installer path for Maya's GLM-5.3-Flash
 engine on `gfx1100`, `gfx1201` and `gfx1151` (Strix Halo, Gorgon Halo). It uses one GPU, or two supported GPUs that split the
-layers (see [Two GPUs](#two-gpus)), and serves text. Images are not enabled by this installer;
-Linux users can opt into the existing [CPU image encoder](#cpu-image-encoder-on-linux).
+layers (see [Two GPUs](#two-gpus)), and reads pictures too: setup builds the image encoder for the GPU
+(ggml's HIP backend), started only while a picture is encoded, as on NVIDIA; `--no-vision` leaves it out. The
+[CPU image encoder](#cpu-image-encoder-on-linux) stays an option on Linux.
 Windows: see [Windows](#windows).
 
 Use a system ROCm 7 installation with its HIP compiler and hipBLAS, Python
@@ -51,10 +52,9 @@ amount.
 
 ## CPU image encoder on Linux
 
-HIP setup skips the image encoder, but the server can use the existing CPU-only
+HIP setup builds a GPU image encoder (above); instead, the server can use a CPU-only
 `maya-vision` helper alongside the HIP text engine. This is an explicit manual
-setup; it does not enable an AMD GPU vision backend or change the installer's
-text-only default. Stop Maya before building or changing the config.
+setup. Stop Maya before building or changing the config.
 
 After HIP setup has fetched its pinned `third_party/llama.cpp` checkout, run
 these commands from the Maya project root. If you used `--llama-dir`, use that

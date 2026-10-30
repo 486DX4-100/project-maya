@@ -36,7 +36,7 @@ The setup recommends one for your PC. How they're made and measured: [MAYA-S](..
 [MAYA-S24](../bench/results/MAYA-S24.md), [MAYA-M](../bench/results/MAYA-M.md), [MAYA-L](../bench/results/MAYA-L.md). On
 [Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF).
 
-On AMD, GLM-5.3-Flash reads text only.
+On AMD, GLM-5.3-Flash reads pictures too (experimental): setup builds its image encoder for the GPU.
 
 ### GLM-5.3-Flash's options
 
