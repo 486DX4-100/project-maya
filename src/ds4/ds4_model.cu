@@ -4207,8 +4207,8 @@ struct Model::Impl {
                 uint64_t total = 0;
                 for (int li = 0; li < pk.eg_layers; ++li) {
                     const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
-                    if (tw == nullptr || (tw->dtype != "Q6_K" && tw->dtype != "IQ4_NL" && tw->dtype != "MXFP8" &&
-                                          tw->dtype != "F8_E4M3")) {
+                    if (tw == nullptr || (tw->dtype != "Q6_K" && tw->dtype != "Q5_K" && tw->dtype != "IQ4_NL" &&
+                                          tw->dtype != "MXFP8" && tw->dtype != "F8_E4M3")) {
                         err = "Engram RAM: unsupported table type"; return false;
                     }
                     if (!eg_io.pin_range(paths[(size_t) tw->file], tw->file, tw->off, tw->bytes, err)) return false;
@@ -4221,7 +4221,7 @@ struct Model::Impl {
                     }
                 }
                 eg_io.require_ram();
-                std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/IQ4_NL/FP8), %.3f GB locked; reads use memcpy\n",
+                std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/Q5_K/IQ4_NL/FP8), %.3f GB locked; reads use memcpy\n",
                              pk.eg_layers, (double) total / 1e9);
             }
             eg_io.start(paths, nth, eg_direct);
@@ -4229,17 +4229,18 @@ struct Model::Impl {
                 eg_win.emplace_back(new EgBatch());
                 const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
                 const bool q6k = tw != nullptr && tw->dtype == "Q6_K", iq4 = tw != nullptr && tw->dtype == "IQ4_NL";
-                if ((q6k && pk.eg_hd % 256 != 0) || (iq4 && pk.eg_hd % 32 != 0)) {
+                const bool q5k = tw != nullptr && tw->dtype == "Q5_K";   // (unsloth's UD-IQ2_XXS, UD-Q2_K_XL)
+                if (((q6k || q5k) && pk.eg_hd % 256 != 0) || (iq4 && pk.eg_hd % 32 != 0)) {
                     err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": " + tw->dtype + " rows of " +
                           std::to_string(pk.eg_hd) + " values (not whole blocks)";
                     return false;
                 }
-                if (tw != nullptr && !q6k && !iq4 && tw->dtype != "MXFP8" && tw->dtype != "F8_E4M3") {
+                if (tw != nullptr && !q6k && !q5k && !iq4 && tw->dtype != "MXFP8" && tw->dtype != "F8_E4M3") {
                     err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": tables in " + tw->dtype +
-                          " (the engine reads Q6_K, IQ4_NL, MXFP8 or FP8)";
+                          " (the engine reads Q6_K, Q5_K, IQ4_NL, MXFP8 or FP8)";
                     return false;
                 }
-                eg_q6k.push_back(q6k ? 1 : iq4 ? 2 : 0);
+                eg_q6k.push_back(q6k ? 1 : iq4 ? 2 : q5k ? 3 : 0);
             }
             if (o.verbose)
                 std::fprintf(stderr, "ds4: Engram rows read on %d threads, issued with the tokens, collected before "
@@ -9632,8 +9633,8 @@ struct Model::Impl {
         const Tensor* tw = pk.get(P + "weight");
         const Tensor* ts = pk.get(P + "scale");
         const bool mx8 = tw->dtype == "MXFP8";   // (a GGUF: the scales between the codes, one per 32)
-        const bool q6k = eg_q6k[(size_t) li] == 1;   // (a GGUF: one Q6_K superblock a 256 values, its scales inside)
-        const bool iq4 = eg_q6k[(size_t) li] == 2;   // (IQ4_NL blocks of 32, their scales inside)
+        const int bfmt = eg_q6k[(size_t) li];        // (a GGUF's block rows, their scales inside: 1 Q6_K superblocks
+                                                     //  of 256, 2 IQ4_NL blocks of 32, 3 Q5_K superblocks of 256)
         std::unordered_map<uint64_t, int> first;   // a row this batch reads already -> its read
         if (!defer_dups) first.reserve((size_t) T * cols);
         int64_t hits = 0;
@@ -9688,8 +9689,8 @@ struct Model::Impl {
                             r.mx8 = true;
                             r.n = (uint32_t) (hd / 32 * 33);
                             r.off = tw->off + (uint64_t) id * r.n;
-                        } else if (q6k || iq4) {   // (into the row's code bytes; its scale bytes unused)
-                            r.n = (uint32_t) (q6k ? hd / 256 * 210 : hd / 32 * 18);
+                        } else if (bfmt != 0) {   // (into the row's code bytes; its scale bytes unused)
+                            r.n = eg_block_row_bytes(bfmt, hd);
                             r.off = tw->off + (uint64_t) id * r.n;
                         } else {
                             r.n = (uint32_t) hd;
