@@ -3684,6 +3684,35 @@ def parallel_of(cfg: dict) -> int:
     return int(v) if str(v).isdigit() else 1
 
 
+def unattended_start(a) -> str | None:
+    """Why this start has nobody to wait for it, else None: --yes, no terminal on stdin (a service, a pipe), or a
+    systemd unit (INVOCATION_ID / NOTIFY_SOCKET).  An unattended start never runs a calibration by itself: it loads the
+    model two more times, and a service manager that kills the start after its timeout would repeat that forever (#690)."""
+    if getattr(a, "yes", False):
+        return "--yes"
+    if os.environ.get("INVOCATION_ID") or os.environ.get("NOTIFY_SOCKET"):
+        return "started by systemd"
+    try:
+        if not sys.stdin.isatty():
+            return "no terminal"
+    except (AttributeError, ValueError, OSError):      # (stdin closed or replaced)
+        return "no terminal"
+    return None
+
+
+def skip_start_calibrations(cfg_path: Path, cfg: dict, why: str) -> None:
+    """The one line an unattended start prints instead of measuring: what is skipped, and the command to run later."""
+    todo = []
+    if needs_prefill_calibration(cfg):
+        todo.append(("prefill calibration", "--calibrate"))
+    if needs_speed_calibration(cfg):
+        todo.append(("speed calibration", "--speed-calibration"))
+    if todo:
+        say("  Calibration skipped on this start (" + why + "): the model starts with its default settings. Run it once "
+            "when you can wait for it: " + "; ".join(f"{ME} --config {cfg_path} {flag} --no-start ({name})"
+                                                      for name, flag in todo))
+
+
 def needs_speed_calibration(cfg: dict) -> bool:
     """A config that drafts with DFlash2 but has no speed calibration yet (set up before there was one, or its
     calibration could not run then - the GPUs were busy): its next start measures first.  Not with --parallel above 1:
@@ -4006,11 +4035,14 @@ def server_command(cfg_path: Path, a) -> tuple:
         ok(f"{cfg_path.name}: starts from DeepSeek's shipped expert profile ({DS4_PROFILE.name}, copied into the pack)")
     cfg_path.touch()                                   # the most recently used model
     refresh_engine(cfg)
-    if needs_prefill_calibration(cfg):                 # MiniMax set up before the prefill calibration: measured once
+    unattended = unattended_start(a)
+    if unattended:                                     # nobody to wait: no calibration (it loads the model two more times)
+        skip_start_calibrations(cfg_path, cfg, unattended)
+    if not unattended and needs_prefill_calibration(cfg):   # MiniMax set up before the prefill calibration: measured once
         prefill_calibration(cfg_path, "once, for a setup from before it")
         cfg = read_json(cfg_path)
         args = cfg.get("args") or []
-    if needs_speed_calibration(cfg):                   # a drafter set up without its speed calibration: measured once
+    if not unattended and needs_speed_calibration(cfg):     # a drafter set up without its speed calibration: measured once
         drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter"}.get(
             config_family(cfg), "DFlash2")
         if speed_calibration(cfg_path, f"once, for a setup that drafts with {drafter}"):
