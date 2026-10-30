@@ -383,7 +383,17 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     if (drafter) {
         std::vector<int> drafts;
         std::vector<float> conf;
-        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
+        // (the lookup's proposal first: with one, the drafter makes its first row even past the cut - the lazy head
+        //  would skip it at a cut first draft, leaving none to weigh the lookup against; past it, the lazy cut)
+        const int k = lk != nullptr ? lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data()) : 0;
+        // the round's cut for the lazy drafter: the drafts-cost window keeps the drafts under the floor alone (no
+        // running product), the plain cut the product too
+        const bool dc_win = dc != nullptr && cum_min < 0;
+        if (!dc_win && cum_min < 0) cum_min = dspark_cum_default();
+        const int max_n = dc_win ? std::min(room - 1, strata::spec::DraftPolicy::kMaxT - 1) : room - 1;
+        if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter, max_n, conf_min,
+                     dc_win ? 0.0f : cum_min, k > 0 ? 1 : 0))
+            return false;
         const int made = (int) drafts.size();
         int keep = 0;
         if (dc != nullptr) dc->alone.set_context(m.pos());
@@ -404,7 +414,6 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         }
         bool from_lk = false;
         if (lk != nullptr && !drafts.empty() && !m.drafts_sampled()) {
-            const int k = lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data());
             match = lk->sfx.last_match();
             if (k > 0 && lk->buf[0] == drafts[0]) {
                 const strata::spec::DraftPolicy::Pick pk = lk->policy.choose(keep + 1, k, match);
