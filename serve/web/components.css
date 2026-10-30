@@ -76,6 +76,8 @@ a:hover { color: var(--st-ink); }
 .field__note { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
 .range { width: 100%; margin: 0; accent-color: var(--st-accent); }
 .range:disabled { opacity: .4; }
+/* the Context size slider (Settings > Model, the Models page's Engine settings) */
+.ctx-slider { display: flex; flex-direction: column; gap: 10px; }
 
 /* a switch: on is the accent */
 .switch { position: relative; width: 40px; height: 24px; flex: none; padding: 0; border: 0; border-radius: var(--st-r-pill);

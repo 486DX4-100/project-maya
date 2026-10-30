@@ -144,13 +144,9 @@ def nvml_pids(pid: int | None, listed: set) -> set:
         return {pid}
 
 
-CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
-CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
-# the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
-# GLM engine's 256K, and maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
-# end yet)
-CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144}
-CONTEXT_TESTED_DEFAULT = 262144
+# the dashboard's Context size range (serve/models.py: the Models page's Engine settings offer the same one)
+CONTEXT_MIN, CONTEXT_FALLBACK_MAX = models.CONTEXT_MIN, models.CONTEXT_FALLBACK_MAX
+CONTEXT_TESTED, CONTEXT_TESTED_DEFAULT = models.CONTEXT_TESTED, models.CONTEXT_TESTED_DEFAULT
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
 REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|ERR|error|"
                           r"failed|out of memory|WARNING", re.I)
@@ -1855,37 +1851,8 @@ def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple
     return None
 
 
-def trained_context(model_dir) -> int | None:
-    """The context the model was trained for (`<arch>.context_length` in its first GGUF's header; GLM-5.3-Flash:
-    1,048,576): the top of the dashboard's Context size.  None when there is no readable GGUF."""
-    try:
-        sys.path.insert(0, str(ROOT / "tools"))
-        from gguf_reader import GGUFFile
-        shards = sorted(Path(model_dir).glob("*-00001-of-*.gguf")) or sorted(Path(model_dir).glob("*.gguf"))
-        if not shards:
-            return None
-        md = GGUFFile(shards[0]).metadata
-        n = md.get(f"{md.get('general.architecture', '')}.context_length")
-        return int(n) if isinstance(n, int) and n > 0 else None
-    except Exception:  # noqa: BLE001 - a header it can't read: the fallback range
-        return None
-
-
-def trained_context_ds4(pack) -> int | None:
-    """DeepSeek's and MiniMax's: the context its pack says the model was trained for (ds4.txt's / mm3.txt's
-    max_position_embeddings, from the model's config.json or a GGUF's context_length; V4.1-Flash and M3.1-Flash:
-    1,048,576, their native reach), the top of the dashboard's Context size.  None when the pack does not say."""
-    for name in ("ds4.txt", "mm3.txt"):
-        try:
-            with open(Path(pack) / name, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    k, _, v = line.strip().partition(" ")
-                    if k == "max_position_embeddings":
-                        n = int(v.split()[0])
-                        return n if n > 0 else None
-        except (OSError, ValueError, IndexError):
-            continue
-    return None
+trained_context = models.trained_context            # (the context a model was trained for: serve/models.py)
+trained_context_ds4 = models.trained_context_ds4
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -2251,7 +2218,7 @@ class Service:
     def context_limits(self) -> dict:
         """The dashboard's Context size: the range it offers and the engine's measured cost of the current one."""
         info = dict(getattr(self.engine, "info", {}) or {})
-        top = self.trained_context or CONTEXT_FALLBACK_MAX
+        rng = models.context_range(self.trained_context, self.engine.max_context, str(info.get("engine_kind") or ""))
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
         # a streamed cache's RAM (KV streaming: maya-mm3's VRAM lines' kv_ram - every position's K / V in pinned RAM,
@@ -2265,9 +2232,7 @@ class Service:
                 ram = {"ram_gb": round(vm.total / 2**30, 1), "ram_free_gb": round(vm.available / 2**30, 1)}
             except Exception:  # noqa: BLE001 - psutil is optional: no RAM figures, no RAM warning
                 pass
-        return {"context": self.engine.max_context, "min": CONTEXT_MIN, "max": max(top, self.engine.max_context),
-                "trained": self.trained_context,
-                "tested": CONTEXT_TESTED.get(str(info.get("engine_kind") or ""), CONTEXT_TESTED_DEFAULT),
+        return {"context": self.engine.max_context, **rng,
                 "kv_gb": info.get("kv_gb"), "kv_ctx": info.get("kv_ctx"),
                 "kv_resident": info.get("kv_resident") or 0,
                 "kv_ram_gb": round(kv_ram / 2**30, 3) if kv_ram else None, **ram,

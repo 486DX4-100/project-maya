@@ -8,7 +8,8 @@ import {api, ctxfmt, esc, fmt, isPhone, modelName, relTime} from "./lib.js";
 import {S, confirmDialog, copyText, emit, toast} from "./state.js";
 import {newChat} from "./chats.js";
 import {setSide, showView} from "./sidebar.js";
-import {Icon, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
+import {GLM_KV_BYTES, ctxHint, ctxStopsIn, loadCtxInfo} from "./server.js";
+import {CtxSlider, Icon, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 
 // the page's own state (beside S: nothing else reads it but the model menu's count)
 export const MS = {data: null, err: null, add: false, details: {}, edit: null, draft: null, tab: 0, preview: null,
@@ -115,6 +116,7 @@ function openEditor(m) {
   MS.tab = 0;
   MS.preview = m.command;
   MS.check = "";
+  if (m.running) loadCtxInfo();                     // (the running engine's own measurement: the Context size's line)
   emit();
 }
 function closeEditor() {
@@ -230,15 +232,25 @@ function AutoOr({label, k, d, dflt, unit, subLabel}) {
       on=${(v) => setDraft({[k]: v})}/></div>` : null};
 }
 
+// the Context size: Settings > Model's slider (ui.js' CtxSlider) over this model's own range (up to the context it was
+// trained for: GET /api/models' context_range), with the same line under it (server.js' ctxHint). `cost`: the cache's
+// bytes per token as the draft sets it (ctxHint's win / whole / ram / vram); `keys`: the settings that change it - while
+// none does, the running model's line is the engine's own measurement, as in Settings
+function contextRow(m, d, ch, cost, keys = [], extra = null) {
+  const s = m.settings, r = m.context_range || {min: 4096, max: 262144, tested: 262144};
+  const n = Number(d.context), now = Number(s.context), stops = ctxStopsIn(r, now, n);
+  const warn = [n !== now && n > r.tested ? `Beyond ${ctxfmt(r.tested)} is untested on this engine.` : null, extra].filter(Boolean).join(" ");
+  return html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")} warn=${warn || null}
+    below=${html`<${CtxSlider} id=${`mdl-ctx-${m.file}`} label="" value=${n} now=${now} stops=${stops}
+      hint=${ctxHint(n, {live: m.running && !ch(...keys), now, ...cost})} onChange=${(v) => setDraft({context: v})}/>`}/>`;
+}
+
 function fieldsOf(m, d) {
   const s = m.settings, ch = (...ks) => ks.some((k) => !same(d[k], s[k])), glm = m.family === "glm";
-  const ctxs = [...new Set([...(m.contexts || MS.data.contexts || []), s.context, d.context].map(Number))].sort((a, b) => a - b);
-  const context = html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")}
-    hint=${glm && d.kv_streaming ? (d.context <= (Number(d.kv_resident) || 32768) ? `Up to ${ctxfmt(Number(d.kv_resident) || 32768)} the whole cache stays in VRAM.`
-      : `Above ${ctxfmt(Number(d.kv_resident) || 32768)} the cache streams from RAM: about ${fmt((d.context * 12288) / 1e9, 1)} GB of RAM at ${ctxfmt(d.context)}.`)
-      : "More context takes GPU memory from the experts."}>
-    <${Seg} label="Context size" value=${Number(d.context)} options=${ctxs.map((n) => ({id: n, label: ctxfmt(n)}))}
-      onChange=${(v) => setDraft({context: v})}/><//>`;
+  const per = Math.max(1, Number(d.parallel) || 1);   // (several answers at once: a cache each)
+  const context = contextRow(m, d, ch, !glm ? {} : d.kv_streaming
+    ? {win: Number(d.kv_resident) || 32768, whole: true, ram: GLM_KV_BYTES * per} : {vram: GLM_KV_BYTES * per},
+    ["kv_streaming", "kv_resident", "parallel"]);
   const images = html`<${Row} label="Images" flag=${glm ? "vision" : "--vision"} changed=${ch("images")}
     hint=${m.choices.images ? "Reads images in chats. Off leaves its memory to the experts."
       : glm ? "This model was set up without its image encoder: the setup adds it." : "This pack has no vision tower."}>
@@ -255,8 +267,8 @@ function fieldsOf(m, d) {
     hint=${glm ? "For the driver, the desktop and other programs. Empty: 700 MiB." : "Per GPU, for the driver, the desktop and other programs. Empty: the engine's own."}
     warn=${whole(d.reserve_mib) ? null : "A whole number of MiB, or empty for the default."}>
     <${Num} label="VRAM kept free" value=${d.reserve_mib} ph=${glm ? "700" : "default"} unit="MiB / GPU" on=${(v) => setDraft({reserve_mib: v})}/><//>`;
-  if (m.family === "minimax") return mm3Fields(m, d, s, ch, ctxs, images, gpus);
-  if (m.family === "qwen") return qwenFields(m, d, s, ch, ctxs, gpus);
+  if (m.family === "minimax") return mm3Fields(m, d, s, ch, images, gpus);
+  if (m.family === "qwen") return qwenFields(m, d, s, ch, gpus);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -332,19 +344,16 @@ function fieldsOf(m, d) {
 // context token, by format (maya.py's MM3_KV_BYTES)
 const MM3_KV = [{id: "bf16", label: "BF16", bytes: 122880}, {id: "int8", label: "INT8", bytes: 63360},
                 {id: "fp8", label: "FP8", bytes: 63360}, {id: "fp4", label: "FP4", bytes: 34560}];
-function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
+function mm3Fields(m, d, s, ch, images, gpus) {
   const dspark = m.choices.draft.includes("dspark"), win = Number(d.kv_resident) || 32768;
   const kv = MM3_KV.find((f) => f.id === d.kv_cache);
-  const ram = kv ? `about ${fmt((d.context * kv.bytes) / 2 ** 30, 1)} GB of pinned RAM at ${ctxfmt(d.context)} (${kv.label})` : "pinned RAM";
+  const kvb = kv ? kv.bytes : 63360;                 // (a format of the config's own the page does not list: INT8's size)
   const tps = [...new Set([0, 1, 2, 4].filter((t) => t <= Math.max(1, d.gpus.length)).concat([Number(s.tp), Number(d.tp)]))].sort((a, b) => a - b);
   return [
     {label: "Model", rows: [
-      html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")}
-        hint=${d.parallel > 1 ? `${d.parallel} answers at once: each keeps a whole cache of this size in VRAM (${fmt((d.parallel * d.context * (kv ? kv.bytes : 63360)) / 2 ** 30, 1)} GB in all at ${ctxfmt(d.context)}), which the experts give up. The engine shortens a context that does not fit.`
-          : d.kv_streaming ? `Every position's cache sits in RAM: ${ram}, its newest ${ctxfmt(win)} in VRAM too.${d.context > 262144 ? " Past 256K it has not been run end to end." : ""}`
-          : "The whole cache in VRAM: more context takes GPU memory from the experts."}>
-        <${Seg} label="Context size" value=${Number(d.context)} options=${ctxs.map((n) => ({id: n, label: ctxfmt(n)}))}
-          onChange=${(v) => setDraft({context: v})}/><//>`,
+      contextRow(m, d, ch, d.parallel > 1 ? {vram: d.parallel * kvb} : d.kv_streaming ? {win, ram: kvb} : {vram: kvb},
+        ["kv_cache", "kv_streaming", "kv_resident", "parallel"],
+        d.parallel > 1 ? `${d.parallel} answers at once: each keeps a whole cache of this size in VRAM. The engine shortens a context that does not fit.` : null),
       html`<${Row} label="Answers at once" flag="--parallel" changed=${ch("parallel")}
         hint="Up to 8. Each extra conversation keeps its own context's cache in VRAM, which the experts give up. With more than one the answers are decoded together: no KV streaming and no DSpark."
         warn=${d.parallel > 1 && d.context * d.parallel > 1048576 ? `${d.parallel} conversations of ${ctxfmt(d.context)} each: a smaller context leaves the experts more VRAM.` : null}>
@@ -398,17 +407,14 @@ function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
 // layers' K and V plus the sparse attention's pooled keys (maya.py's QWEN_KV_BYTES for FP16)
 const QWEN_KV = [{id: "fp16", label: "FP16", bytes: 26112}, {id: "int8", label: "INT8", bytes: 14208},
                  {id: "k8v4", label: "K8 V4", bytes: 11328}, {id: "q4_0", label: "Q4_0", bytes: 8448}];
-function qwenFields(m, d, s, ch, ctxs, gpus) {
+function qwenFields(m, d, s, ch, gpus) {
   const mtp = m.choices.draft.includes("mtp");
   const kv = QWEN_KV.find((f) => f.id === d.kv) || QWEN_KV[0];
   const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 8000, unit: "experts", subLabel: "Experts in the GPU's pool"});
   const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 4096, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
   return [
     {label: "Model", rows: [
-      html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")}
-        hint=${`The attention cache sits in VRAM: about ${fmt((d.context * kv.bytes) / 2 ** 30, 1)} GB at ${ctxfmt(d.context)} (${kv.label}), taken from the experts.`}>
-        <${Seg} label="Context size" value=${Number(d.context)} options=${ctxs.map((n) => ({id: n, label: ctxfmt(n)}))}
-          onChange=${(v) => setDraft({context: v})}/><//>`,
+      contextRow(m, d, ch, {vram: kv.bytes}, ["kv"]),
       html`<${Row} label="Drafting" flag="--mtp-max-t" changed=${ch("draft")}
         hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answer. Off keeps it loaded with its drafts off. The setup measures which is faster on this PC."
           : "This pack has no MTP drafter: the setup builds it from the model file."}>

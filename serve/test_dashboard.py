@@ -565,5 +565,52 @@ class Offline(unittest.TestCase):
         self.assertNotIn("fonts.googleapis", index)
 
 
+# the page's own modules in Node (skipped without it), the browser's few globals they touch at load stubbed out
+PAGE_STUBS = """
+const noop = () => {};
+const el = new Proxy({}, {get: (t, k) => (k in t ? t[k] : k === "dataset" || k === "style" ? (t[k] = {})
+  : k === "classList" ? (t[k] = {add: noop, remove: noop, toggle: noop}) : noop)});
+globalThis.matchMedia = () => ({matches: false, addEventListener: noop, addListener: noop});
+globalThis.localStorage = {getItem: () => null, setItem: noop, removeItem: noop};
+globalThis.document = {documentElement: el, body: el, head: el, addEventListener: noop, querySelector: () => null,
+                       createElement: () => el};
+globalThis.window = globalThis; globalThis.addEventListener = noop;
+globalThis.location = {href: "http://x/", hash: "", search: "", pathname: "/"};
+const web = process.argv[2];
+const st = await import(web + "/state.js"), sv = await import(web + "/server.js");
+"""
+
+
+@unittest.skipUnless(__import__("shutil").which("node"), "Node.js is not installed")
+class PageLogic(unittest.TestCase):
+    def node(self, body):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "t.mjs"
+            p.write_text(PAGE_STUBS + body, encoding="utf-8")
+            r = subprocess.run(["node", str(p), (ROOT / "serve" / "web").resolve().as_uri()], capture_output=True,
+                               encoding="utf-8", timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_context_slider_reaches_each_models_own_top(self):
+        # the Models page's Context size: Settings > Model's stops over each model's range (its trained context, up to
+        # 1M), the size a config has kept as a stop of its own
+        got = self.node("""
+const r1m = {min: 4096, max: 1048576}, r256 = {min: 4096, max: 262144};
+st.S.ctxInfo = {...r1m, context: 131072};
+console.log(JSON.stringify({m1: sv.ctxStopsIn(r1m, 131072), m256: sv.ctxStopsIn(r256, 131072, 100000),
+                            settings: sv.ctxStops(), none: sv.ctxStopsIn(null, 1),
+                            win: sv.ctxHint(16384, {now: 131072, win: 32768, whole: true, ram: sv.GLM_KV_BYTES}),
+                            past: sv.ctxHint(131072, {now: 131072, win: 32768, whole: true, ram: sv.GLM_KV_BYTES})}));""")
+        self.assertEqual((got["m1"][0], got["m1"][-1]), (4096, 1048576))
+        self.assertEqual(got["m1"], got["settings"])                     # (the same stops as Settings > Model's)
+        self.assertEqual(got["m256"][-1], 262144)
+        self.assertIn(100000, got["m256"])
+        self.assertEqual(got["none"], [])
+        self.assertEqual(got["win"], "Up to 32K the whole cache stays in VRAM.")
+        self.assertTrue(got["past"].startswith("≈ 1.5 GB of RAM for the context"), got["past"])
+
+
 if __name__ == "__main__":
     unittest.main()

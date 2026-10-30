@@ -299,6 +299,28 @@ class Settings(unittest.TestCase):
         self.assertEqual([x["index"] for x in out["gpus"]], [0, 1])               # (GPU 1: named by a config only)
 
 
+    def test_context_range_per_model(self):
+        # the Engine settings' Context size slider: Settings > Model's range for each model - up to what the model was
+        # trained for (MiniMax's pack: 1M), else 256K (a GLM GGUF header it cannot read, a DeepSeek pack that does not
+        # say), never below the config's own size; untested past 256K except on DeepSeek
+        g, ds, mm = glm_cfg(self.d), ds4_cfg(self.d), mm3_cfg(self.d)
+        M._trained.clear()
+        with mock.patch.object(M, "machine_gpus", return_value=[]):
+            got = {m["family"]: m["context_range"] for m in M.listing(self.d, None)["models"]}
+        self.assertEqual(got["minimax"], {"min": 4096, "max": 1048576, "trained": 1048576, "tested": 262144})
+        self.assertEqual(got["glm"], {"min": 4096, "max": 262144, "trained": None, "tested": 262144})
+        self.assertEqual(got["deepseek"], {"min": 4096, "max": 262144, "trained": None, "tested": 1048576})
+        cfg = json.loads(ds.read_text())
+        cfg["args"][cfg["args"].index("--max-context") + 1] = "524288"
+        ds.write_text(json.dumps(cfg))
+        self.assertEqual(M.describe(ds, None)["context_range"]["max"], 524288)
+        # GLM: the GGUF header beside its pack (the server's own reading), kept once read
+        with mock.patch.object(M, "trained_context", return_value=1048576) as tc:
+            for _ in range(2):
+                self.assertEqual(M.describe(g, None)["context_range"]["max"], 1048576)
+        tc.assert_called_once_with(str((self.d / "GLM-5.3-Flash" / "Maya-M").resolve()))
+        M._trained.clear()
+
     def test_installs_the_setup_no_longer_lists_are_still_listed(self):
         """v1.1.34: unsloth's UD-Q4_K_XL (gguf-q4) and GLM's EXL3-sc_4.10bpw are out of the setup's pickers; a config of
         either is listed, shown and settable on the Models page as before."""
