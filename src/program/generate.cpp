@@ -1860,10 +1860,12 @@ static int glm_pack_generate(const Options& o) {
         // <think></think>), where it used to stand before the last token.  The next prompt of this conversation goes on
         // from the same place whatever came of this answer - the answer itself, nothing (a cancelled answer that the
         // client sends again with a new message after it), or the same prompt again - so it continues the snapshot
-        // instead of leaving it at the <|assistant|> it no longer has.  STRATA_GLM_SNAP_GEN=0: before the last token.
+        // instead of leaving it at the <|assistant|> it no longer has.  Opt-in (STRATA_GLM_SNAP_GEN=1): the prompt's
+        // last 2-4 tokens then go through the token path instead of the batched one, so a greedy answer can differ
+        // from a read with the snapshot before the last token (the default).
         size_t snap_at = prompt.size() - 1;
         {
-            static const bool snap_gen = env_num("STRATA_GLM_SNAP_GEN", 1) != 0;
+            static const bool snap_gen = env_num("STRATA_GLM_SNAP_GEN", 0) != 0;
             constexpr int32_t kAsstTok = 154828;   // <|assistant|>
             // (at `reuse` itself too: the same prompt again restores the snapshot there and keeps it there)
             for (size_t k = 2; snap_gen && k <= 4 && k <= prompt.size(); ++k) {
