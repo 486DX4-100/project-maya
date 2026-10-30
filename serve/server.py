@@ -4576,11 +4576,11 @@ def make_handler(svc: Service):
                     model = {"id": svc.model, "object": "model",
                              "status": {"value": "loaded" if loaded else "unloaded"},
                              "meta": {"n_ctx": svc.engine.max_context},
-                             # (the same capacities under the names generic OpenAI-compatible
+                             # (the same capacity under the name generic OpenAI-compatible
                              # clients read on a model listing: DeepSeek Harness's pi-ai discovery,
-                             # open-webui, llama.cpp's server clients, ... - n_ctx stays above)
+                             # open-webui, llama.cpp's server clients, ... - n_ctx stays above;
+                             # no max_output_tokens: a client asking for the whole context as output gets a 400)
                              "context_length": svc.engine.max_context,
-                             "max_output_tokens": svc.engine.max_context,
                              # (videos: the llama.cpp encoder's - GLM's; DeepSeek's encoder reads pictures only)
                              "architecture": {"input_modalities": ["text"] if svc.vision is None else
                                               ["text", "image", "video"] if isinstance(svc.vision, Vision) else
