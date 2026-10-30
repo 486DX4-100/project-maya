@@ -4806,19 +4806,20 @@ struct Model::Impl {
     }
 
     // this device's host-to-device link (bytes a second): 32 MB from pinned memory, the best of three (~10 ms on
-    // PCIe 3 x16), once a device; 0: not measured
+    // PCIe 3 x16), once a device; 0: not measured.  The copies and their events on the legacy stream, as the
+    // ordinary load copies: timed on a stream of their own (made for it, destroyed after) they left decode ~20%
+    // slower for the whole run on 2x CMP 170HX (PCIe Gen2), though nothing used that stream again (#609)
     std::map<int, double> link_bw;
     double link_h2d(Dev& d) {
         if (auto it = link_bw.find(d.id); it != link_bw.end()) return it->second;
         const size_t nb = (size_t) 32 << 20;
         void* h = nullptr;
         void* v = nullptr;
-        cudaStream_t s = nullptr;
+        const cudaStream_t s = 0;   // (the legacy stream)
         cudaEvent_t e0 = nullptr, e1 = nullptr;
         double best = 0;
         cudaSetDevice(d.id);
         if (cudaHostAlloc(&h, nb, cudaHostAllocPortable) == cudaSuccess && cudaMalloc(&v, nb) == cudaSuccess &&
-            cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess &&
             cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess) {
             std::memset(h, 0, nb);
             for (int rep = 0; rep < 4; ++rep) {
@@ -4832,7 +4833,6 @@ struct Model::Impl {
         }
         if (e0) cudaEventDestroy(e0);
         if (e1) cudaEventDestroy(e1);
-        if (s) cudaStreamDestroy(s);
         if (v) cudaFree(v);
         if (h) cudaFreeHost(h);
         cudaGetLastError();
