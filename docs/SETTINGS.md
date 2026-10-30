@@ -1156,6 +1156,20 @@ choices. Opt-in until measured on GPUs.
 | --- | --- | --- |
 | `MAYA_DS4_MARKOV_Q8` | off (0) | `1`: the DSpark markov head as Q8_0 blocks (half its bytes and memory; the drafts may change, the verified answers do not) |
 
+`MAYA_DS4_DRAFT_GPU` instead names the GPU IDs printed at startup, including GPUs in different target TP groups.
+For a target split over a two-card group and a third card, `2` puts every drafter block on GPU 2; `0,1,2` puts one
+of three blocks on each GPU. Blocks still run whole and in order. Their dense weights, attention state and expert
+storage belong to the chosen GPU; expert placement charges its target group, preserving the target's shared-slot
+budget. The existing pinned-host handoff carries rows between blocks on different GPUs.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_DRAFT_GPU` | off (existing placement) | one selected GPU ID for all DSpark blocks, or one ID per block; cannot be combined with `MAYA_DS4_DRAFT_DEV` |
+
+This is an opt-in placement experiment, not a speed recommendation. Moving blocks changes the target's available
+expert-cache room and adds transfers at device boundaries; compare end-to-end throughput and draft acceptance.
+It requires loaded DSpark blocks. An unknown/unselected ID, malformed list or wrong block count fails loading.
+
 ## RDNA4 EXL3 matrix prefill
 
 For HIP gfx12 GPUs running EXL3 experts, these switches select the matrix
@@ -1176,7 +1190,7 @@ configuration example, verification, measured scope and rollback.
 
 ## DeepSeek: a helper GPU for the experts VRAM leaves over
 
-A GGUF pack's routed experts that do not fit the layer GPUs' VRAM run on the CPU lane. A GPU that is not one of the
+A pack's routed experts that do not fit the layer GPUs' VRAM run on the CPU lane. A GPU that is not one of the
 layer devices - an integrated one (Strix Halo's Radeon 8060S beside discrete cards) or a small extra card - can take
 those instead: `MAYA_DS4_HELPER=<visible GPU>` with `MAYA_DS4_HELPER_GB=<GB>` gives it a pool of the most-routed
 experts the layer GPUs do not hold (by the expert profile). Its picks run on its own stream from the window's plan
@@ -1193,10 +1207,31 @@ lead's requests take them and each pick's sum joins the lead's CPU part once, be
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_HELPER` | off | the helper's visible GPU index (not one of `--gpus`); with `MAYA_DS4_HELPER_GB`. Linux only (tested); Windows + AMD untested |
+| `MAYA_DS4_HELPER` | off | the helper's visible GPU index (outside `--gpus` unless shared mode is enabled); with `MAYA_DS4_HELPER_GB`. Linux only (tested); Windows + AMD untested |
 | `MAYA_DS4_HELPER_GB` | - | its experts' pool, GB |
 | `MAYA_DS4_WARM_CAP_GB` | - | required with the helper: the load's experts in host RAM, GB, beside the pool (an integrated GPU's pool is host RAM too); ignored under `DS4_REQUIRE_ALL_RAM=1` (every expert in RAM) |
 | `MAYA_DS4_HELPER_CHECK` | off | `1`: at load, two tokens per expert format through the helper against the CPU lane, and its grouped window path against its per-token one, bit for bit |
+
+Uniform EXL3 layers can also use the helper, including layers sharded across a target TP group. Enable
+`MAYA_DS4_HELPER_EXL3=1` explicitly; the helper stores complete experts and executes their contributions while
+the CPU handles the remaining misses. Mixed-format EXL3 layers are not selected. EXL3 does not support nonzero `MAYA_DS4_HELPER_RECENT`;
+its static helper pool remains available. CPU backing remains available
+for fallback, and CPU versus GPU floating-point arithmetic can change model outputs.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_HELPER_EXL3` | off | `1`: allow uniform EXL3 experts in the helper pool |
+| `MAYA_DS4_HELPER_SHARED` | off | `1`: let the helper also host DSpark blocks; currently requires EXL3, `--tp 2`, loaded DSpark blocks and zero target layers on that GPU |
+
+With shared mode, select the helper in `--gpus`, place DSpark there with `MAYA_DS4_DRAFT_GPU`, and use
+`MAYA_DS4_SPLIT` to keep target layers off it. The requested helper pool is reserved before drafter placement;
+choose its budget to leave room for the drafter, context buffers, scratch and the normal VRAM reserve. Without
+shared mode, the existing rule remains: the helper must be outside `--gpus`.
+
+`MAYA_DS4_WARM_CAP_GB` remains required with either helper mode. It caps warm copies in mmap mode, not total
+process RAM with `--mmap-experts off`. `MAYA_DS4_HELPER_CHECK=1` also verifies uploaded EXL3 bytes and retained
+CPU fallback. The helper is disabled unless requested; no GPU ID, pool size, CPU thread count or cache policy
+changes by default. See [EXL3 helper configuration and validation](EXL3-HELPER.md) for examples and limitations.
 
 A prompt's experts that VRAM does not hold are read from the model's files as the prompt picks them (the flow), those
 the helper's pool holds too. With `MAYA_DS4_FLOW_HELPER=1` an expert the pool holds is copied out of it instead - the
