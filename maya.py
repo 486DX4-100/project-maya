@@ -550,11 +550,18 @@ DS4_GGUF_MANIFEST = ROOT / "tools" / "ds4" / "download_gguf.json"
 DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/chat_template.jinja")
 DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M", "maya-xs": "Maya-XS",
               "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw", "abliterated-128g": "Mix-128G",
-              "abliterated-256g": "Mix-256G"}
+              "abliterated-256g": "Mix-256G", "gguf-iq1_s": "UD-IQ1_S", "gguf-iq1_m": "UD-IQ1_M",
+              "gguf-iq2_xxs": "UD-IQ2_XXS", "gguf-q2_k_xl": "UD-Q2_K_XL", "gguf-iq3_xxs": "UD-IQ3_XXS",
+              "gguf-iq3_s": "UD-IQ3_S", "gguf-q3_k_xl": "UD-Q3_K_XL"}
 DS4_MAYA = ("maya-s", "maya-m", "maya-xs")
 # unsloth's UD-Q4_K_XL is no longer in the setup's list (the owner, v1.1.34): --ds4-quant gguf-q4 and an install of it
 # work as before; the list shows it only on a PC that has it set up
 DS4_BY_HAND = ("gguf-q4",)
+# unsloth's smaller UD quants (its re-upload of 2026-10-28, each pinned to that revision in download_gguf.json): the
+# experts 1.6-3.5 bits by layer, the dense weights Q5_K - BF16, the Engram tables in the last shard (IQ4_NL, Q5_K,
+# Q6_K or MXFP8; read from the SSD as every quant's).  --ds4-quant names one; as UD-Q4_K_XL, the list shows one only on
+# a PC that has it set up
+DS4_UD = ("gguf-iq1_s", "gguf-iq1_m", "gguf-iq2_xxs", "gguf-q2_k_xl", "gguf-iq3_xxs", "gguf-iq3_s", "gguf-q3_k_xl")
 # ... and orcarouter's abliterated model (its refusals removed from the weights) as GGUFs (download_gguf.json's
 # "abliterated": Mix-128G and Mix-256G, the experts in other low-bit types layer by layer; a gated repo, so its download
 # sends the user's Hugging Face token), in <models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/<version>, served under a
@@ -4731,9 +4738,10 @@ def ds4_gguf_model(quant: str) -> dict:
         q = (man.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
         if not q.get("files"):
             fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
-        about, repo, revision = (f"{DS4} as unsloth's {DS4_QUANTS[quant]} GGUF (dense weights "
-                                 f"{'BF16' if quant == 'gguf-q8' else 'Q8_0'}, experts MXFP4, the Engram tables MXFP8)",
-                                 man["repo"], man["revision"])
+        about, repo, revision = (f"{DS4} as unsloth's {DS4_QUANTS[quant]} GGUF ("
+                                 + (q.get("about") or f"dense weights {'BF16' if quant == 'gguf-q8' else 'Q8_0'}, "
+                                                      "experts MXFP4, the Engram tables MXFP8") + ")",
+                                 man["repo"], q.get("revision") or man["revision"])   # (DS4_UD: their own revision)
 
     def form(files: dict, rev: str) -> dict:
         files = {Path(k).name: v for k, v in files.items()}
@@ -4962,10 +4970,10 @@ def choose_ds4_quant(a, prev: dict) -> str:
     exl3_ok = hip or not ccs or max(ccs) >= DS4_MIN_CC
     before = (prev.get("installer") or {}).get("ds4_quant")
     keys = maya + list(DS4_ABL) + [k for k in DS4_QUANTS if k not in DS4_MAYA + DS4_ABL and (exl3_ok or k not in DS4_EXL3)
-                                   and (k not in DS4_BY_HAND or k == before)]   # (a chosen-by-hand one: only where it is installed)
+                                   and (k not in DS4_BY_HAND + DS4_UD or k == before)]   # (a chosen-by-hand one: only where it is installed)
     abl = ds4_abl_recommended(hip)
     default = before if before in keys else maya[0] if maya else DS4_DEFAULT_QUANT
-    gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya + [k for k in DS4_ABL if k in keys]}
+    gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya + [k for k in DS4_ABL + DS4_UD if k in keys]}
     for k in DS4_ABL:   # (as the other entries: the whole download, Maya's n-gram tables with it)
         gb[k] += ds4_abl_engram_gb()
     gb.update({"gguf-q8": 508, "gguf-q4": 501, "exl3": 414})
@@ -4986,6 +4994,9 @@ def choose_ds4_quant(a, prev: dict) -> str:
                                  "IQ3_XXS / IQ3_S / MXFP4), ~236 GB of VRAM + RAM hold it; its 161 GB of n-gram tables are "
                                  "Maya's, shared with Maya's DeepSeek quants (downloaded once); a gated repo: your "
                                  "Hugging Face token"}
+    for k in DS4_UD:   # (download_gguf.json's own words: the experts' and dense weights' types, the tables')
+        q = ((read_json(DS4_GGUF_MANIFEST).get("quants") or {}).get(DS4_QUANTS[k]) or {})
+        about[k] = f"unsloth's GGUF: {q.get('about', 'experts in 1.6-3.5 bits')}; ~{q.get('memory_gb', '?')} GB of VRAM + RAM hold it"
     label = {k: (Q.shown("deepseek", k, gb.get(k)), about[k]) for k in DS4_QUANTS}
     pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
                                              "the memory: the experts that do not", "fit in VRAM are read from RAM and "
@@ -6431,7 +6442,9 @@ def main() -> int:
                     help=f"{DS4}'s files: maya-s = Maya's quant (the experts in 2-3 bits; the default once "
                          "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, with its own "
                          "2-bit drafter: the whole model in a 128 GB PC's memory), gguf-q8 = unsloth's UD-Q8_K_XL GGUF, gguf-q4 = its UD-Q4_K_XL "
-                         "(dense weights Q8_0: less VRAM; chosen by hand only, not in the setup's list), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
+                         "(dense weights Q8_0: less VRAM; chosen by hand only, not in the setup's list), gguf-iq1_s / gguf-iq1_m / "
+                         "gguf-iq2_xxs / gguf-q2_k_xl / gguf-iq3_xxs / gguf-iq3_s / gguf-q3_k_xl = its smaller UD quants (experts "
+                         "1.6-3.5 bits; chosen by hand too), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
                          "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer, AMD experimental); "
                          "abliterated-128g / abliterated-256g = orcarouter's abliterated model (its refusals removed) "
                          "as its Mix-128G / Mix-256G GGUF (~114 / ~236 GB of VRAM + RAM, with Maya's Q6_K n-gram "

@@ -456,6 +456,45 @@ class Gguf(unittest.TestCase):
             self.assertRegex(u, rev)
             self.assertIn("/%s/" % maya.DS4_QUANTS[q], u)
 
+    def test_ud_quants(self):
+        """unsloth's smaller UD quants (its re-upload of 2026-10-28): each pinned to that revision with every shard's size
+        and sha256; the VRAM + RAM that hold one are its files but the last shard (the Engram tables, read from the
+        SSD); chosen by hand, as UD-Q4_K_XL - not in the setup's list unless installed; shown under unsloth's names."""
+        want = {"gguf-iq1_s": (5, 233.0, 123), "gguf-iq1_m": (5, 250.4, 140), "gguf-iq2_xxs": (6, 300.5, 166),
+                "gguf-q2_k_xl": (7, 334.8, 200), "gguf-iq3_xxs": (7, 394.7, 234), "gguf-iq3_s": (8, 423.6, 263),
+                "gguf-q3_k_xl": (8, 485.1, 283)}
+        self.assertEqual(sorted(maya.DS4_UD), sorted(want))
+        man = json.loads(maya.DS4_GGUF_MANIFEST.read_text(encoding="utf-8"))
+        for q, (n, gb, mem) in want.items():
+            m = maya.ds4_gguf_model(q)
+            self.assertEqual((m["format"], m["folder"], len(m["files"])), ("ds4-gguf", maya.DS4_QUANTS[q], n))
+            self.assertEqual(m["revision"], "8a6ec9cf118e785a362ea94ee123c61c70553be6")
+            self.assertTrue(all(re.match(r"^[0-9a-f]{64}$", s) for s in m["sha256"].values()))
+            self.assertAlmostEqual(m["download_gb"], gb, delta=0.1)
+            e = man["quants"][maya.DS4_QUANTS[q]]
+            self.assertEqual(e["bytes"], sum(v[0] for v in e["files"].values()))
+            self.assertRegex(e["table"], r"-%05d-of-%05d\.gguf$" % (n, n))   # (the tables: the last shard)
+            self.assertEqual(maya.ds4_memory_gb(q), mem)
+            self.assertIn("/resolve/8a6ec9cf118e785a362ea94ee123c61c70553be6/%s/" % maya.DS4_QUANTS[q],
+                          maya.file_url(m, sorted(m["files"])[0]))
+            self.assertEqual(maya.Q.shown("deepseek", q), "DeepSeek V4.1 · " + maya.DS4_QUANTS[q])
+        self.assertEqual(maya.ds4_gguf_model("gguf-q8")["revision"], "c991b28e7c109eed10a55075ddb46f830b5b3059")
+        rows = []
+
+        def pick(title, intro, opts, default, yes, *x):
+            rows.extend(o[0] for o in opts)
+            return default
+        with patch.object(maya.S, "gpus", return_value=[{"arch": 86}]), patch.object(maya, "choose", pick), \
+                patch.object(maya.S, "UI", None):
+            maya.choose_ds4_quant(args(), {})
+            self.assertFalse(any("UD-IQ" in r or "UD-Q2" in r or "UD-Q3" in r for r in rows), rows)
+            rows.clear()
+            self.assertEqual(maya.choose_ds4_quant(args(), {"installer": {"ds4_quant": "gguf-iq1_s"}}), "gguf-iq1_s")
+            self.assertTrue(any(r.startswith("DeepSeek V4.1 · UD-IQ1_S (233 GB)") for r in rows), rows)
+            rows.clear()
+            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="gguf-iq2_xxs"), {}), "gguf-iq2_xxs")
+            self.assertEqual(rows, [])
+
     def test_earlier_layout_pinned(self):
         """unsloth's layout before its 2026-10-19 re-shard: 10 shards at dc788bdb, each with its size and sha256."""
         for q, gb in (("gguf-q8", 508.4), ("gguf-q4", 500.7)):
