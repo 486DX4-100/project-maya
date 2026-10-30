@@ -41,7 +41,7 @@ no tuning step - it balances its own split):
      and the size - and starts only after you answer y (or pass --download-model)
   6. builds the pack (the engine's index of the model files) inside the model folder
   7. images: compiles the vision encoder (`build-vision/bin/maya-vision`) and fetches the model's vision files
-     (1.1 GB, shown and asked first like the model; --no-vision and HIP skip it)
+     (1.1 GB, shown and asked first like the model; --no-vision skips it)
   8. writes maya-<model>.json and run-maya-<model>.sh (.bat on Windows) - with the settings tuned for this PC
      earlier, or it offers the tuning (./maya.sh --calibrate does it any time) - and starts the dashboard on
      http://127.0.0.1:8080
@@ -2940,23 +2940,34 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     archs = meta.get("archs") or pc.get("archs") or []
     conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
              f"-DLLAMA_DIR={llama}"]
-    if not metal:                                      # (macOS: ggml builds its Metal backend by default, no CUDA)
+    hip = pc.get("backend") == "hip"
+    if hip:
+        conf += ["-DSTRATA_VISION_HIP=ON",
+                 "-DSTRATA_VISION_HIP_TARGETS=" + ";".join(str(x) for x in archs),
+                 "-DAMDGPU_TARGETS=" + ";".join(str(x) for x in archs),
+                 "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(str(x) for x in archs),
+                 "-DCMAKE_EXE_LINKER_FLAGS=-no-pie"]
+        if S.ARM and S.arm_cpu_arch():
+            conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
+    elif not metal:                                    # (macOS: ggml builds its Metal backend by default, no CUDA)
         conf += ["-DSTRATA_VISION_CUDA=ON",
                  "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
                  f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
                  *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
         if S.ARM and S.arm_cpu_arch():
             conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
-    if meta.get("host_compiler") and not metal:
+    if meta.get("host_compiler") and not metal and not hip:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     say("  Compiling the vision encoder (llama.cpp's image library with ggml's " +
-        ("Metal backend: a minute or two" if metal else "CUDA kernels: 10-20 minutes") + ", once) ...")
+        ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: 10-20 minutes") +
+        ", once) ...")
     if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)],
                    dict(os.environ) if metal else None, "" if metal else "build-maya-vision.bat",
-                   nvcc=None if metal else meta.get("nvcc") or pc["nvcc"]):
+                   nvcc=None if metal or hip else meta.get("nvcc") or pc["nvcc"]):
         return False
     VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
+                                  "backend": pc.get("backend"),
                                   "date": time.strftime("%Y-%m-%d %H:%M")}, indent=1), encoding="utf-8")
     return VEXE.exists()
 
@@ -2967,9 +2978,6 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     first start how much that is on this GPU (serve/server.py, vision_footprint).  On a Mac (Metal: one memory, no
     lending) it stays resident beside the model."""
     step(7, "images (the vision encoder)")
-    if pc.get("backend") == "hip":
-        ok("HIP port: text only; vision is not enabled")
-        return None
     # a GGUF of your own reads pictures with the same files: the vision tower and the tokenizer are the same in
     # every GLM-5.3-Flash quant
     spec = MODELS.get(quant) or MODELS[next(iter(MODELS))]
