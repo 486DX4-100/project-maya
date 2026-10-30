@@ -15397,8 +15397,9 @@ struct Model::Impl {
         const std::vector<int>& hg = groups[(size_t) hd.grp].mem;
         const bool mk = mk_split && !drafts_q;   // (sampled drafts: the lead's whole rows, gathered)
         // (lazy: a head alone on its device; conf t reads x_t and draft t-1 only, and every row of the head, the markov
-        //  steps and the confidence head is its own sum - a row computed later is the same bits)
-        const bool lazy = draft_lazy && hg.size() == 1 && dump_d == nullptr;
+        //  steps and the confidence head is its own sum - a row computed later is the same bits; only with a cut that
+        //  can stop it early - a caller without one, --parallel's and --spec-eval's, keeps the one pass and one wait)
+        const bool lazy = draft_lazy && hg.size() == 1 && dump_d == nullptr && (conf_min > 0.0f || cum_min > 0.0f);
         for (int m = (int) hg.size() - 1; m >= 0; --m) {
             Dev& e = devs[(size_t) hg[(size_t) m]];
             cudaSetDevice(e.id);
