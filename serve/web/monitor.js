@@ -209,6 +209,8 @@ function Tiers({t, eng}) {
   const qwen = !!(eng && eng.engine_kind === "qwen");
   const set = TIER_SETS[ds4 ? "ds4" : mm3 ? "mm3" : qwen ? "qwen" : "glm"];
   const n = t.now, h = t.history || {};
+  const helper = ds4 && ((n.helper_held || 0) > 0 || (n.helper || 0) > 0 || +eng.helper_allocated_bytes > 0);
+  const helperHeld = n.helper_held != null ? n.helper_held : +eng.helper_slots || 0;
   const age = n.time ? Math.max(0, Date.now() / 1000 - n.time) : null;
   const stale = age != null && age > 30;               // a reading from the last answer, not live
   // VRAM, RAM and the rest on the SSD - DeepSeek's (maya-ds4) the same keys: its RAM the copies or the read-ahead
@@ -218,7 +220,9 @@ function Tiers({t, eng}) {
   let tip = "";
   if (ds4) {
     if (!stale && n.disk_mb != null && n.disk_mb >= 500) tip = "Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and answers get faster.";
-    else if (!stale && n.vram_hit != null && n.vram_hit < 0.5) tip = "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.";
+    else if (!stale && n.vram_hit != null && n.vram_hit < 0.5)
+      tip = helper && !n.helper_dead ? "Most selections miss the primary cache; the helper handles some before CPU fallback."
+                   : "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.";
   } else if (!stale && n.disk != null && n.disk >= 3) {
     tip = "Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context makes answers faster.";
   } else if (mm3 || qwen) {   // (MiniMax, CYBER-FROST: the CPU computes the experts VRAM does not hold)
@@ -228,13 +232,13 @@ function Tiers({t, eng}) {
   }
   const pc = (x) => (100 * x) / total;
   return html`<section class=${`card${stale ? " is-stale" : ""}`} aria-label="Where the experts live">
-    <div class="card__head"><span class="card__title">Where the experts live</span>
+    <div class="card__head"><span class="card__title">${helper ? "Primary cache and RAM backing" : "Where the experts live"}</span>
       <span class="card__sub">${age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer` : `live · ${fmt(total)} routed experts`}</span></div>
     <div class="tierbar" role="img" aria-label=${`${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in ${ds4 ? "RAM" : "pinned RAM"}, ${fmt(pc(disk), 0)}% on the SSD only`}>
       <span class="tierbar__vram" style=${`flex-grow:${vu}`}></span><span class="tierbar__ram" style=${`flex-grow:${ru}`}></span>
       <span class="tierbar__disk" style=${`flex-grow:${disk}`}></span></div>
     <div class="legend">
-      <span><i class="sw sw--vram"></i>VRAM <b class="num">${fmt(vu)} · ${fmt(n.vram_gb, 1)} GB</b></span>
+      <span><i class="sw sw--vram"></i>${helper ? "Primary VRAM" : "VRAM"} <b class="num">${fmt(vu)} · ${fmt(n.vram_gb, 1)} GB</b></span>
       <span><i class="sw sw--ram"></i>${ds4 ? "RAM" : "Pinned RAM"} <b class="num">${fmt(ru)} · ${fmt(n.ram_gb, 1)} GB</b></span>
       <span><i class="sw sw--disk"></i>SSD only <b class="num">${fmt(disk)}</b></span></div>
     <div class=${`tiles${set.length === 4 ? " tiles--4" : ""}`}>
@@ -255,6 +259,9 @@ function Tiers({t, eng}) {
           <${Spark} values=${(h[x.key] || []).map((y) => (y == null ? 0 : y))} tone=${x.tone || ""}/></div>`;
       })}
     </div>
+    ${helper ? html`<p class="card__note">${n.helper_dead ? "Helper unavailable; its selections fall back to the CPU."
+      : `Helper GPU: ${fmt(helperHeld)} profiled cached experts${n.helper == null ? "" : ` · ${fmt(n.helper, 2)} selections / evaluated token`}.`}
+      The bar shows primary VRAM and RAM backing. The helper pool is separate; CPU backing remains available for fallback.</p>` : null}
     ${tip ? html`<p class="card__note">${tip}</p>` : null}
   </section>`;
 }
@@ -266,7 +273,8 @@ function Tiers({t, eng}) {
 const GPU_PARTS = [
   {key: "weights", label: "Model weights"}, {key: "kv", label: "KV cache"}, {key: "act", label: "Activations"},
   {key: "prompt", label: "Prompt buffers"}, {key: "tp", label: "Tensor parallel"},
-  {key: "drafter", label: "Drafter"}, {key: "pool", label: "Expert pool"}, {key: "vision", label: "Vision encoder"},
+  {key: "drafter", label: "Drafter"}, {key: "pool", label: "Expert pool"}, {key: "helper", label: "Helper experts"},
+  {key: "vision", label: "Vision encoder"},
   {key: "rest", label: "CUDA and the rest"}, {key: "other", label: "Other programs"},
 ];
 const GPU_PLAIN_FROM = 5;
@@ -317,6 +325,7 @@ function gpuDetail(g, segs, m) {
     tp: g.tp_n > 1 ? `the copies a group of ${g.tp_n} GPUs needs: the tensors each of them holds whole, and its layers' KV cache` : "",
     drafter: [g.drafter ? `weights ${gb(g.drafter, 2)} GB` : "", g.window ? `verify window ${gb(g.window, 2)} GB` : ""].filter(Boolean).join(" · "),
     pool: [g.slots ? `${fmt(g.slots)} expert slots` : "", g.borrow ? `prompts borrow up to ${gb(g.borrow)} GB of it` : ""].filter(Boolean).join(" · "),
+    helper: "separate helper expert pool; CPU backing available for fallback",
     vision: g.vision_lent ? "the pool's tail, while it encodes" : g.vision_own ? "the vision tower, in the engine's process" : "its own process",
     rest: "the driver's reserve and context, conversation snapshots and small buffers",
     other: "processes that are not Maya's",
@@ -361,8 +370,10 @@ function GpuMap({m}) {
   const more = (g, b) => (g.slots && g.parts.pool ? Math.max(0, Math.floor(b / (g.parts.pool / g.slots))) : 0);
   const where = (gs) => (one ? "this GPU" : gpuList(gs));
   const pools = (gs) => (one ? "the expert pool" : gs.length > 1 ? "their expert pools" : "its expert pool");
-  const others = complete || plain ? [] : map.filter((g) => (g.parts.other || 0) >= 0.5 * GIB);
-  const frees = complete || plain ? [] : map.filter((g) => !g.vision_lent && (g.free || 0) >= 2 * GIB);
+  // A dedicated helper (or drafter-only device) has no primary pool to grow on restart.
+  const hasPrimaryPool = (g) => g.slots > 0 && (g.parts.pool || 0) > 0;
+  const others = complete || plain ? [] : map.filter((g) => hasPrimaryPool(g) && (g.parts.other || 0) >= 0.5 * GIB);
+  const frees = complete || plain ? [] : map.filter((g) => hasPrimaryPool(g) && !g.vision_lent && (g.free || 0) >= 2 * GIB);
   let advice = "";
   if (others.length) {
     const b = others.reduce((a, g) => a + g.parts.other, 0), n = others.reduce((a, g) => a + more(g, g.parts.other), 0);

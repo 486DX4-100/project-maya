@@ -325,6 +325,29 @@ class GpuMap(unittest.TestCase):
         self.assertIsNone(self.gm.parse("INFO context=32768"))
         self.assertEqual(self.gm.pci_key("00000000:0A:00.0"), "0000:0a:00")
 
+    def test_helper_pool_is_accounted_separately_from_drafter_and_rest(self):
+        helper = 20_000_000_000
+        r = self.gm.parse(f"VRAM dev=2 pci=0000:0f:00.0 total={32 * GB} free={5 * GB} "
+                          f"weights=0 kv=0 act=0 drafter={4 * GB} pool=0 helper={helper} slots=0 layers=-1--1")
+        (g,) = self.gm.view([r], [], engine_pid=100)
+        self.assertEqual(g["parts"]["helper"], helper)
+        self.assertEqual(g["parts"]["drafter"], 4 * GB)
+        self.assertEqual(g["parts"]["rest"], 23 * GB - helper)
+        self.assertIsNone(g["layers"])
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
+        merged = self.gm.merge([r, dict(dev=2, helper=1024, free=5 * GB)])
+        self.assertEqual(merged[0]["helper"], helper + 1024)
+
+    def test_helper_pool_and_primary_pool_on_one_card_do_not_overlap(self):
+        r = dict(self.r, helper=2 * GB)
+        engine = sum(r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool", "helper"))
+        card = dict(self.card(engine + GB, {100: engine + GB}), total=32 * GB)
+        (g,) = self.gm.view([r], [card], engine_pid=100)
+        self.assertEqual(g["parts"]["helper"], 2 * GB)
+        self.assertEqual(g["parts"]["pool"], r["pool"])
+        self.assertEqual(g["parts"]["rest"], GB)
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
+
     def test_nvml_tells_the_engine_from_other_programs(self):
         engine = sum(self.r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
         own, other = engine + 400 * 2**20, 600 * 2**20

@@ -20163,6 +20163,14 @@ struct Model::Impl {
                       (long long) o.max_context, (long long) o.max_context, g.nl * g.n_exp - nh, nh, ram_held,
                       cpu_threads());
         v.push_back(b);
+        // The helper is allocated separately from Dev::experts, including its recent-expert slots.
+        const size_t helper_bytes = helper_pool != nullptr ? helper_used : 0;
+        if (helper_bytes > 0) {
+            std::snprintf(b, sizeof b, "INFO helper_gpu=%d helper_slots=%d helper_allocated_bytes=%zu",
+                          helper_id, helper_n, helper_bytes);
+            v.push_back(b);
+        }
+        bool helper_reported = false;
         // the Monitor's map of each GPU (serve/gpu_map.py, the GLM engine's VRAM lines): what each part holds on the
         // card, in bytes - the dense weights (the drafter's blocks apart), the KV caches, the window's buffers, the
         // drafter's blocks (their weights, a share estimated, and experts), the routed experts' slots, the vision
@@ -20204,12 +20212,31 @@ struct Model::Impl {
             if (cudaDeviceGetPCIBusId(pci, sizeof pci, d.id) != cudaSuccess) std::snprintf(pci, sizeof pci, "-");
             std::snprintf(b, sizeof b,
                           "VRAM dev=%d pci=%s total=%zu free=%zu weights=%zu kv=%zu kv_ram=0 act=%zu drafter=%zu window=0 "
-                          "pool=%zu tail=0 borrow=0 vision=0 vision_own=%zu prompt=%zu tp=%zu tp_n=%zu slots=%lld ctx=%lld "
+                          "pool=%zu helper=%zu tail=0 borrow=0 vision=0 vision_own=%zu prompt=%zu tp=%zu tp_n=%zu slots=%lld ctx=%lld "
                           "layers=%d-%d",
                           d.id, pci, tot, fr, d.weights - mtp_dense - tp_w, d.caches - tp_kv, d.scratch, mtp_dense + mtp_exp,
-                          d.experts - mtp_exp - v_pool, vis, d.prompt - v_prompt, tp_w + tp_kv, tn, slots,
+                          d.experts - mtp_exp - v_pool, d.id == helper_id ? helper_bytes : 0, vis, d.prompt - v_prompt,
+                          tp_w + tp_kv, tn, slots,
                           (long long) o.max_context, a, z);
             v.push_back(b);
+            helper_reported = helper_reported || d.id == helper_id;
+        }
+        // A dedicated helper can be outside --gpus and have no target Dev row.
+        if (helper_bytes > 0 && !helper_reported) {
+            int previous = 0;
+            cudaGetDevice(&previous);
+            size_t fr = 0, tot = 0;
+            if (cudaSetDevice(helper_id) == cudaSuccess && mem_info(&fr, &tot) == cudaSuccess) {
+                char pci[32] = "-";
+                if (cudaDeviceGetPCIBusId(pci, sizeof pci, helper_id) != cudaSuccess)
+                    std::snprintf(pci, sizeof pci, "-");
+                std::snprintf(b, sizeof b, "VRAM dev=%d pci=%s total=%zu free=%zu weights=0 kv=0 kv_ram=0 act=0 drafter=0 "
+                                          "window=0 pool=0 helper=%zu tail=0 borrow=0 vision=0 vision_own=0 prompt=0 "
+                                          "tp=0 tp_n=1 slots=0 ctx=%lld layers=-1--1",
+                              helper_id, pci, tot, fr, helper_bytes, (long long) o.max_context);
+                v.push_back(b);
+            }
+            cudaSetDevice(previous);
         }
         if (commit_kept > 0) {   // (Windows, an integrated GPU: the commit kept experts off the GPU - the server says so)
             std::snprintf(b, sizeof b,

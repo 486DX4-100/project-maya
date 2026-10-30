@@ -1124,6 +1124,18 @@ unchanged. `ds4_gguf_test --ar <GPU> <GPU>` checks both against the host's sums 
 | `MAYA_DS4_AR2` | off (0) | a group of two's prompt-chunk all-reduces: `1` pipelined in one launch, the same sums; `2` FP16 on the wire (half the bytes, the sums FP16's) |
 | `MAYA_DS4_AR2_DECODE` | off (0) | `1`: a group of two's decode-window all-reduces in the same kernel, exact |
 
+## DeepSeek: helper memory in the Monitor
+
+With `MAYA_DS4_HELPER`, the Monitor shows the helper's allocated expert pool as **Helper experts**, separately
+from the drafter, the primary expert pool and the driver's miscellaneous memory. A dedicated helper outside
+`--gpus` has its own GPU row. The byte count is the actual allocated pool (including recent-expert slots),
+not the configured memory limit; small helper working buffers remain in the driver's miscellaneous category.
+
+The expert-placement bar describes **Primary cache and RAM backing** when the helper is active. Helper copies
+are not added to those unique-expert counts: CPU backing remains available for fallback. The note reports the
+profiled cached-expert count and helper selections per evaluated token, and identifies helper failure. The
+primary-cache hit rate continues to exclude helper execution; no routing or cache policy changes.
+
 ## DeepSeek: the DSpark drafter's blocks on a group's members
 
 The drafter's blocks run whole on the drafter's group's lead, and their VRAM experts come out of the lead's room. A
