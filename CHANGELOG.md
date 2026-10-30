@@ -4,6 +4,48 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.40 - 2026-10-30
+
+Experimental Mac support: GLM-5.3-Flash on Apple silicon, from a community contribution. DeepSeek's restore point
+near a prompt's tail is now judged by its real cost on multi-GPU layer splits, and the dashboard got a few fixes.
+
+- **Mac with Apple silicon, experimental (GLM-5.3-Flash only)** (#334, thanks @hotocoo): a new engine, `maya-metal`,
+  runs GLM-5.3-Flash on the GPU of an M1 or newer Mac through Metal, with the same dashboard and the same OpenAI- and
+  Anthropic-compatible API as on Linux and Windows (streamed answers, tool calls, thinking levels, pictures).
+  `./maya.sh --backend metal --setup` builds it and downloads the model; on a Mac, `./maya.sh` picks Metal by itself.
+  See [docs/METAL.md](docs/METAL.md).
+  **This is experimental.** Every change is built and unit-tested on GitHub's Apple silicon runners, but we have no
+  Mac and have not run it with the real model, so expect rough edges. If you try it, please tell us how it went in an
+  issue: the chip and its memory, the model, the speed `./maya.sh --bench` prints, and anything that went wrong
+  (`./maya.sh --report` collects the details). DeepSeek, MiniMax and Qwen stay NVIDIA / AMD only for now, and a Mac
+  GPU without Apple silicon's matrix support (a virtual machine's, for example) gets a clear message instead of a
+  crash. The Mac engine is only built on a Mac; for NVIDIA and AMD users the only changes from #334 are the
+  server and download points at the end of these notes.
+- **DeepSeek: the restore point near a prompt's tail is judged by its measured time per token** (#668, thanks
+  @creslinux for the measurements): on a layer split (`--tp 1`) whose experts mostly stay outside VRAM, v1.1.39 kept
+  that point although its short run cost several times more per token than the rest of the read - a few seconds
+  added to every fresh prompt. The engine now compares the two runs' wall time per token and, after its first two
+  measured reads, leaves the point out wherever it costs more than reading its tokens again. On three V100s fresh
+  prompts then read about 1.3-1.4x faster with 10% of the experts in VRAM (4-8K tokens), and took 7-17% less time
+  with the default placement, about three quarters of the experts in VRAM (4-16K tokens), where the point is now
+  left out too. Editing the last message
+  still restarts from the last user message, and the system-prompt reuse from v1.1.39 is unchanged. One GPU and the
+  CPU lane decide as before. `MAYA_DS4_RESTORE_TAIL_AUTO=0` keeps the point on every read.
+- **Dashboard:**
+  - Monitor: the peak decode speed now follows the live Decode figure, so the live number no longer sits above the
+    peak.
+  - Monitor: the Context card says clearly what the VRAM window is (with KV streaming, how much of a chat's cache
+    stays in GPU memory) and where it is set.
+  - Models page: Engine settings > Context size is now the same slider as Settings > Model, up to each model's own
+    trained context (1M for GLM, DeepSeek and MiniMax), with the same memory line under it.
+  - Chat: the thinking-level picker highlights only the level that is chosen (Low no longer lit Off as well).
+  - Models page: GLM on an AMD GPU says why Images is off (the setup does not build GLM's image encoder for AMD GPUs
+    yet).
+- Also from #334, for every platform: the server refuses requests that a web page of another site sends to it
+  unless the config's `cors_origins` lists that page (curl, SDKs and apps like Open WebUI are not affected), a
+  connection that stalls in the middle of a request is closed after 5 minutes (a long answer is not cut), and a
+  downloaded model file whose checksum does not match is removed so the next setup fetches it again.
+
 ## v1.1.39 - 2026-10-29
 
 DeepSeek reuses a shared system prompt across conversations (a new conversation's first token about 19x sooner),
