@@ -164,6 +164,10 @@ def main():
          "                    // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>\n"),
     ])
     print(f"llama.cpp at {root}: {MARK} vision added")
+    # the encoder's float32 sums on AMD GPUs (ggml's HIP backend; a CUDA build compiles the same code as before)
+    sys.path.insert(0, str(here))
+    import ggml_hip_precision
+    ggml_hip_precision.main(root)
 
 
 if __name__ == "__main__":
