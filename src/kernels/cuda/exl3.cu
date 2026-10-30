@@ -587,6 +587,14 @@ struct KBatch {
     const int* skip;   // set_skip's flag: non-zero = a pipelined window's token past a wrong draft (nullptr: none)
 };
 
+// AMD CDNA3 / CDNA4 (gfx942, gfx950): a split's sums, a gate / up pair's swiglu and the experts' combine run as kernels
+// of their own after the GEMVs (mv_reduce_kernel's note), and the experts' input split (EXL3_XSPLIT) is offered - the
+// device code of those GPUs (EXL3_SEP_DEV) and the host's choice per GPU (sep_sums) go together.  Every other GPU keeps
+// the last block's hand-off (on a Radeon 8060S, gfx1151, the same bits but not faster: the routed experts ~4% slower)
+#if defined(STRATA_USE_HIP) && (defined(__gfx942__) || defined(__gfx950__))
+#define EXL3_SEP_DEV 1
+#endif
+
 // a launch's blocks: its jobs' (output block, input split) pairs, each for all of the job's nc activations at once
 // (block_gemv).  S > 1: the partial sums go to the scratch and the last block of an output block adds them up in split
 // order (deterministic) and runs the epilogue
@@ -620,7 +628,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     if (threadIdx.x < kCols)
         for (int c = 0; c < nc; ++c)
             J.part[((size_t) c * J.S + sp) * J.n + g * kCols + threadIdx.x] = sm.out[c * kCols + threadIdx.x];
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
     return;   // (mv_reduce_kernel adds them up)
 #endif
     __threadfence();
@@ -725,7 +733,7 @@ __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {
 }
 // ... the second block of a (gate, up) pair to finish (its counter back at zero for the next launch) ...
 __device__ __forceinline__ bool pair_last(unsigned* cnt, int& last) {
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
     (void) cnt;
     (void) last;
     return false;   // (moe_swiglu_kernel / win_swiglu_kernel: mv_reduce_kernel's note)
@@ -776,7 +784,7 @@ template <int K2, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_gate_up_kernel(const KMoe a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     __shared__ int last;
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
     const int ei = blockIdx.y, g = blockIdx.x, r = (int) blockIdx.z / a.gS, sp = (int) blockIdx.z % a.gS;
 #else
     const int ei = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
@@ -788,7 +796,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_gate_up_kernel(const KMoe a) {
     const int warp = threadIdx.x >> 5;
     Xin x;
     x.f = a.x;
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
     block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
                       min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), 1, sm);
     if (a.gS > 1) {   // (moe_gu_red_kernel)
@@ -818,7 +826,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_down_kernel(const KMoe a) {
     const int warp = threadIdx.x >> 5;
     float* part = a.part + (size_t) ei * a.n_embd + g * kCols;
     if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
     const int sp = blockIdx.z;
     if (a.dS > 1 && ptr == 0ull) return;        // (moe_down_red_kernel writes its zeros)
 #endif
@@ -826,7 +834,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_down_kernel(const KMoe a) {
         const uint8_t* blob = (const uint8_t*) ptr;
         Xin x;
         x.f = a.h + (size_t) ei * a.n_ff;
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
         block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
                           min(a.n_ff, (sp + 1) * a.dkr), x, (const uint16_t*) (blob + a.suh[2]), 1, sm);
         if (a.dS > 1) {
@@ -841,7 +849,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_down_kernel(const KMoe a) {
     } else if (threadIdx.x < kCols) {
         part[threadIdx.x] = 0.0f;
     }
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
     return;   // (moe_combine_kernel)
 #endif
     __threadfence();
@@ -897,7 +905,7 @@ template <int K2, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     __shared__ int last;
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
     const int grp = blockIdx.y, g = blockIdx.x, r = (int) blockIdx.z / a.gS, sp = (int) blockIdx.z % a.gS;
 #else
     const int grp = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
@@ -911,7 +919,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
         block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
                           min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (a.gS > 1)   // (win_gu_red_kernel)
@@ -941,7 +949,7 @@ template <int K2, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     const int grp = blockIdx.y, g = blockIdx.x;
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
     const int sp = blockIdx.z;
 #endif
     if (grp >= *a.n_groups) return;
@@ -952,7 +960,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.h + (size_t) a.grp_ent[mm + warp] * a.n_ff;
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
         block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
                           min(a.n_ff, (sp + 1) * a.dkr), x, (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (a.dS > 1)   // (win_down_red_kernel)
@@ -1014,10 +1022,26 @@ __global__ void __launch_bounds__(kCols) win_swiglu_kernel(const KWin a) {
         a.h[row] = swiglu(a.h[row], a.u[row], a.limit);
     }
 }
-#define EXL3_MOE_SWIGLU(a, s) moe_swiglu_kernel<<<dim3((unsigned) ((a).n_ff / kCols), (unsigned) (a).k), kCols, 0, s>>>(a)
-#define EXL3_MOE_COMBINE(a, s) moe_combine_kernel<<<(unsigned) ((a).n_embd / kCols), kCols, 0, s>>>(a)
+// whether this GPU's device code runs those pieces as kernels of their own (EXL3_SEP_DEV above): gfx942 / gfx950,
+// cached per device
+static bool sep_sums() {
+    thread_local int known[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (known[dev] == 0) {
+        cudaDeviceProp p{};
+        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                     (std::strncmp(p.gcnArchName, "gfx942", 6) == 0 || std::strncmp(p.gcnArchName, "gfx950", 6) == 0)
+                         ? 2 : 1;
+    }
+    return known[dev] == 2;
+}
+#define EXL3_MOE_SWIGLU(a, s) \
+    do { if (sep_sums()) moe_swiglu_kernel<<<dim3((unsigned) ((a).n_ff / kCols), (unsigned) (a).k), kCols, 0, s>>>(a); } while (0)
+#define EXL3_MOE_COMBINE(a, s) \
+    do { if (sep_sums()) moe_combine_kernel<<<(unsigned) ((a).n_embd / kCols), kCols, 0, s>>>(a); } while (0)
 #define EXL3_WIN_SWIGLU(a, groups, s) \
-    win_swiglu_kernel<<<dim3((unsigned) ((a).n_ff / kCols), (unsigned) (groups)), kCols, 0, s>>>(a)
+    do { if (sep_sums()) win_swiglu_kernel<<<dim3((unsigned) ((a).n_ff / kCols), (unsigned) (groups)), kCols, 0, s>>>(a); } while (0)
 #else
 #define EXL3_MOE_SWIGLU(a, s) (void) 0
 #define EXL3_MOE_COMBINE(a, s) (void) 0
@@ -1187,7 +1211,7 @@ __global__ void EXL3_BOUNDS(2) moe_down_mix_kernel(const KMoe a, const KMix mx) 
     } else if (threadIdx.x < kCols) {
         part[threadIdx.x] = 0.0f;
     }
-#if defined(STRATA_USE_HIP)
+#if defined(EXL3_SEP_DEV)
     return;   // (moe_combine_kernel)
 #endif
     __threadfence();
@@ -2474,13 +2498,13 @@ constexpr size_t kHFloats = (size_t) 8 * 8192;     // the experts' h
 constexpr size_t kUFloats = (size_t) 128 * 4096;   // the experts' up values: a window's 16 tokens x 8, n_ff <= 4096
 #if defined(STRATA_USE_HIP)
 constexpr size_t kXPFloats = (size_t) 6 << 20;     // the experts' input split partials (xsplit, AMD): 24 MB
-// the split EXL3_XSPLIT asks for (1: none)
+// the split EXL3_XSPLIT asks for (1: none) - on gfx942 / gfx950 only (sep_sums: elsewhere the device code has no split)
 int xsplit_want() {
     static const int env = [] {
         const char* v = std::getenv("EXL3_XSPLIT");
         return v != nullptr ? std::max(1, std::min(8, std::atoi(v))) : 1;
     }();
-    return env;
+    return env > 1 && sep_sums() ? env : 1;
 }
 #endif
 struct Scratch {
@@ -2760,7 +2784,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         int rblocks = 0, rnc = 0;
         for (int j = 0; j < nb; ++j)
             if (b.j[j].S > 1) rblocks += b.j[j].n / kCols, rnc = std::max(rnc, b.j[j].nc);
-        if (rblocks > 0) mv_reduce_kernel<<<dim3(rblocks, rnc), kCols, 0, s>>>(b);
+        if (rblocks > 0 && sep_sums()) mv_reduce_kernel<<<dim3(rblocks, rnc), kCols, 0, s>>>(b);
 #endif
     }
     launch_check("mv");
