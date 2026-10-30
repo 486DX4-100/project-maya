@@ -1755,9 +1755,10 @@ from the file's NextN block (`tools/mtp_from_gguf.py`, in `<model folder>/pack/m
 tower byte for byte, so the setup downloads the base model's mmproj (0.9 GB, pinned and sha256-checked, into
 `<model folder>/vision`) and writes the config's `"vision"` entry and the engine's `--vision`; the image encoder
 (`build-vision/bin/maya-vision`) starts only when a picture arrives, on the first GPU: in VRAM that is free, and where
-that is short the engine gives back the end of its expert cache while the picture is read, then maps it again and
-refills the same experts (a second or so per request with new pictures; text answers and the decode speed stay as they
-were; NVIDIA, the HIP build lends only free VRAM). Only when the GPU cannot spare that much does the encoder run on the
+that is short the engine gives back as much of its expert cache as the encoder needs (all of it on a small card, and
+then the draft layer's experts too) while the picture is read, then maps it again and refills the same experts (a
+second or so per request with new pictures; text answers and the decode speed stay as they were; NVIDIA, the HIP build
+lends only free VRAM). Only when the GPU cannot spare that much does the encoder run on the
 CPU, and the engine's log says why. `--no-vision`, or Images off on the Models page, reads text only.
 
 **Where the experts live.** The most-used experts go to VRAM (`--expert-cache auto`: the free VRAM less the reserve).

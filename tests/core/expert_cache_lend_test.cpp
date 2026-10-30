@@ -43,6 +43,8 @@ int main() {
     expect(!c.lendable() && c.lendable_bytes(0) == 0, "a HIP build keeps one allocation");
     expect(!c.lend_tail(1 << 20, 0, from, given, err) && given == 0, "a HIP build cannot lend");
     expect(c.reclaim_tail(err) && !c.lent(), "nothing to reclaim");
+    strata::core::LendableArena a;
+    expect(!a.open(1 << 20, err) && !a.ok() && a.lendable_bytes(0) == 0, "a HIP build has no lendable arena");
     std::printf(fails ? "FAILED\n" : "ok (HIP: no lending)\n");
     return fails ? 1 : 0;
 #else
@@ -98,6 +100,45 @@ int main() {
         expect(c.verify_slot(s, b.data(), err, (int64_t) b.size()), "a slot after the reclaim", err);
     }
     expect(refilled > 0 && refilled < n, "some slots were lent");
+    // the whole cache (no floor: a small card's encoder needs all of it): every byte goes back, every slot refills
+    {
+        size_t fa = 0, fb = 0, fc = 0;
+        cudaMemGetInfo(&fa, &t);
+        uint64_t fromw = 1, givenw = 0;
+        expect(c.lend_tail((uint64_t) c.bytes(), 0, fromw, givenw, err) && fromw == 0 &&
+                   givenw >= (uint64_t) c.bytes() && givenw == c.lendable_bytes(0),
+               "lend the whole cache", err);
+        cudaMemGetInfo(&fb, &t);
+        expect(fb + ((uint64_t) 4 << 20) >= fa + givenw, "the free VRAM grew by the whole cache");
+        expect(c.reclaim_tail(err) && !c.lent() && c.device_slot(0) == base, "reclaim the whole cache", err);
+        cudaMemGetInfo(&fc, &t);
+        expect(fc + ((uint64_t) 4 << 20) >= fa && fc <= fa + ((uint64_t) 4 << 20), "the whole cache is back");
+        for (int s = 0; s < n; ++s) {
+            const auto b = blob(s, sizes[(size_t) s], 2);
+            expect(c.fill_slot_blocking(s, b.data(), err, (int64_t) b.size()) &&
+                       c.verify_slot(s, b.data(), err, (int64_t) b.size()),
+                   "a slot refilled after the whole cache was lent", err);
+        }
+    }
+    // a plain arena (the draft layer's experts): its tail goes back, the head keeps its bytes, the same address after
+    {
+        strata::core::LendableArena a;
+        const uint64_t ab = ((uint64_t) 130 << 20) + 12345;
+        expect(a.open(ab, err) && a.ok() && a.lendable_bytes(0) >= ab, "an arena", err);
+        std::vector<uint8_t> h((size_t) ab), back((size_t) ab);
+        for (size_t i = 0; i < h.size(); ++i) h[i] = (uint8_t) (i * 17 + 3);
+        cudaMemcpy(a.data(), h.data(), h.size(), cudaMemcpyHostToDevice);
+        uint8_t* const ad = a.data();
+        uint64_t af = 0, ag = 0;
+        expect(a.lend_tail(1, 0, af, ag, err) && a.lent() && af == a.lent_from() && af > 0 && af < ab && ag > 0,
+               "the arena lends its last piece", err);
+        expect(a.reclaim_tail(err) && !a.lent() && a.data() == ad, "the arena maps it again", err);
+        cudaMemcpy(ad + af, h.data() + af, (size_t) (ab - af), cudaMemcpyHostToDevice);
+        cudaMemcpy(back.data(), ad, back.size(), cudaMemcpyDeviceToHost);
+        expect(back == h, "the arena's bytes after the reclaim");
+        a.close();
+        expect(!a.ok() && a.data() == nullptr, "the arena closed");
+    }
     // nothing past the floor: refused; a cache closed while lent leaves nothing behind
     expect(!c.lend_tail(1, (uint64_t) c.bytes(), from, given, err), "nothing to lend past the floor");
     const uint64_t lent_first = given0;

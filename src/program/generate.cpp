@@ -5358,6 +5358,16 @@ int main(int argc, char** argv) {
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         static const strata::core::ModelGeometry draft_geometry{};
+#if !defined(STRATA_USE_HIP)
+        // an on-demand vision encoder (it runs on the first GPU): a drafter there can lend its experts' VRAM too,
+        // when the expert cache alone cannot hold the encoder (nothing drafts while a picture is read)
+        {
+            int dev0 = 0;
+            cudaGetDevice(&dev0);
+            if (o.serve && o.vision && vision_lend_need() > 0 && (last_st == nullptr || last_st->dev == dev0))
+                mtp.set_lendable(true);
+        }
+#endif
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "maya generate: %s\n", err.c_str()); return 1; }
@@ -7192,15 +7202,16 @@ int main(int argc, char** argv) {
         // The on-demand vision encoder (the server's VLEND / VRECLAIM between requests): it runs on this GPU in the
         // VRAM that is free, plus - when that is short - the tail of the expert cache, given back to the driver
         // while the picture is read (its experts are marked not resident) and mapped again and refilled after, so
-        // the next request finds the same experts in the same slots.  `vis_cap` (the INFO's vision_lend): the
-        // encoder's need when free VRAM plus the lendable tail can hold it, else 0 (the server then runs the encoder
-        // on the CPU).  The first 128 slots are never lent (the same floor the prompt path keeps).
+        // the next request finds the same experts in the same slots.  Nothing decodes while the encoder runs and a
+        // refill needs no slot (the experts are copied straight from RAM), so the whole cache can be lent; when even
+        // that is short, the draft layer's experts on this GPU follow (read again from their file after).
+        // `vis_cap` (the INFO's vision_lend): the encoder's need when free VRAM plus what can be lent holds it, else
+        // 0 (the server then runs the encoder on the CPU).
         const uint64_t vis_need = o.vision ? vision_lend_need() : 0;
         constexpr uint64_t kVisMargin = (uint64_t) 128 << 20;   // VRAM left free beside the encoder
         const bool vis_tail_ok = xcache.lendable() && !host_res.empty() && d_res != nullptr && srcp != nullptr;
-        const uint64_t vis_keep = xcache.slots() > 128
-                                      ? (uint64_t) (xcache.device_slot(128) - xcache.device_slot(0))
-                                      : (uint64_t) xcache.bytes();
+        constexpr uint64_t vis_keep = 0;   // (no slot is needed while the encoder runs or for the refill)
+        const uint64_t vis_mtp_tail = !o.mtp.empty() ? mtp.lendable_bytes() : 0;
         uint64_t vis_cap = 0;
         if (vis_need > 0) {
             size_t free_b = 0, total_b = 0;
@@ -7216,11 +7227,19 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "maya serve: pictures: the vision encoder (%.2f GB) runs on this GPU - %.2f GB "
                                      "free, the rest lent by the expert cache while a picture is read\n",
                              (double) vis_need / 1073741824.0, (double) have / 1073741824.0);
+            } else if (have + tail + vis_mtp_tail >= vis_need) {
+                vis_cap = vis_need;
+                std::fprintf(stderr, "maya serve: pictures: the vision encoder (%.2f GB) runs on this GPU - %.2f GB "
+                                     "free, %.2f GB lent by the expert cache and the rest by the draft layer's "
+                                     "experts while a picture is read\n",
+                             (double) vis_need / 1073741824.0, (double) have / 1073741824.0,
+                             (double) tail / 1073741824.0);
             } else {
                 std::fprintf(stderr, "maya serve: pictures: this GPU cannot spare the %.2f GB the vision encoder "
-                                     "needs (%.2f GB free, %.2f GB the expert cache can lend%s) - it runs on the CPU\n",
+                                     "needs (%.2f GB free, %.2f GB the expert cache and %.2f GB the draft layer can "
+                                     "lend%s) - it runs on the CPU\n",
                              (double) vis_need / 1073741824.0, (double) have / 1073741824.0,
-                             (double) tail / 1073741824.0,
+                             (double) tail / 1073741824.0, (double) vis_mtp_tail / 1073741824.0,
                              xcache.lendable() ? "" : ": this cache cannot give memory back");
             }
         }
@@ -7269,7 +7288,8 @@ int main(int argc, char** argv) {
         bool mrope_identity = true;
         // the experts the vision encoder's memory took out (residency index, slot), refilled once it is back
         std::vector<std::pair<int32_t, int32_t>> vis_lent;
-        auto vis_reclaim = [&](std::string& e) -> bool {
+        uint64_t vis_mtp_given = 0;   // the draft layer's expert bytes lent with them
+        auto vis_reclaim_cache = [&](std::string& e) -> bool {
             if (!xcache.lent()) return true;
             const auto t0 = Clock::now();
             if (!xcache.reclaim_tail(e)) return false;
@@ -7304,6 +7324,24 @@ int main(int argc, char** argv) {
             vis_lent.clear();
             return true;
         };
+        // the cache first (its refill is the faster), then the draft layer's experts
+        auto vis_reclaim = [&](std::string& e) -> bool {
+            if (!vis_reclaim_cache(e)) return false;
+            if (!mtp.experts_lent()) return true;
+            const auto t0 = Clock::now();
+            if (!mtp.reclaim_experts(e)) {
+                if (mtp.experts_lent()) return false;   // (the memory is not free yet: a later call maps the rest)
+                // mapped again but not read back: only the drafts suffer (the verify decides every token)
+                std::fprintf(stderr, "maya serve: %s - drafts are rejected until the engine restarts\n", e.c_str());
+                vis_mtp_given = 0;
+                return true;
+            }
+            std::fprintf(stderr, "maya serve: the draft layer's experts are back: %.2f GB read again in %.0f ms\n",
+                         (double) vis_mtp_given / 1073741824.0,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            vis_mtp_given = 0;
+            return true;
+        };
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
         // The prompt path's chunk, for the requests that follow: an allocation failure lowers it (the memory is
@@ -7332,10 +7370,24 @@ int main(int argc, char** argv) {
                     size_t free_b = 0, total_b = 0;
                     cudaMemGetInfo(&free_b, &total_b);
                     const uint64_t have = free_b > kVisMargin ? (uint64_t) free_b - kVisMargin : 0;
-                    bool ok = true;
-                    if (have < vis_need) {
-                        ok = vis_tail_ok && xcache.lend_tail(vis_need - have, vis_keep, from, given, ve);
-                        if (!vis_tail_ok && ve.empty()) ve = "the expert cache cannot give memory back here";
+                    // what is short of the free VRAM: the expert cache's tail first (all of it if need be), then
+                    // the draft layer's experts on this GPU
+                    uint64_t mtp_given = 0;
+                    const uint64_t short_b = have < vis_need ? vis_need - have : 0;
+                    if (short_b > 0 && vis_tail_ok) (void) xcache.lend_tail(short_b, vis_keep, from, given, ve);
+                    if (short_b > given && vis_mtp_tail > 0) {
+                        std::string me;
+                        (void) mtp.lend_experts(short_b - given, mtp_given, me);
+                        vis_mtp_given = mtp_given;
+                        if (!me.empty()) ve = ve.empty() ? me : ve + "; " + me;
+                    }
+                    const bool ok = given + mtp_given >= short_b;
+                    if (!ok) {
+                        char buf[200];
+                        std::snprintf(buf, sizeof buf, "the GPU could give the vision encoder only %.2f of the %.2f GB "
+                                      "it needs", (double) (have + given + mtp_given) / 1073741824.0,
+                                      (double) vis_need / 1073741824.0);
+                        ve = ve.empty() ? std::string(buf) : std::string(buf) + " (" + ve + ")";
                     }
                     if (xcache.lent()) {   // (also after a lend that stopped half-way: what is out is marked)
                         // every slot reaching past `from` has lost its expert until the reclaim refills it
@@ -7354,11 +7406,14 @@ int main(int argc, char** argv) {
                         res_upload();
                     }
                     if (ok) {
+                        cudaMemGetInfo(&free_b, &total_b);   // (measured: what the encoder finds free now)
                         std::fprintf(stderr, "maya serve: the vision encoder gets %.2f GB of VRAM: %.2f GB free, "
-                                             "%.2f GB from the expert cache (%zu experts out until it ends)\n",
+                                             "%.2f GB from the expert cache (%zu experts out until it ends), %.2f GB "
+                                             "from the draft layer's experts - %.2f GB free now\n",
                                      (double) vis_need / 1073741824.0, (double) std::min(have, vis_need) / 1073741824.0,
-                                     (double) given / 1073741824.0, vis_lent.size());
-                        std::printf("VLENT %llu\n", (unsigned long long) given);
+                                     (double) given / 1073741824.0, vis_lent.size(),
+                                     (double) mtp_given / 1073741824.0, (double) free_b / 1073741824.0);
+                        std::printf("VLENT %llu\n", (unsigned long long) (given + mtp_given));
                     } else {
                         std::printf("ERR %s\n", ve.c_str());
                     }
@@ -7373,7 +7428,7 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
-            if (xcache.lent()) {
+            if (xcache.lent() || mtp.experts_lent()) {
                 // a request while the encoder's memory is still out (the server reclaims it first, so only when
                 // that kept failing): it is taken back first - the prompt path's buffers live in that tail
                 std::string ve;

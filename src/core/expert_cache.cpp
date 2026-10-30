@@ -230,7 +230,7 @@ std::vector<CUmemAccessDesc> access_list(int dev) {
 }
 }  // namespace
 
-bool ExpertCache::map_piece(Piece& p, std::string& err) {
+bool LendableArena::map_piece(Piece& p, std::string& err) {
     const Vmm& v = vmm();
     CUdevice cd = 0;
     CUmemAllocationProp prop{};
@@ -260,16 +260,16 @@ bool ExpertCache::map_piece(Piece& p, std::string& err) {
     return true;
 }
 
-bool ExpertCache::vmm_open(uint64_t bytes) {
+bool LendableArena::open(uint64_t bytes, std::string& err) {
+    close();
     const Vmm& v = vmm();
-    vmm_err_.clear();
-    if (!v.ok) { vmm_err_ = "the driver has no virtual memory API"; return false; }
+    if (!v.ok) { err = "the driver has no virtual memory API"; return false; }
     cudaGetDevice(&dev_);
     CUdevice cd = 0;
     int vm = 0;
     if (v.dev_get(&cd, dev_) != CUDA_SUCCESS ||
         v.attr(&vm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cd) != CUDA_SUCCESS || vm == 0) {
-        vmm_err_ = "virtual memory management is not supported";
+        err = "virtual memory management is not supported";
         return false;
     }
     CUmemAllocationProp prop{};
@@ -278,7 +278,7 @@ bool ExpertCache::vmm_open(uint64_t bytes) {
     prop.location.id = cd;
     size_t gran = 0;
     if (v.gran(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS || gran == 0) {
-        vmm_err_ = "no allocation granularity";
+        err = "no allocation granularity";
         return false;
     }
     // pieces of 64 MiB (whole granules): what a lend gives back is at most one piece more than it needs
@@ -286,15 +286,15 @@ bool ExpertCache::vmm_open(uint64_t bytes) {
     const uint64_t total = (bytes + g - 1) / g * g;
     CUdeviceptr va = 0;
     if (v.reserve(&va, (size_t) total, 0, 0, 0) != CUDA_SUCCESS) {
-        vmm_err_ = "the address range could not be reserved";
+        err = "the address range could not be reserved";
         return false;
     }
     base_ = (uint8_t*) (uintptr_t) va;
     va_bytes_ = total;
     for (uint64_t off = 0; off < total; off += piece) pieces_.push_back({off, std::min(piece, total - off), false});
     for (Piece& p : pieces_) {
-        if (!map_piece(p, vmm_err_)) {
-            vmm_close();
+        if (!map_piece(p, err)) {
+            close();
             return false;
         }
     }
@@ -302,7 +302,7 @@ bool ExpertCache::vmm_open(uint64_t bytes) {
     return true;
 }
 
-void ExpertCache::vmm_close() {
+void LendableArena::close() {
     const Vmm& v = vmm();
     if (base_ != nullptr) {
         cudaDeviceSynchronize();
@@ -316,10 +316,11 @@ void ExpertCache::vmm_close() {
     lent_from_ = UINT64_MAX;
 }
 
-bool ExpertCache::lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from, uint64_t& given, std::string& err) {
+bool LendableArena::lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from, uint64_t& given,
+                              std::string& err) {
     from = lent_from_;
     given = 0;
-    if (pieces_.empty()) { err = "the expert cache is one allocation here: it cannot give memory back"; return false; }
+    if (pieces_.empty()) { err = "one allocation here: it cannot give memory back"; return false; }
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "the GPU reported an error before lending"; return false; }
     const Vmm& v = vmm();
     for (size_t i = pieces_.size(); i-- > 0 && given < bytes;) {
@@ -336,13 +337,13 @@ bool ExpertCache::lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from,
     }
     from = lent_from_;
     if (given == 0) {
-        if (err.empty()) err = "the expert cache has nothing to lend past its first " + std::to_string(keep_bytes >> 20) + " MiB";
+        if (err.empty()) err = "nothing to lend past the first " + std::to_string(keep_bytes >> 20) + " MiB";
         return false;
     }
     return true;
 }
 
-bool ExpertCache::reclaim_tail(std::string& err) {
+bool LendableArena::reclaim_tail(std::string& err) {
     if (lent_from_ == UINT64_MAX) return true;
     for (Piece& p : pieces_)
         if (!p.mapped && !map_piece(p, err)) return false;
@@ -350,25 +351,31 @@ bool ExpertCache::reclaim_tail(std::string& err) {
     return true;
 }
 
-uint64_t ExpertCache::lendable_bytes(uint64_t keep_bytes) const {
+uint64_t LendableArena::lendable_bytes(uint64_t keep_bytes) const {
     uint64_t b = 0;
     for (const Piece& p : pieces_)
         if (p.off >= keep_bytes) b += p.size;
     return b;
 }
 #else
-bool ExpertCache::vmm_open(uint64_t) { vmm_err_ = "a HIP build"; return false; }
-void ExpertCache::vmm_close() {}
-bool ExpertCache::map_piece(Piece&, std::string& err) { err = "a HIP build"; return false; }
-bool ExpertCache::lend_tail(uint64_t, uint64_t, uint64_t& from, uint64_t& given, std::string& err) {
+bool LendableArena::open(uint64_t, std::string& err) { err = "a HIP build"; return false; }
+void LendableArena::close() {}
+bool LendableArena::map_piece(Piece&, std::string& err) { err = "a HIP build"; return false; }
+bool LendableArena::lend_tail(uint64_t, uint64_t, uint64_t& from, uint64_t& given, std::string& err) {
     from = UINT64_MAX;
     given = 0;
-    err = "the expert cache is one allocation here: it cannot give memory back";
+    err = "one allocation here: it cannot give memory back";
     return false;
 }
-bool ExpertCache::reclaim_tail(std::string&) { return true; }
-uint64_t ExpertCache::lendable_bytes(uint64_t) const { return 0; }
+bool LendableArena::reclaim_tail(std::string&) { return true; }
+uint64_t LendableArena::lendable_bytes(uint64_t) const { return 0; }
 #endif
+
+bool ExpertCache::lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from, uint64_t& given, std::string& err) {
+    const bool ok = arena_.lend_tail(bytes, keep_bytes, from, given, err);
+    if (!ok && !arena_.ok()) err = "the expert cache is " + err;
+    return ok;
+}
 
 #if defined(STRATA_USE_HIP)
 bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
@@ -422,9 +429,10 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     }
 
     // lendable (the on-demand vision encoder): mapped in pieces, else (no virtual memory API) the one cudaMalloc
-    if (want_lend_ && !vmm_open(want)) {
-        std::fprintf(stderr, "maya: the expert cache cannot be mapped in pieces on this GPU (%s) - only VRAM that "
-                             "is free can go to the vision encoder\n", vmm_err_.c_str());
+    if (want_lend_) {
+        if (arena_.open(want, vmm_err_)) base_ = arena_.data();
+        else std::fprintf(stderr, "maya: the expert cache cannot be mapped in pieces on this GPU (%s) - only VRAM "
+                                  "that is free can go to the vision encoder\n", vmm_err_.c_str());
     }
     if (base_ == nullptr && cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
         base_ = nullptr;
@@ -499,8 +507,9 @@ void ExpertCache::close() {
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
-    if (base_ != nullptr && !pieces_.empty()) {
-        vmm_close();
+    if (base_ != nullptr && arena_.ok()) {
+        arena_.close();
+        base_ = nullptr;
     } else if (base_ != nullptr) {
         cudaFree(base_);
         base_ = nullptr;
