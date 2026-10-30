@@ -1842,6 +1842,7 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
     pinned_bytes_ = std::min(registered_bytes_, at);
     uint64_t all = 0;
     for (int64_t l = 0; l < n_layers_; ++l) all += lay.bytes[(size_t) l] * (uint64_t) n_expert_;
+    all_bytes_ = all;
     char buf[400];
     std::snprintf(buf, sizeof buf,
                   "%lld experts (%.2f GiB of %.2f) resident in RAM (%.2f GiB pinned), the rest read from the model "

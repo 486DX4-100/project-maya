@@ -1297,8 +1297,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // the SSD) and, a token, the CPU lane's experts from the SSD (the storage's reads over an expert's bytes, at
         // most the CPU lane's) and from RAM (the rest of them)
         const strata::ds4::Model::Tiers tr = m.tiers();
-        std::snprintf(b, sizeof b, " vram_used=%d ram_used=%d cpu_n=%d vram_gb=%.2f ram_gb=%.2f", tr.vram,
-                      tr.ram, tr.cpu, tr.vram_gb, tr.ram_gb);
+        std::snprintf(b, sizeof b, " vram_used=%d ram_used=%d cpu_n=%d vram_gb=%.2f ram_gb=%.2f disk_gb=%.2f",
+                      tr.vram, tr.ram, tr.cpu, tr.vram_gb, tr.ram_gb, tr.disk_gb);
         out += b;
         std::snprintf(b, sizeof b, " eg_cache_rows=%lld eg_cache_cap=%lld eg_cache_row_bytes=%lld eg_lookup_rows=%lld",
                       (long long) s.eg_cached, (long long) s.eg_cache_cap, (long long) s.eg_cache_row_bytes,
@@ -1337,7 +1337,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                       s.verify_ms - s_dec.verify_ms);
         out += b;
         if (d_off > 0) {
-            std::snprintf(b, sizeof b, " drafts=%.3f", (double) d_acc / (double) d_off);
+            std::snprintf(b, sizeof b, " drafts=%.3f draft_acc=%lld draft_off=%lld", (double) d_acc / (double) d_off,
+                          (long long) d_acc, (long long) d_off);
             out += b;
         }
         if (s.skipped > s_dec.skipped) {   // (STRATA_DS4_DISK_SKIP_W: experts left out a token)

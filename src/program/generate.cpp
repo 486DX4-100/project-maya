@@ -2179,6 +2179,7 @@ static int glm_pack_generate(const Options& o) {
         if (stop_req.load()) finish = "cancel";
         const auto t1 = std::chrono::steady_clock::now();
         const auto st1 = model.fast_stats();
+        const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;   // (the drafts this request so far: STAT, DONE)
         int64_t produced = 0;
         // one emitted token: the T line, the live tier counters every 8 tokens, the stop conditions (false: stop)
         // LOOP GUARD: a heavily quantized model can fall into repeating a short pattern ("0 0 0 ...") until the
@@ -2263,12 +2264,15 @@ static int glm_pack_generate(const Options& o) {
                 const double n = (double) produced;
                 const uint64_t h = sn.hits - st1.hits, m = sn.misses - st1.misses;
                 std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
-                            "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f\n",
+                            "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f "
+                            "disk_gb=%.1f draft_acc=%llu draft_off=%llu\n",
                             n / std::max(1e-9, el), 1000.0 * el / n, (double) h / (double) std::max<uint64_t>(1, h + m),
                             (double) (sn.ram_hits - st1.ram_hits) / n, (double) (sn.disk_reads - st1.disk_reads) / n,
                             (double) (sn.promotions - st1.promotions) / n, (long long) sn.pool_used,
                             (long long) sn.pool_slots, (long long) sn.ram_used, (long long) sn.ram_slots, sn.ram_gb,
-                            sn.pool_gb);
+                            sn.pool_gb, std::max(0.0, sn.all_gb - sn.pool_gb - sn.ram_gb),
+                            (unsigned long long) (model.spec_hits_ - hits0),
+                            (unsigned long long) (model.spec_steps_ - spec0));
             }
             bool eos_hit = false;
             for (const int64_t e : eos)
@@ -2283,7 +2287,6 @@ static int glm_pack_generate(const Options& o) {
             }
             return produced < max_new;
         };
-        const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;
         if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.dflash_ready() && req_spec != 1) {
             // the DFlash decode: a block of drafts a round, one verify window checks them (same tokens as the loop
             // below for the same samples); --spec T caps a round's window at T tokens
@@ -2545,6 +2548,7 @@ static int glm_pack_generate(const Options& o) {
     uint64_t multi_n = 0;        // tokens since the engine last had nothing to do (the STAT lines' rate)
     std::chrono::steady_clock::time_point multi_t1;
     strata::core::Glm5Model::FastStats multi_st1;
+    uint64_t multi_spec0 = 0, multi_hits0 = 0, multi_mtp_acc = 0, multi_mtp_off = 0;   // (the drafts since then, for the STAT lines)
     const auto input_pending = [&]() -> bool {
         std::lock_guard<std::mutex> lk(in_mu);
         return !in_lines.empty() || quit_req.load();
@@ -2626,13 +2630,15 @@ static int glm_pack_generate(const Options& o) {
             const uint64_t h = sn.hits - multi_st1.hits, m = sn.misses - multi_st1.misses;
             std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
                         "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f "
-                        "active=%zu\n",
+                        "disk_gb=%.1f draft_acc=%llu draft_off=%llu active=%zu\n",
                         n / std::max(1e-9, el), 1000.0 * el / n, (double) h / (double) std::max<uint64_t>(1, h + m),
                         (double) (sn.ram_hits - multi_st1.ram_hits) / n,
                         (double) (sn.disk_reads - multi_st1.disk_reads) / n,
                         (double) (sn.promotions - multi_st1.promotions) / n, (long long) sn.pool_used,
                         (long long) sn.pool_slots, (long long) sn.ram_used, (long long) sn.ram_slots, sn.ram_gb,
-                        sn.pool_gb, gens.size());
+                        sn.pool_gb, std::max(0.0, sn.all_gb - sn.pool_gb - sn.ram_gb),
+                        (unsigned long long) (model.spec_hits_ - multi_hits0 + multi_mtp_acc),
+                        (unsigned long long) (model.spec_steps_ - multi_spec0 + multi_mtp_off), gens.size());
         }
         for (const int64_t e : eos)
             if (e == tok && stop_on_eos) {
@@ -2785,6 +2791,8 @@ static int glm_pack_generate(const Options& o) {
             g.mtp_steps += 1;
             g.mtp_drafts += (uint64_t) (w.counts[(size_t) i] - 1);
             g.mtp_acc += (uint64_t) (k - 1);
+            multi_mtp_off += (uint64_t) (w.counts[(size_t) i] - 1);
+            multi_mtp_acc += (uint64_t) (k - 1);
             for (int t = 0; t + 1 < k; ++t) written.push_back(wr[(size_t) t]);   // (the tokens at p0 + 1 .. p0 + k - 1)
             last[(size_t) i] = wr[(size_t) k - 1];
             g.drafts.clear();
@@ -3073,6 +3081,9 @@ static int glm_pack_generate(const Options& o) {
             multi_n = 0;
             multi_t1 = g->t1;
             multi_st1 = g->st1;
+            multi_spec0 = g->spec_steps0;
+            multi_hits0 = g->spec_hits0;
+            multi_mtp_acc = multi_mtp_off = 0;
         }
         if (std::strcmp(g->finish, "cancel") == 0) {
             gens.push_back(std::move(g));
@@ -7979,6 +7990,9 @@ int main(int argc, char** argv) {
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t draft_offered = 0, draft_accepted = 0;
+            // (the Monitor's "where the experts live": every routed expert in GB, and the RAM tier's share)
+            const double qwen_ram_gb = (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) / 1073741824.0;
+            const double qwen_all_gb = from_gguf ? (double) gguf_src.all_bytes() / 1073741824.0 : qwen_ram_gb;
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
@@ -8114,7 +8128,8 @@ int main(int argc, char** argv) {
                     const int64_t look = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused - decode_look0;
                     const int64_t staged = from_gguf ? gguf_src.staged() - staged0 : 0;
                     std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=0 "
-                                "vram_used=%lld vram_slots=%lld ram_used=%lld ram_gb=%.1f vram_gb=%.1f\n",
+                                "vram_used=%lld vram_slots=%lld ram_used=%lld ram_gb=%.1f vram_gb=%.1f "
+                                "disk_gb=%.1f draft_acc=%lld draft_off=%lld\n",
                                 nt / std::max(1e-9, el), 1000.0 * el / nt, (double) h / (double) std::max<int64_t>(1, look),
                                 (double) std::max<int64_t>(0, look - h - staged) / nt, (double) staged / nt,
                                 (long long) xcache.resident(), (long long) xcache.slots(),
@@ -8122,7 +8137,9 @@ int main(int argc, char** argv) {
                                                        : (int64_t) g.n_layers * g.n_expert - xcache.resident()),
                                 (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
                                     1073741824.0,
-                                (double) xcache.bytes() / 1073741824.0);
+                                (double) xcache.bytes() / 1073741824.0,
+                                std::max(0.0, qwen_all_gb - (double) xcache.bytes() / 1073741824.0 - qwen_ram_gb),
+                                (long long) draft_accepted, (long long) draft_offered);
                 }
                 std::fflush(stdout);
                 ++rounds;

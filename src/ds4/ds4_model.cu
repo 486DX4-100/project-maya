@@ -21150,6 +21150,7 @@ Model::Tiers Model::tiers() const {
     else t.ram = t.cpu;
     if (m.store) t.ram = (int) std::min<size_t>((size_t) t.cpu, (size_t) t.ram + m.store->held());
     t.ram_gb = t.ram * t.cpu_blob / 1e9;
+    t.disk_gb = std::max(0, t.cpu - t.ram) * t.cpu_blob / 1e9;
     return t;
 }
 

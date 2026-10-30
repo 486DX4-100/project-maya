@@ -513,6 +513,7 @@ public:
     int64_t resident_blobs() const { return resident_blobs_; }
     uint64_t resident_bytes() const { return resident_bytes_; }
     uint64_t pinned_bytes() const { return pinned_bytes_; }
+    uint64_t all_bytes() const { return all_bytes_; }   // every routed expert in the file (the Monitor's SSD-only share)
     const std::string& note() const { return note_; }
     double load_seconds() const { return load_seconds_; }
 
@@ -553,7 +554,7 @@ private:
     uint64_t registered_bytes_ = 0;
     bool sliced_ = false;
     int64_t resident_blobs_ = 0;
-    uint64_t resident_bytes_ = 0, pinned_bytes_ = 0;
+    uint64_t resident_bytes_ = 0, pinned_bytes_ = 0, all_bytes_ = 0;
     // the staging ring
     std::vector<uint8_t> ring_;
     uint64_t ring_stride_ = 0;

@@ -59,6 +59,8 @@
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); gap: 12px; padding-top: 14px; border-top: 1px solid var(--st-line); }
 .stat { display: flex; flex-direction: column; gap: 2px; }
 .stat__label { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.stat__value--text { white-space: normal; overflow-wrap: anywhere; }
+.stat__note { font-size: var(--st-fs-sm); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; }
 .stat__value { font-size: var(--st-fs-stat); font-weight: 600; letter-spacing: -.01em; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .stat__value small { margin-left: 4px; font-size: var(--st-fs-sm); }
 

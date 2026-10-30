@@ -3,7 +3,7 @@
 import {html, useRef, useState} from "./preact.js";
 import {GIB, ago, ctxfmt, fmt, gb, isPhone, kfmt, rate, store} from "./lib.js";
 import {S, copyText, emit, toast} from "./state.js";
-import {fetchReport, reqAll} from "./server.js";
+import {fetchReport, reqAll, speculationView, tierShares} from "./server.js";
 import {newChat} from "./chats.js";
 import {setSide, status} from "./sidebar.js";
 import {Icon} from "./ui.js";
@@ -61,11 +61,8 @@ function Throughput({m}) {
   const ms = gen && tn && tn.ms_tok ? tn.ms_tok : speed ? 1000 / speed : null;
   const hit = fresh && tn.vram_hit != null ? 100 * tn.vram_hit : last && last.hit_rate != null ? 100 * last.hit_rate : null;
   const a = sparkPath(h.tok_s), b = sparkPath(h.prefill_tok_s_mean);
-  // (DSpark: DeepSeek's server says whether it drafts, MiniMax's engine itself - dspark=0 / 1; the engine's STAT lines the
-  //  share of its drafts kept)
-  const spec = eng.dspark != null ? (+eng.dspark ? "DSpark" : "Off")
-    : eng.mtp == null ? (eng.dflash ? "DFlash2" : null) : +eng.mtp ? "MTP" : "Off";
-  const kept = +eng.dspark && tn && tn.drafts != null ? `${fmt(100 * tn.drafts)}% kept` : "";
+  // (the drafters on, and the share of their drafts the model kept: live from the engine's STAT lines, else the last answer's)
+  const spec = speculationView(m);
   // the highest Decode figure since Maya started - live or a finished answer's (the server's, kept as each reading beats
   // it; from 32 tokens on: a few tokens' speed says little)
   const peak = m.totals && m.totals.peak_decode;
@@ -94,8 +91,12 @@ function Throughput({m}) {
       <div class="stat"><span class="stat__label">Time per token</span><${Num} v=${ms == null ? null : fmt(ms, 1)} unit="ms"/></div>
       <div class="stat"><span class="stat__label">VRAM hit</span><${Num} v=${hit == null ? null : fmt(hit, 1)} unit="%"/></div>
       <div class="stat"><span class="stat__label">Requests served</span><${Num} v=${m.totals && m.totals.requests != null ? fmt(m.totals.requests) : null}/></div>
-      <div class="stat" title=${kept ? "The share of the drafted tokens the model kept, in the last answer" : undefined}>
-        <span class="stat__label">Speculation</span><${Num} v=${spec} unit=${kept}/></div>
+      <div class="stat" title=${spec.state === "off" ? "No drafter is running for this answer: every token comes from a full model step"
+          : "Drafting: a small drafter proposes tokens and the full model checks them. Shown: the drafts the model kept of those offered, live while an answer is written, else the last answer's. A dash: nothing drafted yet."}>
+        <span class="stat__label">Speculation</span>
+        <span class="stat__value stat__value--text">${spec.name == null ? "–" : spec.name}</span>
+        ${spec.state === "none" ? null : html`<span class="stat__note num">drafts kept: ${spec.state === "kept" ? spec.short : spec.text}</span>`}
+        ${spec.state === "kept" && spec.detail ? html`<span class="stat__note num">${spec.detail}</span>` : null}</div>
     </div>
   </section>`;
 }
@@ -214,9 +215,7 @@ function Tiers({t, eng}) {
   const age = n.time ? Math.max(0, Date.now() / 1000 - n.time) : null;
   const stale = age != null && age > 30;               // a reading from the last answer, not live
   // VRAM, RAM and the rest on the SSD - DeepSeek's (maya-ds4) the same keys: its RAM the copies or the read-ahead
-  const vu = n.vram_used || 0, ru = n.ram_used || 0;
-  const total = (ds4 ? vu + (n.cpu_n != null ? n.cpu_n : +eng.cpu_experts || 0) : eng && eng.experts) || Math.max(1, vu + ru);
-  const disk = Math.max(0, total - vu - ru);
+  const {vu, ru, total, disk, vramGb, ramGb, diskGb} = tierShares(n, eng || {});
   let tip = "";
   if (ds4) {
     if (!stale && n.disk_mb != null && n.disk_mb >= 500) tip = "Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and answers get faster.";
@@ -238,9 +237,9 @@ function Tiers({t, eng}) {
       <span class="tierbar__vram" style=${`flex-grow:${vu}`}></span><span class="tierbar__ram" style=${`flex-grow:${ru}`}></span>
       <span class="tierbar__disk" style=${`flex-grow:${disk}`}></span></div>
     <div class="legend">
-      <span><i class="sw sw--vram"></i>${helper ? "Primary VRAM" : "VRAM"} <b class="num">${fmt(vu)} · ${fmt(n.vram_gb, 1)} GB</b></span>
-      <span><i class="sw sw--ram"></i>${ds4 ? "RAM" : "Pinned RAM"} <b class="num">${fmt(ru)} · ${fmt(n.ram_gb, 1)} GB</b></span>
-      <span><i class="sw sw--disk"></i>SSD only <b class="num">${fmt(disk)}</b></span></div>
+      <span><i class="sw sw--vram"></i>${helper ? "Primary VRAM" : "VRAM"} <b class="num">${fmt(vu)} · ${fmt(vramGb, 1)} GB</b></span>
+      <span><i class="sw sw--ram"></i>${ds4 ? "RAM" : "Pinned RAM"} <b class="num">${fmt(ru)} · ${fmt(ramGb, 1)} GB</b></span>
+      <span><i class="sw sw--disk"></i>SSD only <b class="num">${fmt(disk)}${diskGb == null ? "" : ` · ${fmt(diskGb, 1)} GB`}</b></span></div>
     <div class=${`tiles${set.length === 4 ? " tiles--4" : ""}`}>
       ${set.map((x) => {
         const v = n[x.key];

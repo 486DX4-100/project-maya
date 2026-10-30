@@ -1957,12 +1957,42 @@ class Detokenizer:
         return delta
 
 
+def speculation_modes(info: dict, dspark=None, lookup=None) -> list:
+    """The drafters an engine runs with, for the Monitor's Speculation: DSpark (DeepSeek's server says, MiniMax's engine
+    itself), DFlash2 or MTP (GLM's INFO dflash= / mtp=: its DFlash decode takes the request first, else MTP; CYBER-FROST's
+    mtp=) and the prompt lookup (CYBER-FROST's INFO lookup=, DeepSeek's --suffix-draft).  Empty: drafting is off."""
+    def on(v):
+        try:
+            return float(v) > 0
+        except (TypeError, ValueError):
+            return False
+    modes = []
+    ds = dspark if dspark is not None else info.get("dspark")
+    if on(ds):
+        modes.append("DSpark")
+    if on(info.get("dflash")):
+        modes.append("DFlash2")
+    elif on(info.get("mtp")):
+        modes.append("MTP")
+    lk = lookup if lookup is not None else info.get("lookup")
+    if on(lk):
+        modes.append("Lookup")
+    return modes
+
+
+def request_spec_off(sampling) -> bool:
+    """A request that switches drafting off for itself (the GLM engine's spec=1: the plain token loop)."""
+    tune = (sampling or {}).get("strata_tune")
+    return isinstance(tune, dict) and tune.get("spec") == 1 and not isinstance(tune.get("spec"), bool)
+
+
 class RequestStat:
     """One request's live figures: when its first answer token came (None while it reads the prompt) and its
     (time, generated) samples over RATE_WINDOW_S for the live decode rate."""
 
     def __init__(self):
         self.first_token = None
+        self.spec_off = False                           # it asked for no drafting (spec=1)
         self.base = None                                # (time, generated) at the window's start: the rate counts from it
         self.samples = collections.deque(maxlen=4096)   # the samples inside the window, oldest first
 
@@ -2037,6 +2067,7 @@ class Service:
         self.model_dir = None                            # the model's folder (free disk on the dashboard)
         self.model_label = None                          # what runs, as users see it: "MiniMax M3.1 · Maya-XS"
         self.trained_context = None                      # what the model was trained for (its GGUF): the slider's top
+        self.lookup = None                               # DeepSeek's prompt lookup (--suffix-draft above 0); the others' INFO says
         self.dspark = None                               # DeepSeek's: drafts with its DSpark blocks (its engine's INFO
         #                                                  does not say: the config's --dspark and the pack's drafter)
         self.reload = None                               # a context change: {state, from, to, started, error}
@@ -2712,6 +2743,7 @@ class Service:
             guard = dict(self.loop_guard_counts, on=bool(self.loop_guard))   # (what the loop guard did since start)
             active = self.active
             writing = len(self.current_requests)        # (of the active ones, those past their prompt)
+            spec_off = bool(self.current_requests) and all(r.spec_off for r in self.current_requests)
         now = time.time()
         progress = getattr(self.engine, "progress", None)
         if s.get("busy") and not answering:
@@ -2721,7 +2753,7 @@ class Service:
         else:
             state = "unloaded" if self.unloaded else "idle"
         live = {"state": state, "queued": s.get("queued", 0), "active": active,   # (answering at once: --parallel)
-                "writing": writing,
+                "writing": writing, "spec_off": spec_off,   # (the request(s) running asked for no drafting)
                 "phase": s.get("phase") if s.get("busy") else None,
                 "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
@@ -2740,6 +2772,8 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
                   "trained_context": self.trained_context,
                   **({"dspark": self.dspark} if self.dspark is not None else {})}
+        # the drafters on (empty: drafting is off): the Monitor's Speculation says "off", or the draft acceptance
+        engine["speculation"] = speculation_modes(engine, lookup=self.lookup)
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
@@ -3543,6 +3577,7 @@ class Service:
         engine_last0 = getattr(self.engine, "last", None)
         counted, my_started, my_first, queued = False, time.time(), None, False
         stat = RequestStat()                            # this request's live figures
+        stat.spec_off = request_spec_off(sampling)
         with self.status_lock:
             self.status["queued"] += 1
             queued = True                               # counted as waiting until its turn comes (below, or in finally)
@@ -3838,6 +3873,9 @@ class Service:
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
                         "hit_rate": hit_rate,
+                        # the drafts offered and kept (the engine's DONE line; None: it reported none)
+                        "drafts_offered": last.get("drafts_offered"), "drafts_accepted": last.get("drafts_accepted"),
+                        "spec_off": stat.spec_off,
                         "loop_guard": guards[0].summary() if guards and guards[0].events else None}
                     self.history.append(row)
                     t = self.totals
@@ -5922,6 +5960,10 @@ def main() -> int:
         #  has them; MiniMax's says so itself, INFO dspark=)
         if models.family(cfg) == "deepseek":
             svc.dspark = models.flag(args, "--dspark", "on") not in ("off", "none") and models.ds4_has_drafter(cfg)
+            try:
+                svc.lookup = int(models.flag(args, "--suffix-draft", "3")) > 0
+            except ValueError:
+                svc.lookup = True
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
