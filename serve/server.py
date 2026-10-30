@@ -1899,10 +1899,9 @@ def child_env(cfg: dict) -> dict:
     elif gpu_list(cfg) and cfg.get("backend") != "metal":   # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
-    for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
-        env[str(k)] = str(v)
-        if cfg.get("backend") == "metal":            # maya-metal reads its settings by their MAYA_* names
-            env[maya_names.shown(str(k))] = str(v)
+    # engine settings the config carries (AMD: the GEMM tuning table), under BOTH names: env_in left the config with the
+    # older STRATA_ one, and some of the engines' settings are read by their MAYA_ name alone (issue #686)
+    maya_names.export_env(env, cfg.get("env"))
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -5390,7 +5389,8 @@ class Server(ThreadingHTTPServer):
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
               "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
-              "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE", "STRATA_LOOP_GUARD") + RESPONSE_ENV_KEYS + \
+              "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE", "STRATA_LOOP_GUARD", "STRATA_QUEUE_PING_S",
+              "STRATA_UPDATE_CHECK", "STRATA_PACK_TEMPLATE") + RESPONSE_ENV_KEYS + \
     tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL"))
 
 
@@ -5401,7 +5401,7 @@ def apply_server_env(cfg: dict) -> None:
     for k in SERVER_ENV:
         v = (cfg.get("env") or {}).get(k)
         if v is not None:
-            os.environ[k] = str(v)
+            maya_names.export_env(os.environ, {k: v})      # (under both names: the server reads some by MAYA_ alone)
     ENGINE_STALL_S = _stall_seconds()
     REQUEST_QUIET_S = _quiet_seconds()
     DRAIN_S = _drain_seconds()
