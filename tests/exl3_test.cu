@@ -4,6 +4,7 @@
 // the CPU lane's part and the shared expert, and the full reconstruction.
 //
 //   exl3_test                     run everything, exit 0 when every case is within tolerance
+//   exl3_test --prefill-only      grouped experts only; environment selects WMMA/FMA and tile width
 //   exl3_test --exllamav3 <dir>   the decoders against exllamav3 itself: tools/exl3_exllamav3_fixture.py's random
 //                                 tiles (data/exl3-exllamav3) - the same states and W' bit for bit
 //   exl3_test --expect <dir>      a model's matrices against exllamav3's decode of them (the tool's --model files)
@@ -1837,6 +1838,18 @@ int main(int argc, char** argv) {
         return g_fail || ex::launch_errors() ? 1 : 0;
     }
 #endif
+    std::printf("grouped matrix prefill: %s\n", (ex::mma_supported() || ex::prompt_wmma()) ? "enabled" : "disabled");
+    if (argc == 2 && std::string(argv[1]) == "--prefill-only") {
+        for (int k2 = 2; k2 <= 16; k2 += 2)
+            for (int cb = 0; cb <= 2; ++cb) test_set(k2, cb);
+        for (int k2 : {3, 5, 7}) test_set(k2, 2);
+        test_set(7, 2, 10); test_set(5, 2, 8);
+        for (int tail : {1, 15, 16, 17, 31, 32, 33}) test_set(6, 2, 8, 37, tail, 19);   // (row0 19)
+        for (int cb : {0, 1, 2}) test_mixed(cb);
+        std::printf("prefill-only: %s (%d failures, %d launch errors)\n", g_fail ? "FAIL" : "ok",
+                    g_fail, ex::launch_errors());
+        return g_fail || ex::launch_errors() ? 1 : 0;
+    }
     std::string fx_dir, expect_dir;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1845,7 +1858,7 @@ int main(int argc, char** argv) {
         } else if (a == "--expect" && i + 1 < argc) {
             expect_dir = argv[++i];
         } else {
-            std::fprintf(stderr, "usage: exl3_test [--exllamav3 <fixture dir>] [--expect <model fixture dir>]\n");
+            std::fprintf(stderr, "usage: exl3_test [--prefill-only] [--exllamav3 <fixture dir>] [--expect <model fixture dir>]\n");
             return 2;
         }
     }

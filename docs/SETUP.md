@@ -108,6 +108,14 @@ printf '[Service]\nManagedOOMMemoryPressure=auto\n' | sudo tee /etc/systemd/syst
 sudo systemctl daemon-reload
 ```
 
+## RDNA4 EXL3 prefill
+
+On an R9700 / RX 9070-family GPU, grouped EXL3 prompt processing uses the
+RDNA4 matrix kernels by default, with 16-row tiles. [Guided setup](EXL3_RDNA4.md#guided-setup) shows how to save the
+settings through `--env` or an existing configuration, verify the build and
+tests, and switch back for comparison. This applies to EXL3 expert weights,
+not GGUF, and floating-point results can differ from the portable path.
+
 ## Next time, and updating
 
 **Next time**, just run `./setup.sh` again (or the model's `./run-maya-<model>.sh`): it starts right away, nothing is

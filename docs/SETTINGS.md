@@ -1139,6 +1139,25 @@ choices. Opt-in until measured on GPUs.
 | --- | --- | --- |
 | `MAYA_DS4_MARKOV_Q8` | off (0) | `1`: the DSpark markov head as Q8_0 blocks (half its bytes and memory; the drafts may change, the verified answers do not) |
 
+## RDNA4 EXL3 matrix prefill
+
+For HIP gfx12 GPUs running EXL3 experts, these switches select the matrix
+prefill path, enabled by default on supported RDNA4 devices with 16-row tiles.
+Explicit `1`, `16`, `1` settings reproduce that default.
+Use the exact `EXL3_*` names in the config's `env` or with setup's `--env`;
+these kernel switches do not use the `MAYA_*` alias convention.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `EXL3_WMMA_GFX12` | on | `0`: use portable grouped EXL3 prefill on gfx12; `1`: allow RDNA4 matrix instructions |
+| `EXL3_WMMA_ROWS` | `16` | `16` or `32`: routed rows processed per block |
+| `EXL3_WMMA` | enabled where supported | `0`: disable matrix prefill, overriding the gfx12 setting; `1`: allow it |
+
+Restart after changing these settings. Decode/verification kernels retain
+their existing arithmetic, but prefill rounding can change subsequent routing
+and answers. See [RDNA4 EXL3 guided setup](EXL3_RDNA4.md#guided-setup) for the
+configuration example, verification, measured scope and rollback.
+
 ## DeepSeek: a helper GPU for the experts VRAM leaves over
 
 A GGUF pack's routed experts that do not fit the layer GPUs' VRAM run on the CPU lane. A GPU that is not one of the
