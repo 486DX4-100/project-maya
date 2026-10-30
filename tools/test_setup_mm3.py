@@ -278,6 +278,9 @@ class Config(unittest.TestCase):
         c = self.write(args(), old)
         a = c["args"]
         self.assertEqual(a[a.index("--kv-cache") + 1], "int8")
+        # (pictures: a setup again turns them on - the owner's rule for every model; --no-vision keeps them off)
+        self.assertEqual(a[a.index("--vision") + 1], "on")
+        a = self.write(args(no_vision=True), old)["args"]
         self.assertEqual(a[a.index("--vision") + 1], "off")
         # (the model's own sampling and level every setup - the owner, 2026-10-27: no exceptions)
         self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"]), ("auto", {"temperature": 1.0, "top_p": 0.95},

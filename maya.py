@@ -5816,7 +5816,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     #  has them: a kept --vision on without a tower in the pack dropped)
     # (--tp: the config before's for the same GPUs only, else worked out again below from the GPUs chosen now - #436)
     keep = ("--chunk", "--staging", "--cpu-threads", "--reserve-gb", "--resident-cap", "--kv-cache", "--kv-streaming",
-            "--kv-resident", "--dspark", "--dspark-conf", "--vision", "--vision-gpu", "--parallel") + \
+            "--kv-resident", "--dspark", "--dspark-conf", "--vision-gpu", "--parallel") + \
         (() if gguf else (("--tp",) if tp_keepable(old, pc) else ()) + ("--cache-gb",))
     kept = keep_args(old.get("args") or [], args, keep)
     if getattr(a, "parallel", None):   # given now: written, and a later setup keeps it
@@ -5853,12 +5853,12 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     # calibration (tools/calibrate_ds4.py, as DeepSeek's) or the user's choice says it pays (set_up_mm3)
     if "--dspark" not in args[:-1] and "dspark.num_hidden_layers" in (pack / "mm3.txt").read_text(encoding="utf-8"):
         args += ["--dspark", "off"]
-    # pictures, ON by default: the pack's vision tower in the engine (in RAM, on a GPU only during a picture); --no-vision (or a
-    # config's --vision off, kept) frees it for experts
+    # pictures, ON by default: the pack's vision tower in the engine (in RAM, on a GPU only during a picture) - a setup
+    # again turns them on (a config's --vision off is not kept); --no-vision frees it for experts
     if getattr(a, "no_vision", False):
         set_arg(args, "--vision", "off")
-    elif "--vision" not in args[:-1] and mm3_pack_has_vision(pack):
-        args += ["--vision", "on"]
+    elif mm3_pack_has_vision(pack):
+        set_arg(args, "--vision", "on")
     if hip and "--reserve-gb" not in args[:-1]:   # (as DeepSeek's on AMD: the desktop's allocations beside the engine)
         mib = hip_reserve_mib(pc["gpus"])
         set_arg(args, "--reserve-gb", f"{mib / 1024:.1f}")
