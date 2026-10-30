@@ -2349,14 +2349,17 @@ struct Model::Impl {
     }
     // DS4_TP_BORROW=1 (off by default): a tensor-parallel group's members lend the prompt path their experts' room too
     // (Chunk::tp_lend) - on the flow only (DS4_FLOW_TP=1), which streams the lent slots' experts, each member its part
-    // DS4_EXL3_LEND (on; 0 off): an EXL3 pack whose CPU-lane experts are copied into RAM (not read in place) and whose
-    // expert cache keeps recent slots - a tensor-parallel group's members lend the prompt path their tail of the
+    // DS4_EXL3_LEND (opt-in: 1 on): an EXL3 pack whose CPU-lane experts are copied into RAM (not read in place) and
+    // whose expert cache keeps recent slots - a tensor-parallel group's members lend the prompt path their tail of the
     // cache's slots (the spare and the recent ones: copies of CPU-lane experts, streamed from RAM while lent and copied
     // back after), so their chunk buffers hold no VRAM of their own between prompts and a larger chunk costs the
-    // decode nothing.  (A one-GPU group keeps its own room: lent there, the answers came out wrong - not found yet)
+    // decode nothing.  Not on one GPU: lent there, the answers came out wrong (not found yet).  Opt-in until a
+    // DeepSeek EXL3 pack has run it on our machines (a layer split that lends refuses to load where its layers keep too
+    // few recent slots for the chunk)
     bool exl3_lend_on() const {
         const char* v = ds4_env("DS4_EXL3_LEND");
-        return (v == nullptr || std::atoi(v) != 0) && !file_experts && !pk.gguf && o.expert_cache && recent_n > 0;
+        return v != nullptr && std::atoi(v) != 0 && devs.size() > 1 && !file_experts && !pk.gguf && o.expert_cache &&
+               recent_n > 0;
     }
     static bool tp_borrow_on() {
         const auto on = [](const char* v) { return v != nullptr && std::atoi(v) != 0; };

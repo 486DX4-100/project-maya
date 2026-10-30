@@ -4805,8 +4805,8 @@ namespace {
 using WaitValue32 = CUresult (*)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
 WaitValue32 ar_wait_fn() {
     static const WaitValue32 f = []() -> WaitValue32 {
-        const char* e = std::getenv("DS4_AR_BACK_DMA");
-        if (e != nullptr && std::atoi(e) == 0) return nullptr;
+        const char* e = std::getenv("DS4_AR_BACK_DMA");   // (opt-in, 1: a 5+ member group we have not run yet)
+        if (e == nullptr || std::atoi(e) == 0) return nullptr;
 #if CUDART_VERSION >= 12050
         void* fp = nullptr;
         cudaDriverEntryPointQueryResult q{};
@@ -4823,7 +4823,7 @@ WaitValue32 ar_wait_fn() {
 }  // namespace
 #endif
 
-// a chunk's sum read back (DS4_AR_BACK_DMA, on where the driver has stream waits): the stream itself waits for each
+// a chunk's sum read back (DS4_AR_BACK_DMA=1, where the driver has stream waits): the stream itself waits for each
 // piece's flag and the piece is DMA'd into this member's own FP16 rows (out by then: the host sums a piece only once
 // every member's is in), then converted - where the zero-copy kernel read it at half the link's speed beside the expert
 // ring's copies (76 MB: 20.5 ms against 11.5, an RTX 5060 Ti on PCIe 3.0 x8) and spun on the flag on the GPU
