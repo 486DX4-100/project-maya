@@ -19,7 +19,7 @@
 
 namespace {
 
-constexpr int kTypes[] = {16, 17, 18, 19, 20, 21, 22, 23, 29, 42};
+constexpr int kTypes[] = {13, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42};
 constexpr int kCols[] = {1, 2, 3, 4, 5, 7, 8, 9, 16};
 
 int block_elems(int t) { return t == 20 ? 32 : (t == 42 ? 64 : 256); }
