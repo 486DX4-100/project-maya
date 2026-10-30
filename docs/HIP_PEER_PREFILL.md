@@ -2,10 +2,10 @@
 
 For an eligible tensor-parallel pair, startup compares the ordinary host-mapped reduction, exact-F32 AR2, and direct peer-VRAM reduction. It selects the lowest median GPU time at the configured full prefill-chunk size. The peer path preserves member-0-plus-member-1 F32 addition order; it changes transport, not routing or weight precision. A faster collective is not a guarantee of the same percentage improvement in whole-model prefill.
 
-`MAYA_DS4_HIP_PEER_AR` defaults to `auto`. Set it in a serving config's `env`; native launches use `DS4_HIP_PEER_AR` (or `STRATA_DS4_HIP_PEER_AR`). The choices are:
+`MAYA_DS4_HIP_PEER_AR` is off by default (opt-in until it is measured on a two-GPU AMD PC). Set it in a serving config's `env`; native launches use `DS4_HIP_PEER_AR`. The choices are:
 
-- `auto` or unset: compare compatible transports once during model loading.
-- `0`: retain the existing transport, with no peer allocation or timing probe.
+- `auto`: compare compatible transports once during model loading.
+- `0` or unset: retain the existing transport, with no peer allocation or timing probe.
 - `1`: force compatible peer transport without timing it against alternatives.
 
 Both ranks must support HIP peer access, fine-grained device allocations and a queryable steady wall clock. IDs come from the tensor-parallel group; no card models, bus addresses or GPU numbers are hard-coded. Unsupported pairs retain host transport. Explicit `MAYA_DS4_AR2=1/2` and flow groups retain their chosen transport without calibration; explicit AR2 `0` excludes AR2 from the comparison. When AR2 is unset, only its exact-F32 mode (`1`), not its FP16 mode (`2`), is a candidate.

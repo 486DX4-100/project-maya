@@ -16067,9 +16067,10 @@ struct Model::Impl {
             eligible = eligible || (G.mem.size() == 2 && G.arb.nm == 2 && G.arb.ar2 == 0 &&
                 !chunks[(size_t) G.mem[0]]->flow && !chunks[(size_t) G.mem[1]]->flow);
         if (!eligible) return true; // no allocations, queries or timing for single-GPU/other group shapes
+        // (opt-in until a two-GPU AMD PC we can run has measured it: unset = 0, the existing transport)
         const char* opt = ds4_env("DS4_HIP_PEER_AR");
-        if (opt && std::strcmp(opt, "0") == 0) return true;
-        const bool automatic = !opt || std::strcmp(opt, "auto") == 0;
+        if (!opt || std::strcmp(opt, "0") == 0) return true;
+        const bool automatic = std::strcmp(opt, "auto") == 0;
         if (!automatic && std::strcmp(opt, "1") != 0) {
             err = "DS4_HIP_PEER_AR takes auto, 0 or 1";
             return false;
