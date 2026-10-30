@@ -2109,6 +2109,102 @@ class IdleUnload(unittest.TestCase):
         self.assertEqual((self.engine.restarts, self.engine.running, self.svc.unloaded), (1, True, False))
 
 
+class ModelManagement(unittest.TestCase):
+    """#678: llama.cpp's /models/load, /models/unload and /models/sse (Open WebUI's Models page), off unless
+    "model_management" is on; #677: /status obeys the API key, and a request while the engine starts gets a 503."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = LifecycleEngine(self.tok, "</think>\n\nok", max_context=CTX)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.port = self.httpd.server_address[1]
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def call(self, method, path, body=None, key=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", None if body is None else json.dumps(body).encode(),
+                                     {"Content-Type": "application/json", **({"Authorization": "Bearer " + key} if key else {})},
+                                     method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def first_event(self, key=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("GET", "/models/sse", headers={"Authorization": "Bearer " + key} if key else {})
+            r = conn.getresponse()
+            if r.status != 200:
+                return r.status, None
+            while True:
+                line = r.fp.readline()
+                if line.startswith(b"data:"):
+                    return r.status, json.loads(line[5:])
+        finally:
+            conn.close()
+
+    def test_off_unless_the_config_turns_it_on(self):
+        for method, path in (("POST", "/models/load"), ("POST", "/models/unload"), ("GET", "/models/sse")):
+            self.assertEqual(self.call(method, path, {} if method == "POST" else None)[0], 404, path)
+        self.assertEqual((self.engine.closes, self.engine.restarts), (0, 0))
+        from serve.server import model_management_setting
+        self.assertFalse(model_management_setting({}, env={}))
+        self.assertTrue(model_management_setting({"model_management": True}, env={}))
+        self.assertFalse(model_management_setting({"model_management": True}, env={"MAYA_MODEL_MANAGEMENT": "0"}))
+        self.assertTrue(model_management_setting({}, env={"MAYA_MODEL_MANAGEMENT": "on"}))
+
+    def test_unload_load_and_the_state_stream(self):
+        self.svc.model_management = True
+        code, out = self.call("POST", "/models/load", {})                      # (already loaded: nothing starts)
+        self.assertEqual((code, out["status"]["value"], self.engine.restarts), (200, "loaded", 0))
+        self.assertEqual(self.call("POST", "/models/load", {"model": "other"})[0], 404)
+        self.assertEqual(self.first_event()[1]["data"][0]["status"]["value"], "loaded")
+        code, out = self.call("POST", "/models/unload", {})
+        self.assertEqual((code, out["status"]["value"], self.engine.running, self.svc.unloaded), (200, "unloaded", False, True))
+        self.assertEqual(self.first_event()[1]["data"][0]["status"]["value"], "unloaded")
+        code, out = self.call("POST", "/models/load", {"model": self.svc.model})
+        self.assertEqual((code, out["status"]["value"], self.engine.restarts, self.engine.running), (200, "loaded", 1, True))
+        self.assertEqual(self.first_event()[1]["data"][0]["status"]["value"], "loaded")
+
+    def test_unload_waits_for_a_running_request(self):
+        self.svc.model_management = True
+        self.assertTrue(self.svc.fifo.acquire(blocking=False))      # (a request holds the engine)
+        try:
+            self.assertEqual(self.call("POST", "/models/unload", {})[0], 409)
+        finally:
+            self.svc.fifo.release()
+        self.assertTrue(self.engine.running)
+
+    def test_the_api_key_guards_them_and_status(self):
+        self.svc.model_management = True
+        self.svc.api_key = "secret"
+        for method, path in (("POST", "/models/load"), ("POST", "/models/unload"), ("GET", "/models/sse"), ("GET", "/status")):
+            self.assertEqual(self.call(method, path, {} if method == "POST" else None)[0], 401, path)
+            self.assertEqual(self.call(method, path, {} if method == "POST" else None, key="wrong")[0], 401, path)
+        self.assertEqual(self.first_event()[0], 401)
+        self.assertEqual(self.engine.closes, 0)
+        code, out = self.call("GET", "/status", key="secret")
+        self.assertEqual(code, 200)
+        self.assertIn("busy", out)
+        self.assertEqual(self.first_event("secret")[0], 200)
+        self.svc.api_key = ""
+        self.assertEqual(self.call("GET", "/status")[0], 200)          # (no key set: open, as before)
+
+    def test_a_request_while_the_engine_starts_gets_a_retryable_503(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
+        self.engine.max_context = 0                                     # (a start in progress: no READY yet)
+        code, out = self.call("POST", "/v1/chat/completions", body)
+        self.assertEqual(code, 503)
+        self.assertIn("starting", out["error"]["message"])
+        self.engine.max_context = CTX
+        self.assertEqual(self.call("POST", "/v1/chat/completions", body)[0], 200)
+
+
 class HeldEngine(MockEngine):
     """The first request holds the engine until `release` is set (heartbeats meanwhile); the others answer at once."""
     def __init__(self, *a, **k):
