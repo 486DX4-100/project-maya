@@ -2923,11 +2923,19 @@ struct Model::Impl {
                      d0 = gg::type_row_bytes(gg::expert_type(l.lay, 2), x.ff0),
                      dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), x.ffn);
         if (l.ram.empty() || l.ram[(size_t) e] < 0) {
-            if (!read_mx_file(l, e, dst)) return false;
+            // (#670: only the member's gate / up rows are read - straight to their place, the same file bytes the
+            //  blob's rows [ff0, ff0 + ffn) hold - and the down whole, cut in place below.  Each member read the
+            //  whole blob and moved half of it: ~1.5 blobs of CPU copies a member, now ~0.8 - on a 6-core CPU with
+            //  the experts in place a pair's prompts took ~1.5x the time)
             for (int r = 0; r < 2; ++r) {
                 const size_t gr = mx_row_b(l, r);
-                std::memmove(dst + x.hlay.trellis[r], dst + l.lay.trellis[r] + (size_t) x.ff0 * gr, (size_t) x.ffn * gr);
+                if (!pk.read_at(l.mx_file[r], l.mx_off[r] + (uint64_t) e * l.mx_stride[r] + (uint64_t) x.ff0 * gr,
+                                (uint64_t) x.ffn * gr, dst + x.hlay.trellis[r]))
+                    return false;
             }
+            if (!pk.read_at(l.mx_file[2], l.mx_off[2] + (uint64_t) e * l.mx_stride[2], mx_part_bytes(l, 2),
+                            dst + l.lay.trellis[2]))
+                return false;
             for (size_t row = 0; row < (size_t) g.dim; ++row)
                 std::memmove(dst + x.hlay.trellis[2] + row * dh, dst + l.lay.trellis[2] + row * dr + d0, dh);
             return true;
