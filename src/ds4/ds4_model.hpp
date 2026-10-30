@@ -45,6 +45,7 @@ struct Options {
     // gives way, 0 lru, 1 lfu
     double ssd_cache_gb = 0.0;
     int ssd_policy = 0;
+    int experts = 0;                  // routed experts a token takes: the router's top n, renormalised (0: the model's)
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
     // prompt lookup (ds4_main's --suffix-draft): its verify windows run without the drafter too - their buffers (the

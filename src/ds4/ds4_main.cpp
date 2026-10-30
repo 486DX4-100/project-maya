@@ -127,7 +127,8 @@ void usage() {
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--suffix-draft N]\n"
-                 "           [--vision on|off] [--mmap-experts on|off|auto] [--parallel N (--serve: N conversations at once)]\n"
+                 "           [--vision on|off] [--mmap-experts on|off|auto] [--experts N (lossy: the router's top N)]\n"
+                 "           [--parallel N (--serve: N conversations at once)]\n"
                  "           [--ssd-cache GB|auto|off [--ssd-policy lru|lfu]]   (the in-place experts in a RAM store; opt-in)\n"
                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
@@ -3344,7 +3345,8 @@ int main(int argc, char** argv) {
                 return 2;
             }
             o.ssd_policy = v == "lfu" ? 1 : 0;
-        } else if (a == "--images") images = val("--images");
+        } else if (a == "--experts") o.experts = std::max(1, std::atoi(val("--experts").c_str()));
+        else if (a == "--images") images = val("--images");
         else if (a == "--encode-image") enc_rgb = val("--encode-image");
         else if (a == "--dump-image") enc_out = val("--dump-image");
         else if (a == "--size") {
