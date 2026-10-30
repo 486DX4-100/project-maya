@@ -1751,8 +1751,11 @@ the Qwen Community License 1.0, `LICENSE.qwen-community-1.0`). One 112.5 GB file
 `tools/qwen/download.json` pins and checked against its sha256. It runs on the `maya` engine's own Qwen path, from the
 file in place: the setup writes `maya-cyber-frost.json` (`maya-cyber-frost-hip.json` on AMD), the pack (the index of
 the file's tensors, its small float weights and the tokenizer with the model's chat template) and the MTP drafter, built
-from the file's NextN block (`tools/mtp_from_gguf.py`, in `<model folder>/pack/mtp`). Text only: there is no vision
-tower in its repo.
+from the file's NextN block (`tools/mtp_from_gguf.py`, in `<model folder>/pack/mtp`). Pictures: the fine-tune kept the base model's vision
+tower byte for byte, so the setup downloads the base model's mmproj (0.9 GB, pinned and sha256-checked, into
+`<model folder>/vision`) and writes the config's `"vision"` entry and the engine's `--vision`; the image encoder
+(`build-vision/bin/maya-vision`) starts only when a picture arrives. `--no-vision`, or Images off on the Models page,
+reads text only.
 
 **Where the experts live.** The most-used experts go to VRAM (`--expert-cache auto`: the free VRAM less the reserve).
 When this PC's RAM cannot hold all the others, the engine reads them straight from the GGUF: the next-most-used are

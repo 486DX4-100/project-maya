@@ -251,8 +251,9 @@ def choices(cfg: dict) -> dict:
     if family(cfg) == "deepseek":
         return {"draft": ["dspark", "none"] if ds4_has_drafter(cfg) else ["none"],
                 "images": ds4_has_vision(cfg) or "--vision" not in (cfg.get("args") or [])}
-    if family(cfg) == "qwen":                          # (text only: no vision tower)
-        return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"], "images": False}
+    if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
+        return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
+                "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
     f = dflash_file(cfg)
     return {"draft": ["mtp", "dflash2"] if f is not None else ["mtp"],
             "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
@@ -277,7 +278,7 @@ def settings_of(cfg: dict) -> dict:
     if family(cfg) == "qwen":
         ec, pf = flag(args, "--expert-cache", "auto"), flag(args, "--prefill", "auto")
         ram = env.get("MAYA_EXPERT_RAM_GB")
-        out.update(images=False, reserve_mib=_int(flag(args, "--vram-reserve-mib")),
+        out.update(images=bool(cfg.get("vision")), reserve_mib=_int(flag(args, "--vram-reserve-mib")),
                    draft="mtp" if flag(args, "--mtp") and flag(args, "--mtp-max-t") != "1" else "none",
                    expert_cache=None if ec == "auto" else _int(ec), prefill=None if pf == "auto" else _int(pf),
                    kv=flag(args, "--kv", "fp16"), ram_gb=_int(ram))
@@ -394,8 +395,15 @@ def apply(cfg: dict, settings: dict) -> dict:
         if qwen_mtp(cfg) is not None:   # (loaded either way - the server needs it; "none" keeps its drafts off)
             args = set_flag(args, "--mtp", qwen_mtp(cfg))
         args = drop_flag(args, "--mtp-max-t") if s["draft"] == "mtp" else set_flag(args, "--mtp-max-t", 1)
-        if s.get("images"):
-            raise ValueError("Images: this model has no vision tower (text only)")
+        # Images: the config's "vision" (maya-vision with the model's mmproj) and the engine's bare --vision flag (GENI
+        # requests); off keeps the entry as "vision_off", so Images can be switched on again
+        if s.get("images") and not out.get("vision"):
+            if not out.get("vision_off"):
+                raise ValueError("Images: this model was set up without its vision encoder (the setup adds it)")
+            out["vision"] = out.pop("vision_off")
+        elif not s.get("images") and out.get("vision"):
+            out["vision_off"] = out.pop("vision")
+        args = [x for x in args if x != "--vision"] + (["--vision"] if out.get("vision") else [])
         args = set_flag(args, "--vram-reserve-mib", reserve) if reserve is not None else \
             drop_flag(args, "--vram-reserve-mib")
         ec = _num(s, "expert_cache", 1, 1000000, "Expert cache")

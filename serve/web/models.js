@@ -404,7 +404,7 @@ function mm3Fields(m, d, s, ch, images, gpus) {
   ];
 }
 
-// CYBER-FROST's (the `maya` engine's Qwen path; text only).  Its KV cache's VRAM a context token, by format: 12 attention
+// CYBER-FROST's (the `maya` engine's Qwen path; pictures through maya-vision and the base model's mmproj).  Its KV cache's VRAM a context token, by format: 12 attention
 // layers' K and V plus the sparse attention's pooled keys (maya.py's QWEN_KV_BYTES for FP16)
 const QWEN_KV = [{id: "fp16", label: "FP16", bytes: 26112}, {id: "int8", label: "INT8", bytes: 14208},
                  {id: "k8v4", label: "K8 V4", bytes: 11328}, {id: "q4_0", label: "Q4_0", bytes: 8448}];
@@ -416,6 +416,10 @@ function qwenFields(m, d, s, ch, gpus) {
   return [
     {label: "Model", rows: [
       contextRow(m, d, ch, {vram: kv.bytes}, ["kv"]),
+      html`<${Row} label="Images" flag="vision" changed=${ch("images")}
+        hint=${m.choices.images ? "Reads images in chats: the image encoder starts when a picture arrives, no VRAM kept for it. Off reads text only."
+          : "This model was set up without its image encoder: the setup adds it."}>
+        <${Switch} label="Images" on=${d.images} disabled=${!m.choices.images && !d.images} onChange=${(v) => setDraft({images: v})}/><//>`,
       html`<${Row} label="Drafting" flag="--mtp-max-t" changed=${ch("draft")}
         hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answer. Off keeps it loaded with its drafts off. The setup measures which is faster on this PC."
           : "This pack has no MTP drafter: the setup builds it from the model file."}>
