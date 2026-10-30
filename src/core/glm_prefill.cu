@@ -1220,9 +1220,13 @@ bool Glm5Model::prefill_setup(std::string& err) {
             if (T < kPreMinT || gstride == 0) return ring_max;   // (a chunk this short carves no prestage buffer)
             return std::min<int64_t>(ring_max, (int64_t) ((lendable - nr - 256) / gstride));
         };
-        // Strata's biggest_chunk: every test rises with T, so the largest chunk that passes is a bisection on the grid
+        // Strata's biggest_chunk: every test rises with T, so the largest chunk that passes is a bisection on the grid.
+        // A test for a prestage buffer (floor > 0) is searched from kPreMinT up: a shorter chunk carves none, so it
+        // "passed" any floor, the test was not monotonic there, and a card whose pool could not hold the whole ring
+        // beside a 1024-token chunk got 768-token chunks with no ring at all instead of the largest chunk with a part
+        // of it (#673: a 20 GB card, Maya-S24 at 256K: 768 where 10240 fit, half the prompt speed)
         const auto biggest = [&](int64_t floor) -> int64_t {
-            int64_t lo = 1, hi = ceiling / 256, best = 0;
+            int64_t lo = floor > 0 && gstride > 0 ? kPreMinT / 256 : 1, hi = ceiling / 256, best = 0;
             while (lo <= hi) {
                 const int64_t mid = lo + (hi - lo) / 2;
                 if (room(mid * 256) >= floor) {
