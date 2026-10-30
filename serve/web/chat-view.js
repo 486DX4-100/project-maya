@@ -3,7 +3,7 @@
 // greeting: the model that answers it and ideas to start from.
 import {Component, html, useEffect, useLayoutEffect, useRef, useState} from "./preact.js";
 import {SPRITE, coarse, ctxfmt, esc, fmt, isPhone, modelName, timeStr, tokfmt} from "./lib.js";
-import {LEVELS, P, PRESET_NAMES, S, copyText, emit, presetOf, savePrefs, thinkTitles} from "./state.js";
+import {LEVELS, P, PRESET_NAMES, S, copyText, emit, presetOf, savePrefs, thinkPill, thinkTitles} from "./state.js";
 import {mcpOn} from "./server.js";
 import {addFiles, cancelEdit, chatView, ctxMeter, editMessage, focusInput, newChat, painters, regenerate,
         removeAttachment, scrollDown, send, setThinking, stopAnswer, thinkingOf, updateCtxMeter} from "./chats.js";
@@ -288,10 +288,11 @@ function textWidth(t, el) {
 }
 
 // the thinking level: a thick bar hovering over the chat by the message box (above it; below it on a new chat's centred
-// one), one segment a level - the model's own: GLM's Off, Low, High and Max - filled up to the one set.  A tap, a click
-// or a drag along it sets another (one slider: the arrow keys, Home and End too).  On a phone it spans the message box.
+// one), one segment a level - the model's own: GLM's Off, Low, High and Max - and a pill on the one set (that one
+// only: a fill up to it read as every level before it chosen too).  A tap, a click or a drag along it sets another (one
+// slider: the arrow keys, Home and End too).  On a phone it spans the message box.
 function ThinkingBar({bar, below}) {
-  const level = thinkingOf(), n = LEVELS.length, li = Math.max(0, LEVELS.findIndex((l) => l.id === level));
+  const level = thinkingOf(), pill = thinkPill(level), n = pill.n, li = pill.i;
   const titles = thinkTitles();
   const track = useRef(null), dragging = useRef(false);
   const set = (i) => { const l = LEVELS[Math.min(n - 1, Math.max(0, i))]; if (l.id !== thinkingOf()) setThinking(l.id); };
@@ -309,10 +310,10 @@ function ThinkingBar({bar, below}) {
   return html`<div ref=${bar} class=${cls} style=${`--n:${n}`}>
     <div ref=${track} class="think-bar__track" role="slider" tabIndex="0" aria-label="Thinking level, for this chat" aria-valuemin="0"
       aria-valuemax=${n - 1} aria-valuenow=${li} aria-valuetext=${`${LEVELS[li].name}: ${LEVELS[li].desc}`}
-      style=${`--fill:${((li + 1) * 100) / n}%`}
+      style=${`--at:${pill.at}%;--w:${pill.width}%`}
       onPointerDown=${down} onPointerMove=${move} onPointerUp=${up} onPointerCancel=${up} onKeyDown=${keys}>
       <span class="think-bar__fill"></span>
-      ${LEVELS.map((l, i) => html`<span class=${`think-bar__seg${i <= li ? " is-on" : ""}${i === li ? " is-sel" : ""}`}
+      ${LEVELS.map((l, i) => html`<span class=${`think-bar__seg${i === li ? " is-sel" : ""}`}
         title=${titles[l.id]}>${l.name}</span>`)}
     </div>
   </div>`;

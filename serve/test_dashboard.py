@@ -593,6 +593,27 @@ class PageLogic(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
         return json.loads(r.stdout.strip().splitlines()[-1])
 
+    def test_thinking_pill_covers_the_chosen_level_only(self):
+        # the owner's phone: Low chosen, the fill spanned Off and Low.  Every model's levels, every level: the pill sits
+        # on that level's segment alone
+        got = self.node("""
+const out = {};
+for (const model of ["glm-5.3-flash", "deepseek-v4.1-flash", "minimax-m3.1-flash", "cyber-frost-3.8-ps"]) {
+  st.setFamily(model);
+  out[model] = st.LEVELS.map((l) => [l.id, st.thinkPill(l.id)]);
+}
+console.log(JSON.stringify(out));""")
+        self.assertEqual([lv for lv, _ in got["glm-5.3-flash"]], ["none", "low", "high", "max"])
+        self.assertEqual(len(got["minimax-m3.1-flash"]), 7)
+        for model, levels in got.items():
+            n = len(levels)
+            for i, (lv, pill) in enumerate(levels):
+                with self.subTest(model=model, level=lv):
+                    self.assertEqual((pill["i"], pill["n"]), (i, n))
+                    self.assertAlmostEqual(pill["at"], 100 * i / n)
+                    self.assertAlmostEqual(pill["width"], 100 / n)      # (one segment wide: not from 0 up to it)
+        self.assertEqual(got["glm-5.3-flash"][1][1]["at"], 25)            # Low: the second quarter only
+
     def test_context_slider_reaches_each_models_own_top(self):
         # the Models page's Context size: Settings > Model's stops over each model's range (its trained context, up to
         # 1M), the size a config has kept as a stop of its own

@@ -341,7 +341,7 @@
          border-radius: var(--st-r-xl) var(--st-r-xl) 0 0; background: var(--st-surface); box-shadow: var(--st-shadow-sheet); animation: slideup 200ms var(--st-ease); }
 @keyframes slideup { from { transform: translateY(100%); } }
 .sheet__grip { align-self: center; width: 36px; height: 4px; margin: 2px 0 12px; border-radius: 2px; background: var(--st-line-strong); }
-/* the thinking level: a thick bar hovering over the chat by the message box, a segment a level, filled up to the one set;
+/* the thinking level: a thick bar hovering over the chat by the message box, a segment a level, a pill on the one set;
    a tap, a click or a drag along it sets another.  On a phone it spans the message box; wider, it sits by the chip */
 .think-bar { position: absolute; z-index: 25; left: 2px; right: 2px; bottom: calc(100% + 10px); padding: 5px;
              border: 1px solid var(--st-glass-line); border-radius: var(--st-r-pill); background: var(--st-glass-bar);
@@ -351,17 +351,16 @@
 .think-bar__track { position: relative; display: flex; height: 44px; border-radius: var(--st-r-pill); background: var(--st-surface-3);
                     overflow: hidden; cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; outline: none; }
 .think-bar__track:focus-visible { box-shadow: 0 0 0 2px var(--st-focus); }
-.think-bar__fill { position: absolute; left: 0; top: 0; bottom: 0; width: var(--fill); border-radius: var(--st-r-pill); background: var(--st-accent);
-                   transition: width 180ms var(--st-ease); }
+.think-bar__fill { position: absolute; left: var(--at); top: 0; bottom: 0; width: var(--w); border-radius: var(--st-r-pill); background: var(--st-accent);
+                   transition: left 180ms var(--st-ease); }
 .think-bar__seg { position: relative; flex: 1; min-width: 0; display: grid; place-items: center; font-size: var(--st-fs-sm); font-weight: 500;
                   color: var(--st-ink-muted); white-space: nowrap; transition: color 180ms var(--st-ease); }
-.think-bar__seg.is-on { color: color-mix(in srgb, var(--st-accent-ink) 78%, transparent); }
 .think-bar__seg.is-sel { color: var(--st-accent-ink); font-weight: 700; }
 .think-bar--many:not(.think-bar--pop) .think-bar__seg { font-size: var(--st-fs-xs); }   /* (MiniMax's seven, on a phone) */
 .think-bar--pop { left: auto; right: 44px; width: min(calc(var(--n) * 84px + 12px), calc(100% - 48px)); }
 .think-bar--below { bottom: auto; top: calc(100% + 10px); animation-name: thinkbar-down; }
 @keyframes thinkbar-down { from { opacity: 0; transform: translateY(-6px); } }
-@media (hover: hover) { .think-bar__seg:not(.is-on):hover { color: var(--st-ink); } }
+@media (hover: hover) { .think-bar__seg:not(.is-sel):hover { color: var(--st-ink); } }
 
 /* ---------------------------------------------------------------- the phone: the chats push the page over, floating buttons */
 /* (as ChatGPT's app: the chats slide in from the left beside the page, not over it, and push it to the right; its edge
