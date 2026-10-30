@@ -2678,12 +2678,24 @@ class Service:
         return any(isinstance(u, (int, float)) and u > STALL_GPU_BUSY for u in utils)
 
     def _tok_s(self):
-        """tok/s over the last RATE_WINDOW_S seconds, summed over the requests decoding now.  0.0 while none is."""
+        """tok/s over the last RATE_WINDOW_S seconds, summed over the requests decoding now.  0.0 while none is.
+        Every reading is also the Monitor's live Decode figure, so one above the peak decode becomes the peak."""
         with self.status_lock:
             if not self.status.get("busy"):
                 return 0.0
             now = time.time()
-            return sum(r.tok_s(now) for r in self.current_requests)
+            rate = sum(r.tok_s(now) for r in self.current_requests)
+            n = sum((r.samples[-1] if r.samples else r.base or (0, 0))[1] for r in self.current_requests)
+            self._note_peak(rate, n, now)
+            return rate
+
+    def _note_peak(self, tok_s, tokens, when):
+        """The Monitor's peak decode (status_lock held): the highest decode rate it has shown - a running answer's live
+        rate or a finished answer's - rounded as shown (0.1 tok/s), once the answers hold PEAK_MIN_TOKENS tokens."""
+        tok_s = round(tok_s or 0.0, 1)
+        peak = self.totals.get("peak_decode")
+        if tok_s > 0 and tokens >= PEAK_MIN_TOKENS and (peak is None or tok_s > peak["tok_s"]):
+            self.totals["peak_decode"] = {"tok_s": tok_s, "tokens": tokens, "time": when}
 
     def _tok_s_mean(self):
         """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
@@ -2703,6 +2715,7 @@ class Service:
     def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
         the hardware (with a minute of history per series)."""
+        rate = self._tok_s()                            # (first: a live rate above the peak is the peak in `totals`)
         with self.status_lock:
             s = dict(self.status)
             answering = self.latest_request in self.current_requests
@@ -2726,7 +2739,7 @@ class Service:
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
                 "max_tokens": s.get("max_tokens") if s.get("busy") else None,
                 "elapsed_s": round(now - s["started"], 1) if s.get("busy") and s.get("started") else None,
-                "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
+                "tok_s": round(rate, 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
@@ -3639,10 +3652,7 @@ class Service:
                         "loop_guard": guards[0].summary() if guards and guards[0].events else None}
                     self.history.append(row)
                     t = self.totals
-                    peak = t.get("peak_decode")
-                    if row["decode_tok_s"] and n >= PEAK_MIN_TOKENS and \
-                            (peak is None or row["decode_tok_s"] > peak["tok_s"]):
-                        t["peak_decode"] = {"tok_s": row["decode_tok_s"], "tokens": n, "time": started}
+                    self._note_peak(row["decode_tok_s"], n, started)
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
                     t["reused"] += last.get("reused") or 0

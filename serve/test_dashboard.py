@@ -193,6 +193,34 @@ class Dashboard(unittest.TestCase):
                                                   "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(json.loads(self.req("GET", "/metrics")[2])["totals"]["peak_decode"], peak)
 
+    def test_peak_decode_follows_the_live_figure(self):
+        # a live Decode reading above the peak is the peak in the same /metrics answer (the owner's screenshot: 30.0
+        # live, peak 27.8), rounded as shown; a reading before PEAK_MIN_TOKENS tokens is not
+        from serve.server import PEAK_MIN_TOKENS, RequestStat
+        svc, now = self.svc, time.time()
+        svc.totals["peak_decode"] = {"tok_s": 27.8, "tokens": 400, "time": now - 60}
+        r = RequestStat()
+        r.first_token = now - 10
+        with svc.status_lock:
+            svc.status.update(busy=True, generated=PEAK_MIN_TOKENS - 1)
+            svc.current_requests.add(r)
+            svc.latest_request = r
+        try:
+            r.base = (now - 1, 0); r.samples.append((now, PEAK_MIN_TOKENS - 1))   # 31 tok/s, but only 31 tokens
+            m = json.loads(self.req("GET", "/metrics")[2])
+            self.assertEqual(m["totals"]["peak_decode"]["tok_s"], 27.8)
+            for k, n in enumerate((300, 330, 310)):                   # 300, 330, 310 tok/s live, one a reading
+                r.samples.clear(); r.base = (time.time() - 1, 1000 * k); r.samples.append((time.time(), 1000 * k + n))
+                m = json.loads(self.req("GET", "/metrics")[2])
+                self.assertGreaterEqual(m["totals"]["peak_decode"]["tok_s"], m["live"]["tok_s"])
+            self.assertAlmostEqual(m["totals"]["peak_decode"]["tok_s"], 330, delta=2)
+            self.assertEqual(m["totals"]["peak_decode"]["tokens"], 1330)
+            self.assertEqual(round(m["totals"]["peak_decode"]["tok_s"], 1), m["totals"]["peak_decode"]["tok_s"])
+        finally:
+            with svc.status_lock:
+                svc.status.update(busy=False)
+                svc.current_requests.discard(r)
+
     def test_requests_record_their_api(self):
         self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
         s, _, b = self.req("GET", "/metrics")

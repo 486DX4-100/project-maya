@@ -66,7 +66,8 @@ function Throughput({m}) {
   const spec = eng.dspark != null ? (+eng.dspark ? "DSpark" : "Off")
     : eng.mtp == null ? (eng.dflash ? "DFlash2" : null) : +eng.mtp ? "MTP" : "Off";
   const kept = +eng.dspark && tn && tn.drafts != null ? `${fmt(100 * tn.drafts)}% kept` : "";
-  // the fastest answer since Maya started (the server's, of answers 32 tokens or longer: a few tokens' speed says little)
+  // the highest Decode figure since Maya started - live or a finished answer's (the server's, kept as each reading beats
+  // it; from 32 tokens on: a few tokens' speed says little)
   const peak = m.totals && m.totals.peak_decode;
   const when = peak ? new Date(peak.time * 1000) : null;
   const at = when ? when.toLocaleString([], new Date().toDateString() === when.toDateString()
@@ -78,8 +79,8 @@ function Throughput({m}) {
       <div class="speed" title="Prompt tokens read per second (the prefill), counting only the tokens read - not the ones reused from the conversation cache">
         <span class="speed__label"><i class="key key--dash"></i>Prefill · ${live.state === "reading" ? "reading now" : gen ? "this request" : last ? "last request" : "waiting"}</span>
         <span class="speed__mid num">${prefill == null ? "–" : fmt(prefill)}<small>tok/s</small></span></div>
-      <div class="speed" title=${peak ? `The fastest answer since Maya started: ${fmt(peak.tokens)} tokens at ${fmt(peak.tok_s, 1)} tok/s (${at}). Answers of 32 tokens or more count.`
-          : "The fastest answer since Maya started. Answers of 32 tokens or more count."}>
+      <div class="speed" title=${peak ? `The highest decode speed since Maya started: ${fmt(peak.tok_s, 1)} tok/s at ${at}, ${fmt(peak.tokens)} tokens into the answer. Live speeds and finished answers count, from 32 tokens on.`
+          : "The highest decode speed since Maya started. Live speeds and finished answers count, from 32 tokens on."}>
         <span class="speed__label">Peak decode · ${peak ? at : "no answer yet"}</span>
         <span class="speed__mid num">${peak ? fmt(peak.tok_s, 1) : "–"}<small>tok/s</small></span></div>
     </div>
