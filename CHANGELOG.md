@@ -4,6 +4,50 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.42 - 2026-10-30
+
+Pictures on every model and every build: GLM-5.3-Flash now reads pictures on AMD GPUs too, Qwen-3.8-Flash-Next
+(CYBER-FROST) reads pictures for the first time, and DeepSeek and MiniMax read them on every setup again. DeepSeek reads
+long first prompts 16-24% faster and its two-GPU tensor-parallel prompts about 1.5x faster on PCs with few CPU cores,
+GLM's automatic prompt chunk is up to 3.4x faster on cards where it chose too small a chunk, and an idle Maya no longer
+keeps a CPU core busy. Against v1.1.41 on our test PCs, an 8K-token DeepSeek prompt
+read about 1.27x faster on one GPU and 1.1x faster with `--tp 2`; decode, and the other models' speeds, are unchanged.
+
+- **Pictures on every model and every build:**
+  - GLM-5.3-Flash reads pictures on AMD GPUs - Linux and Windows, discrete cards and Ryzen AI Max APUs (#345, thanks
+    @Ehco). The encoder's matmuls and attention now add up in float32 on the GPU, so its answers about a picture match
+    the CPU encoder's on AMD (they drifted on a few image patches before) and on NVIDIA's newer cards too.
+  - Qwen-3.8-Flash-Next (CYBER-FROST) reads pictures. The setup downloads its 0.9 GB image encoder (it asks first),
+    and the encoder runs on the GPU in memory the engine lends it while a picture is read: on an 8 GB card the expert
+    cache and, if need be, the draft layer's experts are lent and read back afterwards. On an 8 GB card a picture is
+    read about 3.6x faster than with the CPU encoder; text answers before and after a picture are the same.
+  - DeepSeek reads pictures with the EXL3 quants on V100s too, and the setup says why a PC short of RAM reads text
+    only. A MiniMax setup run again turns pictures on (it kept an earlier "off" before). `--no-vision` keeps them off
+    for every model.
+- **DeepSeek:**
+  - Long prompts (#691, thanks @needmorevram): the restore points near the end of a prompt are kept in one read, and
+    a chunk streams only the experts it picks. A fresh 20-30K-token prompt read 16-24% faster on one and on two GPUs
+    in our tests, with the same output. Lending EXL3 chunk buffers from the expert cache and reading host-summed
+    pieces back by DMA are opt-in for now (`MAYA_DS4_EXL3_LEND=1`, `DS4_AR_BACK_DMA=1`).
+  - GGUF `--tp 2`: each GPU of a tensor-parallel pair reads only its own part of an expert from the files - on a PC
+    with few CPU cores its prompts took about two thirds of the time (#670, thanks @speja969 for the measurements).
+  - A slow PCIe link (one expert takes 1 ms or more) streams one expert at a time, and the link is measured on the
+    same stream as the loads, which gave back the decode speed lost on such a PC (#609, thanks @SeriousRising, who
+    found the cause).
+  - A GPU too small for the model's dense weights stops at the start with what it needs, instead of a memory error
+    part way into the load.
+- **GLM:** `--prefill auto` no longer falls back to 768-token chunks when the prestage buffer does not fit whole beside
+  a bigger chunk; on such a card a 19K-token prompt read about 3.4x faster (#673, thanks @pietroMastro92).
+- **An idle Maya stays idle** (#685, thanks @vbooka1 for the measurements): after a minute without a request the
+  engines' CPU-lane threads sleep until the next request wakes them (DeepSeek's used up to 12% of a core doing
+  nothing, now none), and the setup screen and the hardware sampler slow down when nothing runs. The first answer
+  after a quiet spell comes as fast as before.
+- **Settings:** a `MAYA_...` setting in a config's `"env"` now reaches the engine under either of its names (#686,
+  thanks @mgabor3141).
+- **Setup:** a discrete NVIDIA card without Resizable BAR is no longer called "shared with the system" (#671, thanks
+  @speja969).
+- **MiniMax:** a routing id outside the experts ends the request with an error that says where, instead of a crash.
+
 ## v1.1.41 - 2026-10-30
 
 A community release: 36 contributions. DeepSeek reads the first long prompt after a start about 1.3x faster on
