@@ -4871,13 +4871,21 @@ def ds4_drafter_step(a, d: Path, quant: str | None = None) -> bool:
     return True
 
 
-def ds4_vision_model() -> dict:
+def ds4_vision_model(mmproj: bool = False) -> dict:
     """DeepSeek's vision tower (the GGUFs leave it out; every GGUF of the model shares it) as offer_download's form:
     shard 1 of DeepSeek's own checkpoint (only the tower and its aligner) and config.json (download_gguf.json's
-    "vision"; its "marks" - 30 KB of shard 2 - are read by tools/ds4/vision_pack.py)."""
+    "vision"; its "marks" - 30 KB of shard 2 - are read by tools/ds4/vision_pack.py).  mmproj (unsloth's UD quants):
+    unsloth's mmproj-BF16.gguf from the quant's own repo instead ("vision" / "mmproj": the same weights, vision_pack.py
+    --mmproj makes the same vision.bin from it, byte for byte)."""
     man = (read_json(DS4_GGUF_MANIFEST).get("vision") or {})
     if not man.get("files") or not man.get("marks"):
         fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
+    mp = man.get("mmproj") or {}
+    if mmproj and mp.get("files"):
+        return {"about": "DeepSeek's vision tower (it lets the model read pictures), unsloth's mmproj of it",
+                "format": "ds4-vision", "repo": mp["repo"], "revision": mp["revision"], "folder": "", "mmproj": True,
+                "files": {k: v[0] for k, v in mp["files"].items()}, "sha256": {k: v[1] for k, v in mp["files"].items()},
+                "download_gb": sum(v[0] for v in mp["files"].values()) / 1e9}
     return {"about": "DeepSeek's vision tower (it lets the model read pictures), from DeepSeek's own checkpoint",
             "format": "ds4-vision", "repo": man["repo"], "revision": man["revision"], "folder": "",
             "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
@@ -4909,11 +4917,12 @@ def ds4_vision_blocker(pc: dict) -> str | None:
     return None
 
 
-def ds4_vision_step(a, pc: dict, d: Path) -> bool:
+def ds4_vision_step(a, pc: dict, d: Path, mmproj: bool = False) -> bool:
     """Step 7 for a GGUF: the vision tower in ds4_vision_dir(d) - downloaded when it is not there (shard 1 of
     DeepSeek's checkpoint, 0.97 GB, and its config.json), then made the GGUF path's file (tools/ds4/vision_pack.py:
     vision.bin, with the picture markers read from shard 2 by a 30 KB range request); the shard is removed after
-    that.  False: no vision tower (skipped, cannot run here, or not downloaded): the model reads text only."""
+    that.  mmproj (unsloth's UD quants): unsloth's mmproj-BF16.gguf (0.97 GB) instead, made into the same vision.bin.
+    False: no vision tower (skipped, cannot run here, or not downloaded): the model reads text only."""
     step(7, "images (the vision tower)")
     if a.no_vision:
         ok("skipped (--no-vision): the model reads text only")
@@ -4931,7 +4940,7 @@ def ds4_vision_step(a, pc: dict, d: Path) -> bool:
     if not os.access(existing(v), os.W_OK):
         warn(f"{existing(v)} is not writable: no vision tower, the model reads text only")
         return False
-    m = ds4_vision_model()
+    m = ds4_vision_model(mmproj)
     files = [v / n for n in m["files"]]
     if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the vision tower", v, files, m):
         warn("the vision tower was not downloaded: the model reads text only")
@@ -4940,9 +4949,13 @@ def ds4_vision_step(a, pc: dict, d: Path) -> bool:
         if not sha256_checked(f, m["sha256"][f.name]):
             f.unlink(missing_ok=True)                  # else the next run finds it complete and fails here again
             fail(f"{f}: the sha256 does not match the published one (the file was removed)", "run the setup again")
-    say("  Reading the picture markers (30 KB of DeepSeek's shard 2, a range request) and copying the tower into one "
-        "file (exactly the same values; a few seconds) ...")
-    r = run([sys.executable, str(ROOT / "tools" / "ds4" / "vision_pack.py"), "--dir", str(v)], check=False)
+    if m.get("mmproj"):
+        say("  Copying the mmproj's tower into one file (exactly the same values; a few seconds) ...")
+    else:
+        say("  Reading the picture markers (30 KB of DeepSeek's shard 2, a range request) and copying the tower into one "
+            "file (exactly the same values; a few seconds) ...")
+    r = run([sys.executable, str(ROOT / "tools" / "ds4" / "vision_pack.py"), "--dir", str(v)]
+            + (["--mmproj", str(files[0])] if m.get("mmproj") else []), check=False)
     if r.returncode != 0 or not (v / "vision.bin").is_file():
         warn("the vision tower was not made (the reason is above): the model reads text only - the setup tries again "
              "next time, without downloading the shard again")
@@ -5438,7 +5451,7 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     dj = d.parent / "dspark" / own["json"] if own is not None and drafter else None
     pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj, without=without)   # 6
     if gguf:                                           # 7 (DeepSeek's checkpoint's tower, added to the pack)
-        vision = ds4_vision_step(a, pc, d)
+        vision = ds4_vision_step(a, pc, d, mmproj=quant in DS4_UD)   # (UD quants: unsloth's mmproj, the same tower)
         if vision and not ds4_pack_has_vision(pack):
             pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj, without=without)
         vision = vision and ds4_pack_has_vision(pack)

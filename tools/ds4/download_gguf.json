@@ -709,6 +709,17 @@
      "f55bfbcb7e06217c4822d27cf7a6696966c099f2805dbf47fc1a6d6f56a885b6"
     ]
    }
+  },
+  "mmproj": {
+   "_": "unsloth's mmproj of the same tower (its UD quants take it: vision_pack.py --mmproj makes the same vision.bin from it, byte for byte - checked 2026-10-30)",
+   "repo": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+   "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
+   "files": {
+    "mmproj-BF16.gguf": [
+     972208288,
+     "9a1ef7c40d0d702c7ed8c5f863f60abae64091387ba3fce0ad19ce9beeda3bf9"
+    ]
+   }
   }
  }
 }

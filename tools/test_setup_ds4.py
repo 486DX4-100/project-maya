@@ -786,7 +786,30 @@ class Vision(unittest.TestCase):
             f.write_bytes(b"s" * 8)
         return True
 
-    def fake_model(self):
+    def test_ud_quants_take_the_mmproj(self):
+        """unsloth's UD quants: its mmproj-BF16.gguf (pinned in "vision" / "mmproj"), packed by vision_pack.py --mmproj
+        into the same vision.bin, the download removed after; the other GGUFs keep DeepSeek's checkpoint shard."""
+        m = maya.ds4_vision_model(True)
+        self.assertEqual((m["repo"], m["revision"], list(m["files"])), ("unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+                         "8a6ec9cf118e785a362ea94ee123c61c70553be6", ["mmproj-BF16.gguf"]))
+        self.assertEqual(m["files"]["mmproj-BF16.gguf"], 972208288)
+        self.assertIn("model-00001-of-00048.safetensors", maya.ds4_vision_model()["files"])
+
+        def fake(mmproj=False):
+            return dict(self.fake_model(), files={"mmproj-BF16.gguf": 8}, mmproj=True,
+                        sha256={"mmproj-BF16.gguf": hashlib.sha256(b"s" * 8).hexdigest()})
+
+        def pack(cmd, check=True):
+            self.assertEqual(cmd[cmd.index("--mmproj") + 1], str(self.v / "mmproj-BF16.gguf"))
+            (self.v / "vision.bin").write_bytes(b"v")
+            (self.v / "vision.json").write_text("{}")
+            return SimpleNamespace(returncode=0)
+        with patch.object(maya, "ds4_vision_model", fake), \
+                patch.object(maya, "offer_download", self.fake_download), patch.object(maya, "run", pack):
+            self.assertTrue(maya.ds4_vision_step(args(), {}, self.d, mmproj=True))
+        self.assertFalse((self.v / "mmproj-BF16.gguf").exists())
+
+    def fake_model(self, mmproj=False):
         import hashlib
         return {"files": {"model-00001-of-00048.safetensors": 8, "config.json": 8},
                 "sha256": {n: hashlib.sha256(b"s" * 8).hexdigest() for n in ("model-00001-of-00048.safetensors",
