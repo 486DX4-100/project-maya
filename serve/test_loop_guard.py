@@ -1034,7 +1034,7 @@ class ThinkingMarkers(unittest.TestCase):
     (THINK_RESTARTS times).  In the answer it is text too when quoted in code or inside a tool call's body; spelled
     out in ordinary pieces or in plain prose it ends the turn as always."""
 
-    def answer(self, *seqs, tok=None):
+    def answer(self, *seqs, tok=None, stop=None):
         from serve.frontend import openai_to_messages
         tok = tok or DeepTok()
         eng = SeqEngine(tok, *seqs)
@@ -1043,6 +1043,8 @@ class ThinkingMarkers(unittest.TestCase):
         ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
         events, done = [], None
         sampling = {"_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume")}
+        if stop is not None:
+            sampling["stop"] = stop
         for kind, x in svc.run(ids, thinking, tools, max_new, sampling, threading.Event()):
             if kind == "event":
                 events.append(x)
@@ -1122,6 +1124,29 @@ class ThinkingMarkers(unittest.TestCase):
         svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
         self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
         self.assertIn("ANSWER OK", text)
+
+    def test_a_gguf_named_tokenizer_resumes_at_every_turn_end_the_engine_stops_at(self):
+        # GLM's pack tokenizer names its ids by their GGUF keys (no "eos"), and the GLM engine ends at every turn-end
+        # token (<|endoftext|>, <|user|>, <|observation|>): a turn end in the thinking ended the engine there, and the
+        # server, waiting for an "eos" it never knew, closed the answer as "length" mid-thinking
+        class GgufTok(Tok):
+            special_ids = {"tokenizer.ggml.eos_token_id": 256 + 2}
+        tok = GgufTok()
+        first = tok.encode("thinking about ", parse_special=True)      # (SeqEngine ends it with <|im_end|>)
+        second = tok.encode("</think>\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(first, second, tok=tok)
+        self.assertEqual(svc.eos_ids, svc.stop_ids)
+        self.assertEqual((len(eng.prompts), done["finish"]), (2, "stop"))
+        self.assertIn("ANSWER OK", text)
+
+    def test_a_client_stop_string_stops_inside_code(self):
+        # the quoted-marker rule is for the server's own markers: a client's stop string stops wherever it is
+        tok = DeepTok()
+        seq = tok.encode("</think>\n\n```\nx = 1\nEND\ny = 2\n```\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok, stop=["END"])
+        self.assertEqual(done["finish"], "stop")
+        self.assertIn("x = 1", text)
+        self.assertNotIn("y = 2", text)
 
 
 if __name__ == "__main__":

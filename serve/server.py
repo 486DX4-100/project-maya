@@ -2116,9 +2116,12 @@ class Service:
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
         end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
-        # the engine's own end-of-sequence token (its --eos, default the tokenizer's eos): at it the engine ends the
-        # request itself, whatever the server does (see THINK_RESTARTS)
-        self.eos_id = (getattr(tokenizer, "special_ids", None) or {}).get("eos")
+        # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
+        # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the
+        # GLM/Qwen engine ends at every turn-end token of its vocabulary (GLM: <|endoftext|>, <|user|>,
+        # <|observation|>), and its tokenizer names them by their GGUF keys - all of stop_ids then
+        sid = getattr(tokenizer, "special_ids", None) or {}
+        self.eos_ids = {sid["eos"]} if isinstance(sid.get("eos"), int) else set(self.stop_ids)
         # the special literals that stay text inside a message (frontend.mark_literals): every one the vocabulary has
         self.literals = literal_tags(getattr(tokenizer, "special_tokens", None))
 
@@ -3775,7 +3778,7 @@ class Service:
                             # EOS token the engine ends there, though: then the server goes on from the quote with a note
                             # as the server's (the thinking continues; the answer's own markers still end the turn, the
                             # answer's)
-                            if t != self.eos_id:
+                            if t not in self.eos_ids:
                                 continue
                             if think_resume is None or think_restarts >= THINK_RESTARTS:
                                 finish = "stop"
@@ -3792,7 +3795,7 @@ class Service:
                             continue
                         # a marker the model wrote as its answer's text - quoted, in a code fence, a tool call's body - is
                         # not the turn's end (the stream's own parser has the same rule for calls)
-                        quoted = t in self.stop_ids and t != self.eos_id and (
+                        quoted = t in self.stop_ids and t not in self.eos_ids and (
                             parser.call_opened or CALL_START in held + text or parser.in_code_after(held + text))
                         if t in self.stop_ids and not quoted:
                             finish = "stop"
@@ -3851,8 +3854,10 @@ class Service:
                                 # a marker the model wrote as its text - quoted, in a code fence, a template's docs -
                                 # is not the marker: an answer about this very server's markers would end the turn there
                                 # (the stream's own parser has the same rule).  The scan keeps the text
-                                # and looks for a real one, on the next piece.
-                                if parser.in_code_after(held[:cut]) or parser.call_opened or CALL_START in held[:cut]:
+                                # and looks for a real one, on the next piece.  A client's own stop string stops
+                                # wherever it is, as the API says (a closing fence, a newline in code).
+                                if s not in client_stops and (parser.in_code_after(held[:cut]) or parser.call_opened
+                                                              or CALL_START in held[:cut]):
                                     text, held, stopped = held, "", False
                                 else:
                                     text, held, stopped = held[:cut], "", True
