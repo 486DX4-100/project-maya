@@ -4737,10 +4737,29 @@ struct Model::Impl {
                 ok = ok && rows <= room / 2.0;
             }
             if (groups.size() > 1 && ram != ~uint64_t{0}) ok = ok && 2.0 * C * hand_row * (double) devs.size() <= (double) ram / 8.0;
-            if (ok) return C;
+            if (ok) return gfx11_chunk_cap(C);
         }
         return c0;
     }
+    // RDNA 3 / 3.5 (gfx11, HIP): chunks of 4K tokens read a 16K prompt faster than the 32K / 16K default (Strix Halo,
+    // Maya-XS, experts resident: 16K prompt 524 -> 550 tok/s, the first one after a start 475 -> 550; 1K 492, 256
+    // 340) - so the default is capped there; DS4_CHUNK_GFX11=N changes the cap, 0 leaves the default
+    int gfx11_chunk_cap(int C) const {
+#if defined(STRATA_USE_HIP)
+        const char* e = std::getenv("DS4_CHUNK_GFX11");
+        const int cap = e != nullptr ? std::atoi(e) : kGfx11Chunk;
+        if (cap <= 0 || C <= cap || devs.empty()) return C;
+        for (const Dev& d : devs) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, d.id) != cudaSuccess || std::strncmp(prop.gcnArchName, "gfx11", 5) != 0)
+                return C;
+        }
+        return cap / 16 * 16;
+#else
+        return C;
+#endif
+    }
+    static constexpr int kGfx11Chunk = 4096;
     // a device's chunk dimensions in a group of nm members: its heads' width, wo_a groups and FFN share (the widest
     // member's: member 0 takes split128's odd blocks), the attention's and the indexer's slabs (the indexer's scores
     // rows are the context wide - about 64 MB of them)
