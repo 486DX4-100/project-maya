@@ -1649,7 +1649,9 @@ struct Model::Impl {
     // the in-place pages may hold above the load's own (default 6 on Windows; 0 disables); TRIM_MS the pass interval.
     const float ip_trim_gb = [] {
 #if defined(_WIN32)
+        // (a config's env arrives renamed by tools/maya_names.py env_in: read both names, MAYA_ first, as lookup does)
         const char* v = std::getenv("MAYA_DS4_INPLACE_TRIM_GB");
+        if (v == nullptr) v = std::getenv("STRATA_DS4_INPLACE_TRIM_GB");
         return v != nullptr ? (float) std::atof(v) : 6.0f;
 #else
         return 0.0f;
@@ -1657,6 +1659,7 @@ struct Model::Impl {
     }();
     const int ip_trim_ms = [] {
         const char* v = std::getenv("MAYA_DS4_INPLACE_TRIM_MS");
+        if (v == nullptr) v = std::getenv("STRATA_DS4_INPLACE_TRIM_MS");
         return v != nullptr ? std::max(50, std::atoi(v)) : 250;
     }();
     std::atomic<bool> ip_on{false};
