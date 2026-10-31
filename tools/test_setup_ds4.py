@@ -486,14 +486,35 @@ class Gguf(unittest.TestCase):
         with patch.object(maya.S, "gpus", return_value=[{"arch": 86}]), patch.object(maya, "choose", pick), \
                 patch.object(maya.S, "UI", None):
             maya.choose_ds4_quant(args(), {})
-            self.assertFalse(any(x in r for r in rows for x in ("UD-IQ1", "UD-IQ2", "UD-IQ3_XXS", "UD-Q2", "UD-Q3")), rows)
-            self.assertEqual(sum("UD-IQ3_S" in r for r in rows), 1)   # (UD-IQ3_S: the one that is listed)
+            self.assertFalse(any(x in r for r in rows for x in ("UD-IQ1_S", "UD-IQ2", "UD-IQ3_XXS", "UD-Q2", "UD-Q3")), rows)
+            self.assertEqual(sum("UD-IQ3_S" in r for r in rows), 1)   # (UD-IQ3_S and UD-IQ1_M: the listed ones)
+            self.assertEqual(sum("UD-IQ1_M" in r for r in rows), 1)
             rows.clear()
             self.assertEqual(maya.choose_ds4_quant(args(), {"installer": {"ds4_quant": "gguf-iq1_s"}}), "gguf-iq1_s")
             self.assertTrue(any(r.startswith("DeepSeek V4.1 · UD-IQ1_S (233 GB)") for r in rows), rows)
             rows.clear()
             self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="gguf-iq2_xxs"), {}), "gguf-iq2_xxs")
             self.assertEqual(rows, [])
+
+    def test_iq1_m_listed(self):
+        """UD-IQ1_M is a listed choice before UD-IQ3_S, on its own facts (no comparison with Maya-XS)."""
+        rows = []
+
+        def pick(title, intro, opts, default, yes, *x):
+            rows.extend((o[0], o[2]) for o in opts)
+            return default
+        pub = lambda k: k in ("maya-s", "maya-xs")  # noqa: E731
+        with patch.object(maya.S, "gpus", return_value=[{"arch": 86}]), patch.object(maya, "choose", pick), \
+                patch.object(maya.S, "UI", None), patch.object(maya, "ds4_maya_published", pub):
+            maya.choose_ds4_quant(args(), {})
+        names = [r[0] for r in rows]
+        i = next(j for j, n in enumerate(names) if "UD-IQ1_M" in n)
+        self.assertIn("UD-IQ3_S", names[i + 1])
+        self.assertIn("(250 GB)", names[i])
+        for part in ("KLD 0.198", "90.3%", "140 GB", "110 GB", "150 GB"):
+            self.assertIn(part, rows[i][1])
+        self.assertNotIn("better", rows[i][1])
+
 
     def test_iq3_s_listed(self):
         """UD-IQ3_S is a listed choice, between Maya-S and the Q8, with its quality and the memory it wants; the other six

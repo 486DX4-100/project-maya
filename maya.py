@@ -562,7 +562,7 @@ DS4_BY_HAND = ("gguf-q4",)
 # Q6_K or MXFP8; read from the SSD as every quant's).  --ds4-quant names one; as UD-Q4_K_XL, the list shows one only on
 # a PC that has it set up - but for DS4_UD_LISTED, which the list always shows
 DS4_UD = ("gguf-iq1_s", "gguf-iq1_m", "gguf-iq2_xxs", "gguf-q2_k_xl", "gguf-iq3_xxs", "gguf-iq3_s", "gguf-q3_k_xl")
-DS4_UD_LISTED = ("gguf-iq3_s",)   # (UD-IQ3_S: close to Q8's quality; listed between Maya-S and the Q8, the owner, v1.1.43)
+DS4_UD_LISTED = ("gguf-iq1_m", "gguf-iq3_s")   # (UD-IQ3_S: close to Q8's quality; listed between Maya-S and the Q8, the owner, v1.1.43; UD-IQ1_M before UD-IQ3_S, v1.1.44)
 # ... and orcarouter's abliterated model (its refusals removed from the weights) as GGUFs (download_gguf.json's
 # "abliterated": Mix-128G and Mix-256G, the experts in other low-bit types layer by layer; a gated repo, so its download
 # sends the user's Hugging Face token), in <models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/<version>, served under a
@@ -5057,6 +5057,10 @@ def choose_ds4_quant(a, prev: dict) -> str:
     for k in DS4_UD:   # (download_gguf.json's own words: the experts' and dense weights' types, the tables')
         q = ((read_json(DS4_GGUF_MANIFEST).get("quants") or {}).get(DS4_QUANTS[k]) or {})
         about[k] = f"unsloth's GGUF: {q.get('about', 'experts in 1.6-3.5 bits')}; ~{q.get('memory_gb', '?')} GB of VRAM + RAM hold it"
+    about["gguf-iq1_m"] = ("unsloth's UD-IQ1_M: KLD 0.198 against the original, 90.3% the same top token (our scorer; "
+                           "the same scale as the other KLD numbers here); about 140 GB of VRAM + RAM plus 110 GB of "
+                           "n-gram tables (IQ4_NL, not shareable with Maya's Q6_K tables) read from the SSD; for PCs "
+                           "with about 150 GB of VRAM + RAM")
     about["gguf-iq3_s"] = ("unsloth's UD-IQ3_S: close to Q8's quality (KLD 0.061 vs Q8's 0.047; Maya-S 0.119), about 262 GB of "
                            "VRAM + RAM plus the 161 GB n-gram tables read from the SSD; for PCs with about 270 GB or more of "
                            "VRAM + RAM - below that it reads experts from the disk and gets slow")
