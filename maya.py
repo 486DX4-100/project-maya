@@ -5039,7 +5039,10 @@ def choose_ds4_quant(a, prev: dict) -> str:
     about = {"maya-s": "Maya's quant: experts in 2-3 bits, the most of it in memory",
              "maya-m": "Maya's quant: experts in 3.4 bits, closer to the original",
              "maya-xs": "Maya's smallest quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory",
-             "gguf-q8": "unsloth's GGUF: dense weights BF16, experts MXFP4 (DeepSeek's own formats)",
+             "gguf-q8": ("unsloth's GGUF, the closest to the original model (DeepSeek's own formats: dense weights BF16, "
+                         "experts MXFP4): KLD 0.047, 96.4% the same top token as the full-precision original (our scorer, "
+                         "the same scale as the UD-IQ3_S and Maya-S numbers); about 306 GB of VRAM + RAM hold it, plus the "
+                         "203 GB of n-gram tables (MXFP8) read from the SSD - not shareable with Maya's Q6_K tables"),
              "gguf-q4": "unsloth's GGUF: dense weights Q8_0 (less VRAM), experts MXFP4",
              "exl3": "LibertAIDAI's quant, with the DSpark drafter and the vision tower",
              "exl3-3.5": f"closer to the original, slower: ~{DS4_EXL3['exl3-3.5']['memory_gb']} GB of VRAM + RAM "

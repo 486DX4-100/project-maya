@@ -2,7 +2,7 @@
  "_": "DeepSeek-V4.1-Flash-1017 as unsloth's GGUFs for maya-ds4 (maya.py's DeepSeek setup, tools/ds4/pack_gguf.py): dense weights BF16 (UD-Q8_K_XL) or Q8_0 (UD-Q4_K_XL), routed experts MXFP4, the Engram tables MXFP8; the smaller UD quants of unsloth's re-upload of 2026-10-28 (each pinned to that revision: its own \"revision\"; the Engram tables in the last shard, in IQ4_NL, Q5_K, Q6_K or MXFP8 - \"table\"; \"memory_gb\": the files but that shard) - every file pinned to a revision, with its size and sha256. Neither has the DSpark drafter or the vision tower (\"drafter\" and \"vision\" below: from DeepSeek's own checkpoint).",
  "name": "DeepSeek-V4.1-Flash-1017",
  "repo": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
- "revision": "c991b28e7c109eed10a55075ddb46f830b5b3059",
+ "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
  "license": "MIT",
  "quants": {
   "UD-Q8_K_XL": {

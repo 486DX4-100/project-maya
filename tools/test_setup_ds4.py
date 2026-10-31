@@ -478,7 +478,6 @@ class Gguf(unittest.TestCase):
             self.assertIn("/resolve/8a6ec9cf118e785a362ea94ee123c61c70553be6/%s/" % maya.DS4_QUANTS[q],
                           maya.file_url(m, sorted(m["files"])[0]))
             self.assertEqual(maya.Q.shown("deepseek", q), "DeepSeek V4.1 · " + maya.DS4_QUANTS[q])
-        self.assertEqual(maya.ds4_gguf_model("gguf-q8")["revision"], "c991b28e7c109eed10a55075ddb46f830b5b3059")
         rows = []
 
         def pick(title, intro, opts, default, yes, *x):
@@ -632,6 +631,37 @@ class Gguf(unittest.TestCase):
                     with patch.object(maya.shutil, "disk_usage", return_value=SimpleNamespace(free=1e9)), \
                             self.assertRaises(SystemExit):
                         maya.share_file(src, root / "d" / "t.gguf")
+
+    def test_q8_q4_on_the_current_revision_unchanged(self):
+        """UD-Q8_K_XL and UD-Q4_K_XL are pinned to the same revision as the other UD quants (8a6ec9cf); every file's
+        name, size and sha256 is the one pinned before at c991b28e (checked against the Hub), and a folder that holds
+        them whole is valid under either revision - an install made earlier downloads nothing again."""
+        want = {"gguf-q8": "530007912f9637438fff4e34791c9a792ae2436b5a16913f5837e6e63e356573",
+                "gguf-q4": "f339e525a29bd127db40eddb2d215a7d7d1ce10fdc8793eb90c20d4821b8f299"}
+        man = json.loads(maya.DS4_GGUF_MANIFEST.read_text(encoding="utf-8"))
+        for q, digest in want.items():
+            m = maya.ds4_gguf_model(q)
+            self.assertEqual(m["revision"], "8a6ec9cf118e785a362ea94ee123c61c70553be6")
+            files = man["quants"][maya.DS4_QUANTS[q]]["files"]
+            self.assertEqual(hashlib.sha256("\n".join("%s %d %s" % (k, v[0], v[1]) for k, v in sorted(files.items()))
+                                            .encode()).hexdigest(), digest)
+            tmp = Path(tempfile.mkdtemp())
+            d = tmp / maya.DS4_QUANTS[q]
+            d.mkdir()
+            small = json.loads(json.dumps(man))
+            for i, k in enumerate(sorted(small["quants"][maya.DS4_QUANTS[q]]["files"])):
+                small["quants"][maya.DS4_QUANTS[q]]["files"][k][0] = i + 1
+            for rev in ("c991b28e7c109eed10a55075ddb46f830b5b3059", "8a6ec9cf118e785a362ea94ee123c61c70553be6"):
+                small["revision"] = rev                       # (the folder was filled under the old revision)
+                p = tmp / "download_gguf.json"
+                p.write_text(json.dumps(small), encoding="utf-8")
+                with patch.object(maya, "DS4_GGUF_MANIFEST", p):
+                    mm = maya.ds4_gguf_model(q)
+                    self.assertEqual(mm["revision"], rev)
+                    for i, n in enumerate(sorted(mm["files"])):
+                        (d / n).write_bytes(b"x" * (i + 1))
+                    self.assertEqual([n for n in mm["files"] if maya.file_incomplete(mm, d / n)], [])
+                    self.assertIsNone(maya.ds4_earlier(mm, d))
 
     def test_earlier_layout_pinned(self):
         """unsloth's layout before its 2026-10-19 re-shard: 10 shards at dc788bdb, each with its size and sha256."""
