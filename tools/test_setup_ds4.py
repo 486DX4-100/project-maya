@@ -487,13 +487,63 @@ class Gguf(unittest.TestCase):
         with patch.object(maya.S, "gpus", return_value=[{"arch": 86}]), patch.object(maya, "choose", pick), \
                 patch.object(maya.S, "UI", None):
             maya.choose_ds4_quant(args(), {})
-            self.assertFalse(any("UD-IQ" in r or "UD-Q2" in r or "UD-Q3" in r for r in rows), rows)
+            self.assertFalse(any(x in r for r in rows for x in ("UD-IQ1", "UD-IQ2", "UD-IQ3_XXS", "UD-Q2", "UD-Q3")), rows)
+            self.assertEqual(sum("UD-IQ3_S" in r for r in rows), 1)   # (UD-IQ3_S: the one that is listed)
             rows.clear()
             self.assertEqual(maya.choose_ds4_quant(args(), {"installer": {"ds4_quant": "gguf-iq1_s"}}), "gguf-iq1_s")
             self.assertTrue(any(r.startswith("DeepSeek V4.1 · UD-IQ1_S (233 GB)") for r in rows), rows)
             rows.clear()
             self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="gguf-iq2_xxs"), {}), "gguf-iq2_xxs")
             self.assertEqual(rows, [])
+
+    def test_iq3_s_listed(self):
+        """UD-IQ3_S is a listed choice, between Maya-S and the Q8, with its quality and the memory it wants; the other six
+        UD quants stay by hand."""
+        rows = []
+
+        def pick(title, intro, opts, default, yes, *x):
+            rows.extend((o[0], o[2]) for o in opts)
+            return default
+        with patch.object(maya.S, "gpus", return_value=[{"arch": 86}]), patch.object(maya, "choose", pick), \
+                patch.object(maya.S, "UI", None), patch.object(maya, "ds4_maya_published", lambda k: k == "maya-s"):
+            maya.choose_ds4_quant(args(), {})
+        names = [r[0] for r in rows]
+        i = next(j for j, n in enumerate(names) if "UD-IQ3_S" in n)
+        self.assertTrue(names[0].startswith("DeepSeek V4.1 · Maya-S"))
+        self.assertIn("UD-Q8_K_XL", names[i + 1])
+        self.assertIn("(424 GB)", names[i])
+        for part in ("KLD 0.061 vs Q8's 0.047", "Maya-S 0.119", "262 GB", "161 GB", "270 GB or more"):
+            self.assertIn(part, rows[i][1])
+        self.assertEqual(maya.ds4_memory_gb("gguf-iq3_s"), 263)
+
+    def test_free_space_per_disk(self):
+        """A shard that is a link to another disk is counted against that disk, not the model folder's."""
+        m = {"about": "x", "repo": "r", "folder": "f", "revision": "v", "download_gb": 30.0,
+             "files": {"a.gguf": int(10e9), "b.gguf": int(20e9)}, "sha256": {"a.gguf": "0", "b.gguf": "0"}}
+        root = Path(tempfile.mkdtemp())
+        d, other = root / "m", root / "other"
+        d.mkdir()
+        other.mkdir()
+        (d / "b.gguf").symlink_to(other / "b.gguf")
+        shards = [d / "a.gguf", d / "b.gguf"]
+        disks = {str(d): 1, str(other): 2}
+        free = {1: 15e9, 2: 100e9}
+
+        def usage(p):
+            return SimpleNamespace(free=free[disks[str(maya.existing(Path(p)))]])
+        with patch.object(maya, "disk_of", lambda p: disks[str(Path(p))]), \
+                patch.object(maya.shutil, "disk_usage", usage), patch.object(maya, "say", lambda *a: None), \
+                patch.object(maya, "hf_token", return_value="t"), patch.object(maya, "ask", return_value="n"), \
+                patch.object(maya, "rotational", return_value=False):
+            self.assertEqual(maya.linked_downloads(m, d, shards), {str(other): (100.0, 20.0)})
+            # 30 GB do not fit the folder's 15 GB free, but only 10 GB land there (20 GB go to the other disk's 100)
+            self.assertFalse(maya.offer_download(args(download_model=False), "x", d, shards, m))
+            free[2] = 21e9
+            with self.assertRaises(SystemExit):            # (20 + 3 GB wanted on the other disk, 21 free)
+                maya.offer_download(args(download_model=False), "x", d, shards, m)
+            free.update({1: 11e9, 2: 100e9})
+            with self.assertRaises(SystemExit):            # (10 + 3 GB wanted in the folder, 11 free)
+                maya.offer_download(args(download_model=False), "x", d, shards, m)
 
     def test_earlier_layout_pinned(self):
         """unsloth's layout before its 2026-10-19 re-shard: 10 shards at dc788bdb, each with its size and sha256."""

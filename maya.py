@@ -560,8 +560,9 @@ DS4_BY_HAND = ("gguf-q4",)
 # unsloth's smaller UD quants (its re-upload of 2026-10-28, each pinned to that revision in download_gguf.json): the
 # experts 1.6-3.5 bits by layer, the dense weights Q5_K - BF16, the Engram tables in the last shard (IQ4_NL, Q5_K,
 # Q6_K or MXFP8; read from the SSD as every quant's).  --ds4-quant names one; as UD-Q4_K_XL, the list shows one only on
-# a PC that has it set up
+# a PC that has it set up - but for DS4_UD_LISTED, which the list always shows
 DS4_UD = ("gguf-iq1_s", "gguf-iq1_m", "gguf-iq2_xxs", "gguf-q2_k_xl", "gguf-iq3_xxs", "gguf-iq3_s", "gguf-q3_k_xl")
+DS4_UD_LISTED = ("gguf-iq3_s",)   # (UD-IQ3_S: close to Q8's quality; listed between Maya-S and the Q8, the owner, v1.1.43)
 # ... and orcarouter's abliterated model (its refusals removed from the weights) as GGUFs (download_gguf.json's
 # "abliterated": Mix-128G and Mix-256G, the experts in other low-bit types layer by layer; a gated repo, so its download
 # sends the user's Hugging Face token), in <models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/<version>, served under a
@@ -2554,6 +2555,40 @@ def fetch_files(m: dict, shards: list, missing: list, urls: dict) -> None:
         S.progress()
 
 
+def disk_of(path: Path):
+    """An id of the disk path is on (its st_dev)."""
+    return os.stat(path).st_dev
+
+
+def linked_downloads(m: dict, d: Path, missing: list) -> dict:
+    """The part of a download that lands on another disk than d's: a shard that is a link (a symlink, on Windows too)
+    to a file on that disk is written there, not into d.  {the folder it lands in: (GB free on that disk, GB still to
+    download into it)}; only for the GGUFs whose shard sizes the manifest lists (m["files"])."""
+    out: dict = {}
+    if "files" not in m:
+        return out
+    try:
+        home = disk_of(existing(d))
+    except OSError:
+        return out
+    for s in missing:
+        if not s.is_symlink():
+            continue
+        try:
+            target = Path(os.path.realpath(s))
+            where = existing(target.parent)
+            if disk_of(where) == home:
+                continue
+            have = target.stat().st_size if target.exists() else 0
+            need = max(0, m["files"].get(hf_name(m, s), 0) - have) / 1e9
+            free = shutil.disk_usage(where).free / 1e9
+        except (OSError, KeyError):
+            continue
+        prev = out.get(str(where), (free, 0.0))
+        out[str(where)] = (free, prev[1] + need)
+    return out
+
+
 def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) -> bool:
     """Shows what would be downloaded - the source, the size, the exact commands - and downloads only after a yes
     (or --download-model).  False: nothing was downloaded."""
@@ -2585,11 +2620,19 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
     also = float(m.get("also_gb") or 0)   # (what the setup downloads after it, beside it: the space for both)
     if also:
         say(f"  Then {m.get('also_what', 'more files')}: {also:.0f} GB more.")
-    if free < remaining + also + 3:
-        fail(f"not enough free space in {d}: about {remaining + also + 3:.0f} GB are needed (the model" +
+    linked = linked_downloads(m, d, missing)   # (a shard that is a link to another disk lands on that disk)
+    here = remaining - sum(need for _, need in linked.values())
+    for where, (gb_free, need) in linked.items():
+        say(f"    {need:.0f} GB of it, linked from there, into {where}   ({gb_free:.0f} GB free)")
+    if free < here + also + 3:
+        fail(f"not enough free space in {d}: about {here + also + 3:.0f} GB are needed (the model" +
              (f", {m.get('also_what', 'more files')}" if also else "") + " + its pack)",
              f"free some space, or put the model on another drive: {ME} --setup --models-dir " +
              (r"D:\Maya-models" if WIN else "/path/on/nvme"))
+    for where, (gb_free, need) in linked.items():
+        if gb_free < need + 3:
+            fail(f"not enough free space in {where}: about {need + 3:.0f} GB of the model are linked into it from {d}",
+                 "free some space there, or link the files to another drive")
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: the engine reads experts from these files while it answers - use an "
              "NVMe SSD (--models-dir)")
@@ -4982,7 +5025,8 @@ def choose_ds4_quant(a, prev: dict) -> str:
         ccs = []
     exl3_ok = hip or not ccs or max(ccs) >= DS4_MIN_CC
     before = (prev.get("installer") or {}).get("ds4_quant")
-    keys = maya + list(DS4_ABL) + [k for k in DS4_QUANTS if k not in DS4_MAYA + DS4_ABL and (exl3_ok or k not in DS4_EXL3)
+    keys = maya + list(DS4_ABL) + list(DS4_UD_LISTED) + [
+        k for k in DS4_QUANTS if k not in DS4_MAYA + DS4_ABL + DS4_UD_LISTED and (exl3_ok or k not in DS4_EXL3)
                                    and (k not in DS4_BY_HAND + DS4_UD or k == before)]   # (a chosen-by-hand one: only where it is installed)
     abl = ds4_abl_recommended(hip)
     default = before if before in keys else maya[0] if maya else DS4_DEFAULT_QUANT
@@ -5010,6 +5054,9 @@ def choose_ds4_quant(a, prev: dict) -> str:
     for k in DS4_UD:   # (download_gguf.json's own words: the experts' and dense weights' types, the tables')
         q = ((read_json(DS4_GGUF_MANIFEST).get("quants") or {}).get(DS4_QUANTS[k]) or {})
         about[k] = f"unsloth's GGUF: {q.get('about', 'experts in 1.6-3.5 bits')}; ~{q.get('memory_gb', '?')} GB of VRAM + RAM hold it"
+    about["gguf-iq3_s"] = ("unsloth's UD-IQ3_S: close to Q8's quality (KLD 0.061 vs Q8's 0.047; Maya-S 0.119), about 262 GB of "
+                           "VRAM + RAM plus the 161 GB n-gram tables read from the SSD; for PCs with about 270 GB or more of "
+                           "VRAM + RAM - below that it reads experts from the disk and gets slow")
     label = {k: (Q.shown("deepseek", k, gb.get(k)), about[k]) for k in DS4_QUANTS}
     pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
                                              "the memory: the experts that do not", "fit in VRAM are read from RAM and "
