@@ -941,6 +941,18 @@ class Collapse(unittest.TestCase):
         self.assertEqual(LG.collapse(msgs).messages[3], {"role": "assistant", "content": msgs[5]["content"]})
         self.assertEqual(msgs[3]["reasoning_content"], self.STUCK)      # the request's own messages stay as sent
 
+    def test_content_as_parts(self):
+        # #717: an assistant message's content may be a list of OpenAI parts; it must not break the collapse
+        self.assertEqual(LG._text([{"type": "text", "text": "a"}, {"type": "image_url"}, "x", {"text": "b"}]), "a b")
+        self.assertEqual(LG._text(None), "")
+        msgs = self.turns(4, new=lambda i: f" Found: claim {i}." if i == 2 else "")
+        for m in msgs:
+            if m["role"] == "assistant":
+                m["content"] = [{"type": "text", "text": m["content"]}]
+        c = LG.collapse(msgs)
+        self.assertEqual(c.rounds, 3)
+        self.assertTrue(LG.go_on({"content": [{"type": "text", "text": "continue"}]}))
+
     def test_a_check_run_again_in_a_row(self):
         msgs = [{"role": "user", "content": "x"}]
         for i, n in enumerate((12, 15, 12, 15)):

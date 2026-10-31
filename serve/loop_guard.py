@@ -328,12 +328,20 @@ GO_ON = re.compile(r"(?i)\s*(please\s+)?(continue|proceed|go on|go ahead|keep go
                    r"yes|y|sure|do it)\s*[.!]*\s*")
 
 
+def _text(c) -> str:
+    """A message's content as text: a string as is; a list of content parts (OpenAI form) by its text parts, joined.
+    Anything else (None, a part without text) is ""."""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(p.get("text", "") for p in c if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return ""
+
+
 def go_on(m: dict) -> bool:
     """A user message that only says to go on ("continue", "proceed", "ok"): it says nothing new, so it does not
     start the count over (a user's "continue" set GLM-5.3 off on the same loop again, twice)."""
-    c = m.get("content")
-    text = c if isinstance(c, str) else " ".join(p.get("text", "") for p in c or [] if isinstance(p, dict))
-    return bool(GO_ON.fullmatch(text))
+    return bool(GO_ON.fullmatch(_text(m.get("content"))))
 
 
 def _gist(result: str) -> str:
@@ -607,14 +615,14 @@ def collapse(messages: list[dict]) -> Collapse | None:
             # a round that repeats: the call and its result go, and the thinking around them (the loop's own
             # talk); text the model wrote to the user, if new, stays
             rounds += 1
-            if (m.get("content") or "").strip():
+            if _text(m.get("content")).strip():
                 out.append({"role": "assistant", "content": m["content"]})
             i = j
             continue
         made.update(keys)
         if keys:
             last = gists
-        if (m.get("content") or "").strip() or (m.get("reasoning_content") or "").strip() or m.get("tool_calls"):
+        if _text(m.get("content")).strip() or (m.get("reasoning_content") or "").strip() or m.get("tool_calls"):
             out.append(m)
         i += 1
     return Collapse(out, paras, rounds) if paras or rounds else None
