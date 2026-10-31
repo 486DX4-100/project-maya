@@ -4,6 +4,14 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.44 - 2026-10-31
+
+DeepSeek-V4.1-Flash's setup lists one more of unsloth's quants, UD-IQ1_M, for PCs with about 150 GB of VRAM + RAM, and the Q8 now says in the setup how close it is to the original.
+
+- **UD-IQ1_M in the setup's list** (`--ds4-quant gguf-iq1_m`): unsloth's UD-IQ1_M, about 140 GB of VRAM + RAM plus 110 GB of n-gram tables read from the SSD (a 250 GB download). It sits after Maya's own quants, before UD-IQ3_S.
+- **The Q8 (UD-Q8_K_XL) in the setup:** its line now gives its quality next to the others' (the closest to the original model), and it and UD-Q4_K_XL are pinned to unsloth's current revision. The files are the same, so an existing install downloads nothing again.
+- **docs/MODELS.md:** the unsloth rows say in short who each is for.
+
 ## v1.1.43 - 2026-10-31
 
 DeepSeek-V4.1-Flash now runs unsloth's DeepSeek GGUF quants, and the setup lists UD-IQ3_S: close to Q8's quality for PCs
