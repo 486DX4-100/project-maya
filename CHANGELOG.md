@@ -4,6 +4,12 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.45 - 2026-10-31
+
+A fix for DeepSeek-V4.1-Flash on one GPU.
+
+- **DeepSeek on one GPU: no more illegal memory access after a few long prompts.** After several requests of different lengths, a long prompt on one GPU could overlap experts the engine was still loading in the background, and the next step failed with an illegal memory access (often reported later as an error in an unrelated call). The background loads are now finished before a prompt uses that memory. Prompts of 32K, 64K and 128K on one GPU run, with the same answers and the same speed as before. The problem had been there since at least v1.1.41; setups with two or more GPUs were not affected.
+
 ## v1.1.44 - 2026-10-31
 
 DeepSeek-V4.1-Flash's setup lists one more of unsloth's quants, UD-IQ1_M, for PCs with about 150 GB of VRAM + RAM, and the Q8 now says in the setup how close it is to the original.
