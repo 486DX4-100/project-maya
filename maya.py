@@ -5189,6 +5189,95 @@ def ds4_abl_engram_step(a, d: Path, models: Path) -> Path | None:
     return e
 
 
+def ds4_shared_tables(quant: str, d: Path, models: Path, m: dict) -> dict | None:
+    """One copy of the Q6_K n-gram (Engram) tables for unsloth's UD-IQ3_S and Maya's quants, whichever is on the disk
+    first (download_gguf.json: unsloth's table shard holds the same bytes as Maya's pair of shards, compared in full;
+    "tables_as_maya").  Only when the other side's files are whole, by size AND sha256 (never assumed): a UD quant is
+    then set up without its table shard (the Maya pair is read), a Maya quant without its pair (unsloth's shard is
+    read).  None: nothing to share.  Else {"model": m without the files left out, "without": their names, "src":
+    {name: path} of the copy to read, "folder": where the pack reads it from, "what": a sentence for the user}."""
+    man = read_json(DS4_GGUF_MANIFEST)
+    pairs = {t: [Path(n).name for n in names] for t, names in ((man.get("abliterated") or {}).get("engram") or {})
+             .get("from", {}).items()}
+    uds = {k: v for k, v in (man.get("quants") or {}).items() if v.get("tables_as_maya")}
+
+    def whole(path: Path, size: int, sha: str) -> bool:
+        try:
+            return path.is_file() and path.stat().st_size == size and sha256_checked(path, sha)
+        except OSError:
+            return False
+
+    def trimmed(names: list) -> dict:
+        files = {k: v for k, v in m["files"].items() if k not in names}
+        return dict(m, files=files, sha256={k: v for k, v in m["sha256"].items() if k in files},
+                    download_gb=sum(files.values()) / 1e9)
+    mine = DS4_QUANTS[quant]
+    if mine in uds:                                      # unsloth's quant, Maya's pair there?
+        table = Path(uds[mine]["table"]).name
+        if table not in m["files"] or not pairs:
+            return None
+        for tier, names in pairs.items():
+            q = ((man.get("maya") or {}).get("quants") or {}).get(tier, {}).get("files") or {}
+            full = {Path(n).name: v for n, v in q.items() if Path(n).name in names}
+            for where in (d.parent / "Engram-Q6_K", models / f"{DS4}-Maya-GGUF" / tier):
+                if len(full) == len(names) and all(whole(where / n, v[0], v[1]) for n, v in full.items()):
+                    return {"model": trimmed([table]), "without": [table], "src": {n: where / n for n in full},
+                            "folder": d.parent / "Engram-Q6_K",
+                            "what": f"Maya's Q6_K n-gram tables ({tier}'s pair of shards, {where}) are read for "
+                                    f"{mine}'s too: its own table shard ({table}) is left out"}
+        return None
+    tier = mine                                          # a Maya quant, unsloth's shard there?
+    names = pairs.get(tier)
+    if not names or not all(n in m["files"] for n in names):
+        return None
+    if all(whole(d / n, m["files"][n], m["sha256"][n]) for n in names):
+        return None                                      # (its own pair is there already)
+    for ud, v in uds.items():
+        table = Path(v["table"]).name
+        want = {Path(n).name: x for n, x in v["files"].items()}[table]
+        where = models / f"{DS4}-GGUF" / ud
+        if whole(where / table, want[0], want[1]):
+            return {"model": trimmed(names), "without": names, "src": {table: where / table},
+                    "folder": d.parent / "Engram-UD-Q6_K",
+                    "what": f"unsloth's {ud} table shard ({where / table}) holds the same Q6_K n-gram tables as "
+                            f"{tier}'s pair of shards: read for {tier} too, the pair is left out"}
+    return None
+
+
+def share_file(src: Path, dst: Path) -> str:
+    """dst as src's one copy: already there, else a hard link (same disk), else a symbolic link, else a copy.  Returns
+    which ("there", "hard link", "symbolic link" or "copy")."""
+    if dst.exists() or dst.is_symlink():
+        if dst.exists() and dst.stat().st_size == src.stat().st_size:
+            return "there"
+        dst.unlink()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(src, dst)
+        return "hard link"
+    except OSError:
+        pass
+    try:
+        os.symlink(src.resolve(), dst)
+        return "symbolic link"
+    except OSError:
+        pass
+    need = src.stat().st_size / 1e9
+    if shutil.disk_usage(dst.parent).free / 1e9 < need + 3:
+        fail(f"not enough free space in {dst.parent} to copy {src.name} ({need:.0f} GB): it could not be linked",
+             "free some space, or put the models on one drive (--models-dir)")
+    shutil.copy2(src, dst)
+    return "copy"
+
+
+def ds4_share_step(plan: dict) -> Path:
+    """Puts the shared tables where the pack reads them (plan["folder"]) and says what was done."""
+    how = {share_file(p, plan["folder"] / n) for n, p in plan["src"].items()}
+    ok(f"the n-gram (Engram) tables: {plan['what']}; {'/'.join(sorted(how))} into {plan['folder']}"
+       + ("" if "copy" in how else " (no second copy of the 161 GB)"))
+    return plan["folder"]
+
+
 def ds4_kv_gb(ctx: int, gpus: int = 1) -> float:
     """GB of VRAM the context's caches take, on all the GPUs together (each holds its layers' caches, every member of
     a tensor-parallel group the group's: counted on each GPU - the upper bound)."""
@@ -5479,6 +5568,9 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     if quant in DS4_ABL and not ds4_abl_engram_there(d, models):   # (the tables follow: room for them too)
         m = dict(m, also_gb=ds4_abl_engram_gb(), also_what="Maya's Q6_K n-gram tables, downloaded after it")
     old = ds4_earlier(m, d) if gguf else None          # (an earlier layout of the files, whole: used as it is)
+    shared = ds4_shared_tables(quant, d, models, m) if gguf and old is None and quant not in DS4_ABL else None
+    if shared:                                         # (the same Q6_K tables are there: unsloth's UD-IQ3_S <-> Maya's)
+        m = shared["model"]
     files = ds4_model_step(a, d, old or m)             # 5
     if files is None:
         return None
@@ -5493,6 +5585,8 @@ def set_up_ds4(a, prev: dict) -> Path | None:
         engram = ds4_abl_engram_step(a, d, models)
         if engram is None:
             return None
+    if shared:
+        engram, without = ds4_share_step(shared), shared["without"]
     drafter = gguf and ds4_drafter_step(a, d.parent / "dspark", quant)   # (the EXL3 quant has its own)
     own = ds4_quant_drafter(quant) if gguf else None   # (Maya-XS: its own drafter beside the shared one)
     dj = d.parent / "dspark" / own["json"] if own is not None and drafter else None

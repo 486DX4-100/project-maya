@@ -545,6 +545,91 @@ class Gguf(unittest.TestCase):
             with self.assertRaises(SystemExit):            # (10 + 3 GB wanted in the folder, 11 free)
                 maya.offer_download(args(download_model=False), "x", d, shards, m)
 
+    def _tables(self):
+        """Small stand-ins for the table files, and the manifest that names them."""
+        models = Path(tempfile.mkdtemp()) / "models"
+        man = json.loads(maya.DS4_GGUF_MANIFEST.read_text(encoding="utf-8"))
+        pair = man["abliterated"]["engram"]["from"]["Maya-XS"]
+
+        def mk(path, data):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            return [len(data), hashlib.sha256(data).hexdigest()]
+        return models, man, pair, man["quants"]["UD-IQ3_S"]["table"], mk
+
+    def test_shared_tables_unsloth_after_maya(self):
+        """UD-IQ3_S set up where Maya's Q6_K pair is whole (size and sha256): its table shard is left out and the pair is
+        read, linked (one copy); a damaged pair, or another UD quant, shares nothing."""
+        models, man, pair, table, mk = self._tables()
+        src = models / "DeepSeek-V4.1-Flash-1017-Maya-GGUF" / "Maya-XS"
+        for n in pair:
+            man["maya"]["quants"]["Maya-XS"]["files"][n] = mk(src / Path(n).name, Path(n).name.encode() * 3)
+        d = models / "DeepSeek-V4.1-Flash-1017-GGUF" / "UD-IQ3_S"
+        d.mkdir(parents=True)
+        real = maya.read_json
+        full = maya.ds4_gguf_model("gguf-iq3_s")
+        with patch.object(maya, "read_json", lambda p: man if Path(p) == maya.DS4_GGUF_MANIFEST else real(p)), \
+                patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None):
+            plan = maya.ds4_shared_tables("gguf-iq3_s", d, models, full)
+            self.assertEqual(plan["without"], [Path(table).name])
+            self.assertNotIn(Path(table).name, plan["model"]["files"])
+            self.assertEqual(len(plan["model"]["files"]), len(full["files"]) - 1)
+            self.assertAlmostEqual(plan["model"]["download_gb"], full["download_gb"] - 161.28, delta=0.05)
+            e = maya.ds4_share_step(plan)
+            self.assertEqual(e, d.parent / "Engram-Q6_K")
+            for n in pair:
+                self.assertEqual((e / Path(n).name).stat().st_ino, (src / Path(n).name).stat().st_ino)
+            self.assertIsNone(maya.ds4_shared_tables("gguf-iq3_xxs", d, models, maya.ds4_gguf_model("gguf-iq3_xxs")))
+            (src / Path(pair[0]).name).write_bytes(b"damaged")                    # (the pair no longer matches)
+            for x in e.iterdir():
+                x.unlink()
+            self.assertIsNone(maya.ds4_shared_tables("gguf-iq3_s", d, models, full))
+
+    def test_shared_tables_maya_after_unsloth(self):
+        """Maya-XS set up where UD-IQ3_S's table shard is whole (size and sha256): its pair of shards is left out and
+        unsloth's shard is read; its own pair there already, or unsloth's shard damaged: nothing to share."""
+        models, man, pair, table, mk = self._tables()
+        ud = models / "DeepSeek-V4.1-Flash-1017-GGUF" / "UD-IQ3_S" / Path(table).name
+        man["quants"]["UD-IQ3_S"]["files"][table] = mk(ud, b"unsloth table")
+        d = models / "DeepSeek-V4.1-Flash-1017-Maya-GGUF" / "Maya-XS"
+        d.mkdir(parents=True)
+        real = maya.read_json
+        full = maya.ds4_gguf_model("maya-xs")
+        with patch.object(maya, "read_json", lambda p: man if Path(p) == maya.DS4_GGUF_MANIFEST else real(p)), \
+                patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None):
+            plan = maya.ds4_shared_tables("maya-xs", d, models, full)
+            self.assertEqual(plan["without"], [Path(n).name for n in pair])
+            self.assertEqual(len(plan["model"]["files"]), len(full["files"]) - 2)
+            self.assertEqual(list(plan["src"]), [ud.name])
+            e = maya.ds4_share_step(plan)
+            self.assertEqual(e, d.parent / "Engram-UD-Q6_K")
+            self.assertEqual([x.name for x in e.glob("*.gguf")], [ud.name])
+            self.assertEqual((e / ud.name).stat().st_ino, ud.stat().st_ino)
+            ud.write_bytes(b"x")
+            self.assertIsNone(maya.ds4_shared_tables("maya-xs", d, models, full))     # (unsloth's shard damaged)
+            ud.write_bytes(b"unsloth table")
+            for n in pair:                                                              # (Maya's own pair is there)
+                man["maya"]["quants"]["Maya-XS"]["files"][n] = mk(d / Path(n).name, b"mine" + n.encode())
+            self.assertIsNone(maya.ds4_shared_tables("maya-xs", d, models, maya.ds4_gguf_model("maya-xs")))
+
+    def test_share_file_fallbacks(self):
+        """The one copy: a hard link, else a symbolic link, else a copy (with room for it); a file there already stays."""
+        root = Path(tempfile.mkdtemp())
+        src = root / "s" / "t.gguf"
+        src.parent.mkdir()
+        src.write_bytes(b"0123456789")
+        with patch.object(maya, "fail", side_effect=SystemExit):
+            self.assertEqual(maya.share_file(src, root / "a" / "t.gguf"), "hard link")
+            self.assertEqual(maya.share_file(src, root / "a" / "t.gguf"), "there")
+            with patch.object(maya.os, "link", side_effect=OSError):
+                self.assertEqual(maya.share_file(src, root / "b" / "t.gguf"), "symbolic link")
+                with patch.object(maya.os, "symlink", side_effect=OSError):
+                    self.assertEqual(maya.share_file(src, root / "c" / "t.gguf"), "copy")
+                    self.assertEqual((root / "c" / "t.gguf").read_bytes(), b"0123456789")
+                    with patch.object(maya.shutil, "disk_usage", return_value=SimpleNamespace(free=1e9)), \
+                            self.assertRaises(SystemExit):
+                        maya.share_file(src, root / "d" / "t.gguf")
+
     def test_earlier_layout_pinned(self):
         """unsloth's layout before its 2026-10-19 re-shard: 10 shards at dc788bdb, each with its size and sha256."""
         for q, gb in (("gguf-q8", 508.4), ("gguf-q4", 500.7)):

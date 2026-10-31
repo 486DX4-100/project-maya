@@ -350,6 +350,7 @@
   },
   "UD-IQ3_S": {
    "about": "experts IQ2_S / IQ3_XXS / IQ3_S / Q3_K / MXFP4 by layer, dense weights Q8_0 / BF16, the Engram tables Q6_K (in its last shard)",
+   "tables_as_maya": "its table shard holds the same bytes as Maya's Q6_K pair (abliterated.engram.from; compared in full, 2026-10-30): either is read for both",
    "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
    "files": {
     "UD-IQ3_S/DeepSeek-V4.1-Flash-1017-UD-IQ3_S-00001-of-00008.gguf": [
