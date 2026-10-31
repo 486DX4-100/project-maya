@@ -5225,7 +5225,8 @@ def ds4_shared_tables(quant: str, d: Path, models: Path, m: dict) -> dict | None
         for tier, names in pairs.items():
             q = ((man.get("maya") or {}).get("quants") or {}).get(tier, {}).get("files") or {}
             full = {Path(n).name: v for n, v in q.items() if Path(n).name in names}
-            for where in (d.parent / "Engram-Q6_K", models / f"{DS4}-Maya-GGUF" / tier):
+            for where in (models / f"{DS4}-Maya-GGUF" / tier, d.parent / "Engram-Q6_K"):   # (Maya's folder first: its
+                # files were checked there, a rerun does not read the 161 GB again through the link)
                 if len(full) == len(names) and all(whole(where / n, v[0], v[1]) for n, v in full.items()):
                     return {"model": trimmed([table]), "without": [table], "src": {n: where / n for n in full},
                             "folder": d.parent / "Engram-Q6_K",
