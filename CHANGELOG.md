@@ -4,6 +4,15 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.46 - 2026-10-31
+
+DeepSeek reads long prompts about 5% faster on AMD Strix / Gorgon Halo, and three fixes.
+
+- **Strix / Gorgon Halo:** DeepSeek reads a 16K prompt about 5% faster (the prompt is read in 4K-token pieces on these GPUs, with the same answers).
+- **Long agent sessions:** a request whose messages carry their content as parts no longer fails with an error (#717).
+- **Tool calls:** a tool call with an unclosed parameter tag is handled as a malformed call instead of failing the request (#706).
+- **DeepSeek on Windows:** the in-place memory trim settings given in a config now reach the engine (#728).
+
 ## v1.1.45 - 2026-10-31
 
 A fix for DeepSeek-V4.1-Flash on one GPU.
