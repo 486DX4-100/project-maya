@@ -568,9 +568,12 @@ class Gguf(unittest.TestCase):
         d.mkdir(parents=True)
         real = maya.read_json
         full = maya.ds4_gguf_model("gguf-iq3_s")
+        said = []
         with patch.object(maya, "read_json", lambda p: man if Path(p) == maya.DS4_GGUF_MANIFEST else real(p)), \
-                patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None):
+                patch.object(maya, "say", lambda *a: said.append(" ".join(map(str, a)))), \
+                patch.object(maya, "ok", lambda *a: None):
             plan = maya.ds4_shared_tables("gguf-iq3_s", d, models, full)
+            self.assertEqual(sum("are the same bytes" in x for x in said), 1)         # (told once, before the sha256 reads)
             self.assertEqual(plan["without"], [Path(table).name])
             self.assertNotIn(Path(table).name, plan["model"]["files"])
             self.assertEqual(len(plan["model"]["files"]), len(full["files"]) - 1)

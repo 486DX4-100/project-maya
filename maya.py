@@ -5201,8 +5201,14 @@ def ds4_shared_tables(quant: str, d: Path, models: Path, m: dict) -> dict | None
              .get("from", {}).items()}
     uds = {k: v for k, v in (man.get("quants") or {}).items() if v.get("tables_as_maya")}
 
+    told = []
+
     def whole(path: Path, size: int, sha: str) -> bool:
         try:
+            if path.is_file() and path.stat().st_size == size and not told:
+                told.append(1)
+                say("  The other model's n-gram (Engram) tables are on this disk: checking they are the same bytes "
+                    "(sha256, read once - a few minutes), so that there is one copy of them ...")
             return path.is_file() and path.stat().st_size == size and sha256_checked(path, sha)
         except OSError:
             return False
@@ -5368,10 +5374,11 @@ def ds4_link_engram(d: Path, m: dict, models: Path, prev: dict):
             break
 
 
-def ds4_model_step(a, d: Path, m: dict):
+def ds4_model_step(a, d: Path, m: dict, announce: bool = True):
     """The model's files in d (downloaded when they are not there): their list, or None when nothing was
-    downloaded."""
-    step(5, f"the model ({DS4})")
+    downloaded.  announce=False: the step heading was printed already."""
+    if announce:
+        step(5, f"the model ({DS4})")
     files = [d / n for n in m["files"]]
     if any(file_incomplete(m, f) for f in files) and not offer_download(a, DS4, d, files, m):
         return None
@@ -5568,10 +5575,15 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     if quant in DS4_ABL and not ds4_abl_engram_there(d, models):   # (the tables follow: room for them too)
         m = dict(m, also_gb=ds4_abl_engram_gb(), also_what="Maya's Q6_K n-gram tables, downloaded after it")
     old = ds4_earlier(m, d) if gguf else None          # (an earlier layout of the files, whole: used as it is)
-    shared = ds4_shared_tables(quant, d, models, m) if gguf and old is None and quant not in DS4_ABL else None
+    shared = None
+    look = gguf and old is None and quant not in DS4_ABL
+    if look:                                           # (its checks of the other model's tables print under the heading)
+        step(5, f"the model ({DS4})")
+        shared = ds4_shared_tables(quant, d, models, m)
     if shared:                                         # (the same Q6_K tables are there: unsloth's UD-IQ3_S <-> Maya's)
+        ok(f"{shared['what']}: {(m['download_gb'] - shared['model']['download_gb']):.0f} GB less to download")
         m = shared["model"]
-    files = ds4_model_step(a, d, old or m)             # 5
+    files = ds4_model_step(a, d, old or m, announce=not look)             # 5
     if files is None:
         return None
     if gguf and old is None:
