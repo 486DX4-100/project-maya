@@ -182,6 +182,10 @@ button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var
   .card { padding: 16px; }
   .speed__big { font-size: 40px; }
   .speeds { row-gap: 14px; }
+  /* the three one-line figures side by side, the taller Speculation on its own row: no blank under a short one */
+  .stats { grid-template-columns: repeat(3, auto); justify-content: space-between; column-gap: 8px; }
+  .stats .stat__label { white-space: nowrap; }
+  .stat--spec { grid-column: 1 / -1; }
   .gpurow__line { grid-template-columns: minmax(0, 1fr) auto; }
   .gpurow__track { grid-column: 1 / -1; grid-row: 2; }
 }

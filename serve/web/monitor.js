@@ -91,7 +91,7 @@ function Throughput({m}) {
       <div class="stat"><span class="stat__label">Time per token</span><${Num} v=${ms == null ? null : fmt(ms, 1)} unit="ms"/></div>
       <div class="stat"><span class="stat__label">VRAM hit</span><${Num} v=${hit == null ? null : fmt(hit, 1)} unit="%"/></div>
       <div class="stat"><span class="stat__label">Requests served</span><${Num} v=${m.totals && m.totals.requests != null ? fmt(m.totals.requests) : null}/></div>
-      <div class="stat" title=${spec.state === "off" ? "No drafter is running for this answer: every token comes from a full model step"
+      <div class="stat stat--spec" title=${spec.state === "off" ? "No drafter is running for this answer: every token comes from a full model step"
           : "Drafting: a small drafter proposes tokens and the full model checks them. Shown: the drafts the model kept of those offered, live while an answer is written, else the last answer's. A dash: nothing drafted yet."}>
         <span class="stat__label">Speculation</span>
         <span class="stat__value stat__value--text">${spec.name == null ? "–" : spec.name}</span>
