@@ -9506,9 +9506,10 @@ struct Model::Impl {
             std::atomic<bool>& f;
             ~Unflush() { f.store(false, std::memory_order_release); }
         } unflush_{copy_flush};
-        if (x3) copy_flush.store(true, std::memory_order_release);
+        const bool rc = rc_in_tail();   // (recent slots: under the room too - as borrow_begin)
+        if (x3 || rc) copy_flush.store(true, std::memory_order_release);
         cache_drain();
-        if (ln_one || ln_land || x3) rc_drain(x3);
+        if (ln_one || ln_land || x3 || rc) rc_drain(x3 || rc);
         const size_t b0 = (d.tail_bytes - need) & ~(size_t) 255;
         for (Layer& l : L) {
             if (l.dev != 0 || l.mtp || l.n_main >= l.n_slots) continue;
@@ -10709,6 +10710,12 @@ struct Model::Impl {
     static constexpr double kRcDrainMs = 5000.0;
     // for_lend (an EXL3 lender: the recent slots its run borrows): the held fills issued now, and every one waited for -
     // one still to come could land in the run's buffers, or be mapped over what the run wrote there
+    // the recent slots in use (set up at the load while the one-GPU path was on - one_gpu_plan may turn that path off
+    // after its timing, and the slots and their fills stay): they lie in the tail a run of chunks or a picture borrows.
+    // A fill done but not yet mapped, or still to be issued, left there by a lend landed in the buffers or under them,
+    // and the tick after the hand-back mapped its expert over what the run wrote: the decode read garbage (NaN routing,
+    // then an illegal memory access) - a 32K prompt on one GPU after a few shorter ones
+    bool rc_in_tail() const { return recent_n > 0 && !rc_cs.empty(); }
     void rc_drain(bool for_lend = false) {
         if (recent_n <= 0 || rc_cs.empty()) return;
         const double t0 = now_ms();
@@ -17906,9 +17913,10 @@ struct Model::Impl {
             std::atomic<bool>& f;
             ~Unflush() { f.store(false, std::memory_order_release); }
         } unflush_{copy_flush};
-        if (x3) copy_flush.store(true, std::memory_order_release);   // (the drains wait on held swaps and fills)
+        const bool rc = rc_in_tail();   // (recent slots: under the buffers too - every fill done and mapped first)
+        if (x3 || rc) copy_flush.store(true, std::memory_order_release);   // (the drains wait on held swaps and fills)
         cache_drain();
-        if (ln_one || ln_land || x3) rc_drain(x3);   // (the one-GPU path's; elsewhere v1.1.27's: no wait)
+        if (ln_one || ln_land || x3 || rc) rc_drain(x3 || rc);   // (none: v1.1.27's path, no wait)
         bool tp = false;   // (DS4_TP_BORROW: a group's layer keeps the fewest of its members' slots - from all of them)
         for (const auto& cp : chunks) tp = tp || (cp != nullptr && cp->tp_lend);
         // (every lending device's room first, before any is touched: a refusal leaves every slot as it was)
