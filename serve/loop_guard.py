@@ -574,7 +574,10 @@ def collapse(messages: list[dict]) -> Collapse | None:
     nothing to leave out, or a conversation above COLLAPSE_MAX_CHARS (whose prompt must not change, #702)."""
     if not echoes(messages):
         return None
-    limit = int(os.environ.get("MAYA_LOOP_GUARD_COLLAPSE_MAX") or COLLAPSE_MAX_CHARS)
+    try:
+        limit = int(os.environ.get("MAYA_LOOP_GUARD_COLLAPSE_MAX") or COLLAPSE_MAX_CHARS)
+    except ValueError:          # (a setting that is not a number: the default, not a failed request)
+        limit = COLLAPSE_MAX_CHARS
     if limit and conv_chars(messages) > limit:
         return None          # a long conversation keeps its prompt whole: the engine's cache stays valid (#702)
     out, seen, made, paras, rounds, i, last = [], set(), set(), 0, 0, 0, None

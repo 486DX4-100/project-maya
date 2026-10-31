@@ -975,6 +975,8 @@ class Collapse(unittest.TestCase):
         os.environ["MAYA_LOOP_GUARD_COLLAPSE_MAX"] = "1000000"          # (the behaviour before #702)
         try:
             self.assertIsNotNone(LG.collapse(msgs))
+            os.environ["MAYA_LOOP_GUARD_COLLAPSE_MAX"] = "lots"              # (not a number: the default, no error)
+            self.assertIsNone(LG.collapse(msgs))
         finally:
             os.environ.pop("MAYA_LOOP_GUARD_COLLAPSE_MAX", None)
 
