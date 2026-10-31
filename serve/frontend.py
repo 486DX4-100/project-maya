@@ -722,8 +722,11 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
-        pname = rest[:rest.index(">")]
-        rest = rest[rest.index(">") + 1:]
+        close = rest.find(">")
+        if close < 0 or "<" in rest[:close]:     # an unclosed <parameter= tag: malformed, as the other cases (#706)
+            raise MalformedToolCall(body)
+        pname = rest[:close]
+        rest = rest[close + 1:]
         end = rest.find("</parameter>")
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len("</parameter>"):] if end >= 0 else ""
