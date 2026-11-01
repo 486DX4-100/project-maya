@@ -1304,8 +1304,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                       (long long) s.eg_cached, (long long) s.eg_cache_cap, (long long) s.eg_cache_row_bytes,
                       (long long) s.eg_rows);
         out += b;
-        std::snprintf(b, sizeof b, " eg_lookup_hits=%lld eg_lookup_reads=%lld", (long long) s.eg_hits,
-                      (long long) s.eg_reads);
+        std::snprintf(b, sizeof b, " eg_lookup_hits=%lld eg_lookup_reads=%lld eg_decode_ahead_rows=%lld",
+                      (long long) s.eg_hits, (long long) s.eg_reads, (long long) s.eg_dahead);
         out += b;
         if (slot_max > 0) {
             int slot_ram = 0, slot_disk = 0;
