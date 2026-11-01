@@ -16074,6 +16074,14 @@ struct Model::Impl {
         }
         return true;
     }
+    // the conversations a pass holds at most (can_draft_multi's bounds; 1: no pass of several; 0: no drafter)
+    int draft_pass() const {
+        const int T = g.d_block;
+        if (g.n_mtp == 0 || sqs.empty() || T < 1 || dump_d != nullptr || lend_broken) return g.n_mtp > 0 ? 1 : 0;
+        int n = 1;
+        while ((n + 1) * T <= kWin && (n + 1) * (T + 1) <= kWin + 2) ++n;
+        return n;
+    }
     bool draft_multi(const int* sv, const int* ys, int n, std::vector<std::vector<int>>& out,
                      std::vector<std::vector<float>>& conf, std::string& err) {
         out.assign((size_t) std::max(0, n), {});
@@ -21419,6 +21427,7 @@ bool Model::step_multi_spec(const int* seqs, const int* const* toks, const int* 
     return p_->step_runs(seqs, toks, lens, n, true, err);
 }
 bool Model::can_draft_multi(const int* seqs, int n) const { return p_->can_draft_multi(seqs, n); }
+int Model::draft_pass() const { return p_->draft_pass(); }
 bool Model::draft_multi(const int* seqs, const int* ys, int n, std::vector<std::vector<int>>& d,
                         std::vector<std::vector<float>>& c, std::string& err) {
     return p_->draft_multi(seqs, ys, n, d, c, err);

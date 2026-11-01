@@ -297,6 +297,8 @@ public:
     /// together.  can_draft_multi: whether these conversations fit one pass (their blocks in a window, each its
     /// block's room in its context); else each drafts alone with draft().
     bool can_draft_multi(const int* seqs, int n) const;
+    /// The conversations one drafter pass holds at most (1: none of several; 0: no drafter).
+    int draft_pass() const;
     bool draft_multi(const int* seqs, const int* ys, int n, std::vector<std::vector<int>>& drafts,
                      std::vector<std::vector<float>>& conf, std::string& err);
     bool verify_multi(int i, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
