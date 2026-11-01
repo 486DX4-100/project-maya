@@ -2497,15 +2497,22 @@ struct Model::Impl {
         int dev;       // (index into devs: the sending member)
         void** where;
         size_t bytes;
+        bool chunk;    // (a Chunk's: alloc_chunks_fit may redo those, so alloc_chunks drops them first)
     };
     std::vector<XfNote> xf_todo;
-    bool xnote(int di, uint8_t*& p, size_t bytes) {
+    bool xnote(int di, uint8_t*& p, size_t bytes, bool chunk = false) {
         static const bool want = std::getenv("DS4_XFER_P2P") != nullptr && std::atoi(std::getenv("DS4_XFER_P2P")) != 0;
-        if (want && devs[(size_t) di].mi == 0 && groups.size() > 1) xf_todo.push_back({di, (void**) &p, bytes});
+        if (want && devs[(size_t) di].mi == 0 && groups.size() > 1) xf_todo.push_back({di, (void**) &p, bytes, chunk});
         return true;
     }
     void xfer_p2p_place() {
-        if (xf_todo.empty()) return;
+        static const bool want = std::getenv("DS4_XFER_P2P") != nullptr && std::atoi(std::getenv("DS4_XFER_P2P")) != 0;
+        if (!want) return;
+        if (xf_todo.empty()) {
+            std::fprintf(stderr, "ds4: DS4_XFER_P2P: 0 hand-off buffers noted (%zu groups, %d chunk, nothing between groups to place)\n",
+                         groups.size(), chunk);
+            return;
+        }
         int cur = 0;
         cudaGetDevice(&cur);
         // (the sending device -> the devices of the group of the layer after its group's last: L's group changes)
@@ -2569,6 +2576,12 @@ struct Model::Impl {
                          moved[kv.first] / 1e6,
                          kept[kv.first] > 0 ? (", " + std::to_string(kept[kv.first] >> 20) + " MiB left host-mapped").c_str() : "");
         }
+        size_t nm = 0, nk = 0;
+        for (const auto& kv : moved) nm += kv.second;
+        for (const auto& kv : kept) nk += kv.second;
+        std::fprintf(stderr, "ds4: DS4_XFER_P2P: %zu hand-off buffers noted, %.1f MB placed peer-to-peer, %.1f MB left on host "
+                             "memory%s\n", xf_todo.size(), nm / 1e6, nk / 1e6,
+                     to.empty() ? " (no layer hands over between groups)" : "");
         xf_todo.clear();
     }
     template <class T>
@@ -5062,6 +5075,7 @@ struct Model::Impl {
         return best;
     }
     bool alloc_chunks(std::string& err) {
+        xf_todo.erase(std::remove_if(xf_todo.begin(), xf_todo.end(), [](const XfNote& n) { return n.chunk; }), xf_todo.end());
         chunks.resize(devs.size());
         const int D = g.dim;
         const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
@@ -5188,7 +5202,7 @@ struct Model::Impl {
             const bool hands = d.mi == 0 && groups.size() > 1;
             for (int sl = 0; sl < 2; ++sl) {
                 if (hands && (!hmap(c.hand[sl], chunk_hand_bytes(), err) || !hmap(c.hand_flag[sl], 32, err))) return false;
-                if (hands) xnote((int) di, c.hand[sl], chunk_hand_bytes());
+                if (hands) xnote((int) di, c.hand[sl], chunk_hand_bytes(), true);
                 if (has_first && !halloc(c.emb_host[sl], C * D, err)) return false;
                 if (has_eg && !halloc(c.eg_host[sl], C * pk.eg_layers * (size_t) cols * (ehd + ehd / 32), err)) return false;
                 CK(cudaEventCreateWithFlags(&c.emb_ev[sl], cudaEventDisableTiming));
