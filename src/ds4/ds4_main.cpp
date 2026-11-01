@@ -251,6 +251,17 @@ void prof_line(const strata::ds4::Stats& s0, const strata::ds4::Stats& s) {
                  (s.prof_ms[2] - s0.prof_ms[2]) / pt, (s.prof_ms[3] - s0.prof_ms[3]) / pt,
                  (s.prof_ms[4] - s0.prof_ms[4]) / pt, (s.prof_ms[5] - s0.prof_ms[5]) / pt,
                  (long long) (s.prof_tokens - s0.prof_tokens));
+    if (s.prof_wall_ms > s0.prof_wall_ms) {   // multi-row windows: each device's busy time against the step's wall time
+        std::string dv;
+        for (int i = 0; i < 8; ++i)
+            if (s.prof_dev_ms[i] > s0.prof_dev_ms[i]) {
+                char b[48];
+                std::snprintf(b, sizeof b, " CUDA%d %.2f", i, (s.prof_dev_ms[i] - s0.prof_dev_ms[i]) / pt);
+                dv += b;
+            }
+        std::fprintf(stderr, "DS4_PROF per device a window (busy ms):%s; window wall %.2f ms\n", dv.c_str(),
+                     (s.prof_wall_ms - s0.prof_wall_ms) / pt);
+    }
 }
 
 // The drafts between two stats: each draft position (1st, 2nd, ..) - how often it was verified with every draft
@@ -2356,7 +2367,52 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     }
                     if (!m.step_multi(sv.data(), tv.data(), nn, err)) cancel_all();
                     else {
-                        for (int i = 0; i < nn; ++i) {
+                        {   // DS4_PROF: a line every 64 profiled multi-row windows (per-device busy time, window wall time)
+                            static strata::ds4::Stats prof0;
+                            const strata::ds4::Stats& ps = m.stats();
+                            if (ps.prof_tokens - prof0.prof_tokens >= 64) {
+                                std::fprintf(stderr, "DS4_PROF multi-row windows (N=%d), per window:\n", nn);
+                                prof_line(prof0, ps);
+                                prof0 = ps;
+                            }
+                        }
+                        static const bool host_batch = std::getenv("MAYA_DS4_HOST_BATCH") != nullptr &&
+                                                       std::string(std::getenv("MAYA_DS4_HOST_BATCH")) == "1";
+                        bool batched = false;
+                        if (host_batch && nn > 1 && nn <= 16) {
+                            bool lp = false;
+                            for (int i = 0; i < nn; ++i) lp = lp || need[(size_t) i]->r.logprobs >= 0;
+                            if (!lp) {
+                                std::vector<strata::ds4::Model::MultiPick> pk((size_t) nn);
+                                std::vector<int> outt((size_t) nn);
+                                for (int i = 0; i < nn; ++i) {
+                                    const Req& r = need[(size_t) i]->r;
+                                    auto& p = pk[(size_t) i];
+                                    p.temperature = r.temperature;
+                                    p.top_p = r.top_p;
+                                    p.top_k = r.top_k;
+                                    p.min_p = r.min_p;
+                                    p.seed = r.seed;
+                                    p.counter = need[(size_t) i]->counter;
+                                    p.pen_last_n = r.pen_n < 0 ? INT_MAX : r.pen_n;
+                                    p.pen_repeat = std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f;
+                                    p.pen_freq = std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f;
+                                    p.pen_present = std::isfinite(r.pen_present) ? r.pen_present : 0.0f;
+                                }
+                                m.set_logprobs(-1, -1);
+                                if (m.sample_multi_batch(nn, pk.data(), outt.data())) {
+                                    batched = true;
+                                    for (int i = 0; i < nn; ++i) {
+                                        Act& a = *need[(size_t) i];
+                                        a.counter++;
+                                        a.tok = outt[(size_t) i];
+                                        if (closing[(size_t) i]) a.tok = a.r.think_end;
+                                        a.cool = tried[(size_t) i] != 0;
+                                    }
+                                }
+                            }
+                        }
+                        for (int i = 0; !batched && i < nn; ++i) {
                             Act& a = *need[(size_t) i];
                             penalties(a.r);
                             m.set_logprobs(a.r.logprobs, closing[(size_t) i] ? a.r.think_end : -1);

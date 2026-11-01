@@ -137,6 +137,8 @@ struct Stats {
     int64_t store_put = 0, store_evicted = 0, store_failed = 0;
     double store_wait_ms = 0.0;
     double prof_ms[6] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +
+    double prof_dev_ms[8] = {};      // DS4_PROF: the same time by device (CUDA id), and the multi steps' wall time
+    double prof_wall_ms = 0;
     int64_t prof_tokens = 0;         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
     // lookahead (decode windows of one): the picks of layers guessed a layer before (the next layer's gate on this
     // layer's FFN input), of them in the guess's top k / in all its guesses / in the guess two layers before; the picks
@@ -284,6 +286,16 @@ public:
     /// seeded as its own step would seed them, so it drafts on alone later.  The bound conversation stays bound.
     bool step_multi(const int* seqs, const int* tokens, int n, std::string& err);
     int sample_multi(int row, float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter);
+    /// MAYA_DS4_HOST_BATCH: the picks of rows 0..n-1 in one go (one token copy, one stream sync); a row's pick is what
+    /// set_penalties() with its own values + sample_multi() would return.  No logprobs.  out[i] = -1 on an error
+    struct MultiPick {
+        float temperature, top_p, min_p;
+        int top_k;
+        uint64_t seed, counter;
+        int pen_last_n;
+        float pen_repeat, pen_freq, pen_present;
+    };
+    bool sample_multi_batch(int n, const MultiPick* picks, int* out);
     /// The drafter beside --parallel: n conversations' verify windows through the model together - window i is
     /// conversation seqs[i]'s token y and its drafts (each conversation's own draft(), bound to it), toks[i][0 ..
     /// lens[i]) with toks[i][0] = y - as step_multi's rows (distinct conversations, at most verify_max() rows in all),

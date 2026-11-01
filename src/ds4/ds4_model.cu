@@ -2174,6 +2174,7 @@ struct Model::Impl {
                         break;
                     }
                     sample_ms[m.stage] += ms;
+                    if (!chunk_sample && m.dev >= 0 && m.dev < 8) st.prof_dev_ms[m.dev] += ms;
                     it->second = m.ev;
                 } else {
                     last.push_back({m.dev, m.ev});
@@ -16226,10 +16227,10 @@ struct Model::Impl {
     // front; the penalties into sp.  nullptr and h = 0 (sp untouched) for a request without penalties
     // (hist: whose tokens - null: the bound conversation's; a multi step's row: its own conversation's)
     const int* pen_rows(int64_t end0, int T, strata::kernels::SamplerParams& sp, int& h,
-                        const std::vector<int32_t>* hist = nullptr) {
+                        const std::vector<int32_t>* hist = nullptr, int slot = 0) {
         const std::vector<int32_t>& toks = hist != nullptr ? *hist : this->toks;
         h = 0;
-        if (pen_n <= 0 || T < 1 || T > kWin) return nullptr;
+        if (pen_n <= 0 || T < 1 || slot < 0 || slot + T > kWin) return nullptr;
         Dev& d = devs[(size_t) head_dev];
         if (d_pen == nullptr) {
             std::string e;
@@ -16242,18 +16243,19 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         h = std::min(pen_n, kPenCap);
         for (int t = 0; t < T; ++t) {
-            int32_t* row = h_pen + (size_t) t * (size_t) h;
+            int32_t* row = h_pen + (size_t) (slot + t) * (size_t) h;
             const int64_t end = std::min<int64_t>(end0 + t, (int64_t) toks.size());
             const int take = (int) std::min<int64_t>(h, std::max<int64_t>(0, end));
             std::fill(row, row + (h - take), -1);
             std::copy(toks.begin() + (end - take), toks.begin() + end, row + (h - take));
         }
-        cudaMemcpyAsync(d_pen, h_pen, (size_t) T * (size_t) h * sizeof(int32_t), cudaMemcpyHostToDevice, d.st);
+        cudaMemcpyAsync(d_pen + (size_t) slot * h, h_pen + (size_t) slot * h, (size_t) T * (size_t) h * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, d.st);
         sp.penalty_last_n = h;
         sp.penalty_repeat = pen_repeat;
         sp.penalty_freq = pen_freq;
         sp.penalty_present = pen_present;
-        return d_pen;
+        return d_pen + (size_t) slot * h;
     }
 
     // the token sample_tokens left in d.tok; -1 on a CUDA error, printed here (the callers reject a -1)
@@ -20759,7 +20761,7 @@ struct Model::Impl {
             std::memcpy(h_emb + (size_t) t * D, embed_pinned + (size_t) tk[t] * D, (size_t) D * 2);
         plan_window(0, T, wp);
         if (helper_n > 0 && wp.async) helper_window(T, wp);
-        prof_window = false;
+        prof_window = prof_on && !spec;   // (DS4_PROF: the N-row window's per-device time too)
         n_logits = T;
         logits_all = false;
         const double tl = now_ms();
@@ -20785,7 +20787,9 @@ struct Model::Impl {
                 seq_unpark();
                 return false;
             }
+            if (prof_window) st.prof_wall_ms += now_ms() - tl;
             prof_collect();
+            prof_window = false;
             for (int i = 0; i < n; ++i) sqs[(size_t) sv[i]].pos += lens[i];
             st.tokens += T;
             cache_tick(T);
@@ -20978,6 +20982,44 @@ struct Model::Impl {
         const int t = tok_back(d);
         if (t >= 0) lp_pick(d.logits + (size_t) row * g.vocab, 1, &t, (int64_t) hist.size(), &hist);
         return t;
+    }
+
+    // MAYA_DS4_HOST_BATCH: every row's pick launched on the head stream (its own penalty slot and token slot), then one
+    // copy of the tokens and one sync.  A row's sampling is the same kernel with the same arguments as sample_multi's
+    bool sample_multi_batch(int n, const Model::MultiPick* pk, int* out) {
+        Dev& d = devs[(size_t) head_dev];
+        cudaSetDevice(d.id);
+        if (n < 1 || n > 16 || n > n_logits || n > (int) mrows.size()) return false;
+        for (int i = 0; i < n; ++i) {
+            const Model::MultiPick& k = pk[i];
+            const bool on = k.pen_last_n > 0 && (k.pen_repeat != 1.0f || k.pen_freq != 0.0f || k.pen_present != 0.0f);
+            pen_n = on ? k.pen_last_n : 0;
+            pen_repeat = k.pen_repeat;
+            pen_freq = k.pen_freq;
+            pen_present = k.pen_present;
+            strata::kernels::SamplerParams sp;
+            sp.temperature = k.temperature;
+            sp.greedy = k.temperature <= 0.0f;
+            sp.top_p = k.top_p;
+            sp.top_k = k.top_k;
+            sp.min_p = k.min_p;
+            sp.seed = k.seed;
+            sp.counter = k.counter;
+            const std::vector<int32_t>& hist = seq_tokens(mrows[(size_t) i]);
+            int h = 0;
+            const int* hr = pen_rows((int64_t) hist.size(), 1, sp, h, &hist, i);
+            strata::kernels::sample_tokens(d.logits + (size_t) i * g.vocab, 1, g.vocab, hr, h, sp, d.tok + i, d.st);
+        }
+        int t[16];
+        cudaError_t e = cudaMemcpyAsync(t, d.tok, (size_t) n * 4, cudaMemcpyDeviceToHost, d.st);
+        if (e == cudaSuccess) e = cudaStreamSynchronize(d.st);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "ds4 sample: %s\n", cudaGetErrorString(e));
+            for (int i = 0; i < n; ++i) out[i] = -1;
+            return true;
+        }
+        for (int i = 0; i < n; ++i) out[i] = t[i];
+        return true;
     }
 
     bool logits(std::vector<float>& out) {
@@ -21351,6 +21393,7 @@ const std::vector<int32_t>& Model::seq_tokens(int s) const { return p_->seq_toke
 bool Model::step_multi(const int* seqs, const int* tokens, int n, std::string& err) {
     return p_->step_multi(seqs, tokens, n, err);
 }
+bool Model::sample_multi_batch(int n, const MultiPick* picks, int* out) { return p_->sample_multi_batch(n, picks, out); }
 int Model::sample_multi(int row, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
     return p_->sample_multi(row, t, tp, tk, mp, seed, counter);
 }
