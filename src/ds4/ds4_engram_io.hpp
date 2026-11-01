@@ -147,7 +147,8 @@ public:
 #endif
     }
     // A successful preload is fully resident and locked. In RAM mode a missing range is an error.
-    bool pin_range(const std::string& path, int file, uint64_t off, uint64_t n, std::string& err) {
+    // keep_partial: an mlock failure keeps the chunks locked so far (the range shrinks) instead of failing.
+    bool pin_range(const std::string& path, int file, uint64_t off, uint64_t n, std::string& err, bool keep_partial = false) {
 #if defined(_WIN32)
         err = "Engram RAM mode requires Linux"; return false;
 #else
@@ -174,6 +175,11 @@ public:
             if (::mlock(base + pos, std::min(chunk, length - pos)) != 0) {
                 err = "Engram RAM: mlock failed: " + std::string(std::strerror(errno)) +
                       "; check available RAM and RLIMIT_MEMLOCK (ulimit -l)";
+                if (keep_partial && pos > off - begin) {   // keep the locked prefix (pos is chunk-aligned)
+                    ::munmap(base + pos, length - pos);
+                    ram_.push_back({file, off, (uint64_t) pos - (off - begin), base, pos, (size_t) (off - begin)});
+                    return true;
+                }
                 ::munlock(base, length); ::munmap(base, length); return false;
             }
             if ((pos / chunk) % 32 == 0 || pos + chunk >= length)
@@ -199,12 +205,15 @@ public:
         cv_.notify_all();
         for (auto& t : th_) t.join();
         th_.clear();
+        if (ram_hits_.load() > 0)
+            std::fprintf(stderr, "ds4: Engram RAM layers: %lld rows served from locked memory\n", (long long) ram_hits_.load());
         if (check_n_.load() > 0)
             std::fprintf(stderr, "ds4 Engram check (DS4_EG_CHECK): %lld rows read unbuffered, %lld differed from a buffered read\n",
                          (long long) check_n_.load(), (long long) check_bad_.load());
     }
     int threads() const { return (int) th_.size(); }
     bool ram_only() const { return ram_only_; }
+    int64_t ram_hits() const { return ram_hits_.load(); }   // rows served from the locked ranges (partial mode)
     void submit(EgBatch& b, bool low = false) {
         b.io_reads = (int) b.reads.size();
         b.ok.assign(b.reads.size(), 0);
@@ -410,6 +419,7 @@ private:
     struct RamRange { int file; uint64_t off, n; uint8_t* base; size_t mapped, delta; };
     std::vector<RamRange> ram_;
     bool ram_only_ = false;
+    std::atomic<int64_t> ram_hits_{0};
     bool copy_ram(int file, uint64_t off, uint64_t n, void* dst) const {
         for (const auto& r : ram_) if (r.file == file && off >= r.off && n <= r.n && off - r.off <= r.n - n) {
             std::memcpy(dst, r.base + r.delta + (size_t) (off - r.off), (size_t) n); return true;
@@ -453,6 +463,21 @@ private:
     }
     bool read(std::vector<os::fd_t>& fds, std::vector<os::fd_t>& ufds, uint8_t* al, const EgRead& r,
               std::vector<uint8_t>& buf) {
+        if (!ram_only_ && !ram_.empty()) {   // partial RAM (DS4_ENGRAM_RAM_LAYERS): a row inside a locked range, else the files
+            bool hit;
+            if (!r.mx8) {
+                hit = copy_ram(r.file, r.off, r.n, r.dst) && (r.n2 == 0 || copy_ram(r.file2, r.off2, r.n2, r.scales));
+            } else {
+                buf.resize(r.n);
+                hit = copy_ram(r.file, r.off, r.n, buf.data());
+                if (hit)
+                    for (uint32_t k = 0; k < r.n / 33; ++k) {
+                        r.scales[k] = buf[(size_t) k * 33];
+                        std::memcpy(r.dst + (size_t) k * 32, buf.data() + (size_t) k * 33 + 1, 32);
+                    }
+            }
+            if (hit) { ram_hits_.fetch_add(1, std::memory_order_relaxed); return true; }
+        }
         if (ram_only_) {
             if (!r.mx8) {
                 return copy_ram(r.file, r.off, r.n, r.dst) &&

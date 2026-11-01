@@ -4424,6 +4424,67 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/Q5_K/IQ4_NL/FP8), %.3f GB locked; reads use memcpy\n",
                              pk.eg_layers, (double) total / 1e9);
             }
+            else if (const char* ls = std::getenv("DS4_ENGRAM_RAM_LAYERS"); ls && *ls) {
+                // opt-in: lock only these layers' tables (up to DS4_ENGRAM_RAM_GB in all); their rows come from RAM,
+                // the rest (other layers, rows past the cap) keep the row cache + reader path. Never fails the start.
+                std::vector<int> want;
+                for (const char* p = ls; *p;) {
+                    char* e = nullptr;
+                    const long v = std::strtol(p, &e, 10);
+                    if (e == p) break;
+                    want.push_back((int) v);
+                    p = *e == ',' ? e + 1 : e;
+                }
+                double cap = 1e30;
+                if (const char* c = std::getenv("DS4_ENGRAM_RAM_GB"); c && *c) cap = std::atof(c) * 1e9;
+                uint64_t avail_kb = 0;
+                if (FILE* mi = std::fopen("/proc/meminfo", "r")) {
+                    char line[256];
+                    while (std::fgets(line, sizeof line, mi))
+                        if (std::sscanf(line, "MemAvailable: %llu kB", (unsigned long long*) &avail_kb) == 1) break;
+                    std::fclose(mi);
+                }
+                if (avail_kb != 0) {
+                    const double room = std::max(0.0, (double) avail_kb * 1024.0 - 6e9);
+                    if (cap > room) {
+                        std::fprintf(stderr, "ds4: Engram RAM layers: cap %s shrunk to %.1f GB (MemAvailable %.1f GB - 6 GB margin)\n",
+                                     cap > 1e29 ? "none" : (std::to_string(cap / 1e9) + " GB").c_str(), room / 1e9, (double) avail_kb * 1024.0 / 1e9);
+                        cap = room;
+                    }
+                }
+                double locked = 0, all = 0, rows_locked = 0, rows_all = 0;
+                std::string ids;
+                for (int li = 0; li < pk.eg_layers; ++li) {
+                    const int id = g.eg_layers[(size_t) li];
+                    if (std::find(want.begin(), want.end(), id) == want.end()) continue;
+                    const Tensor* tw = pk.get("layers." + std::to_string(id) + ".engram.embed.weight");
+                    const Tensor* ts = pk.get("layers." + std::to_string(id) + ".engram.embed.scale");
+                    if (tw == nullptr || (tw->dtype == "F8_E4M3" && (ts == nullptr || ts->dtype != "F8_E8M0"))) {
+                        std::fprintf(stderr, "ds4: Engram RAM layers: layer %d skipped (unsupported table)\n", id);
+                        continue;
+                    }
+                    const bool split = tw->dtype == "F8_E4M3";
+                    const double bytes = (double) tw->bytes + (split ? (double) ts->bytes : 0.0);
+                    const double take = std::min(bytes, std::max(0.0, cap - locked));
+                    const double f = take / bytes;
+                    std::string e1;
+                    const uint64_t lw = (uint64_t) ((double) tw->bytes * f), lsb = split ? (uint64_t) ((double) ts->bytes * f) : 0;
+                    uint64_t got_w = 0, got_s = 0;
+                    if (lw > 0 && eg_io.pin_range(paths[(size_t) tw->file], tw->file, tw->off, lw, e1, true)) got_w = lw;
+                    else if (lw > 0) std::fprintf(stderr, "ds4: Engram RAM layers: layer %d weights not locked: %s\n", id, e1.c_str());
+                    if (split && lsb > 0 && eg_io.pin_range(paths[(size_t) ts->file], ts->file, ts->off, lsb, e1, true)) got_s = lsb;
+                    else if (split && lsb > 0) std::fprintf(stderr, "ds4: Engram RAM layers: layer %d scales not locked: %s\n", id, e1.c_str());
+                    locked += (double) (got_w + got_s);
+                    all += bytes;
+                    // a row is served from RAM only when it and its scale are both locked
+                    const double fw = (double) got_w / (double) tw->bytes, fs = split ? (double) got_s / (double) ts->bytes : 1.0;
+                    rows_locked += std::min(fw, fs);
+                    rows_all += 1.0;
+                    ids += (ids.empty() ? "" : ",") + std::to_string(id);
+                }
+                std::fprintf(stderr, "ds4: Engram RAM layers %s: %.1f / %.1f GB locked (%.0f%% of rows), others from the files\n",
+                             ids.c_str(), locked / 1e9, all / 1e9, rows_all > 0 ? 100.0 * rows_locked / rows_all : 0.0);
+            }
             eg_io.start(paths, nth, eg_direct);
             for (int li = 0; li < pk.eg_layers; ++li) {
                 eg_win.emplace_back(new EgBatch());

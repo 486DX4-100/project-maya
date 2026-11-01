@@ -46,5 +46,16 @@ int main() {
     { std::ofstream f(name, std::ios::binary); f.write((char*) data.data(), data.size()); }
     EgBatch missing; q.mx8 = false; q.off = 2048; q.n = 32; missing.reads.push_back(q);
     ram.submit(missing); ram.wait(missing); check(!missing.ok[0], "missing RAM range silently fell back");
+    // Partial mode (no require_ram): rows inside a locked range come from RAM, the rest from the file; same bytes.
+    { std::ofstream f(name, std::ios::binary); f.write((char*) data.data(), data.size()); }
+    { EgReader part; check(part.pin_range(name, 0, 0, 1024, err, true), err.c_str()); part.start({name}, 2);
+      uint8_t in[32] = {}, out[32] = {};
+      EgRead a1; a1.file = 0; a1.off = 100; a1.n = 32; a1.dst = in;
+      EgRead a2; a2.file = 0; a2.off = 3000; a2.n = 32; a2.dst = out;
+      EgBatch pb; pb.reads.push_back(a1); pb.reads.push_back(a2); part.submit(pb); part.wait(pb);
+      check(pb.ok[0] && pb.ok[1] && !std::memcmp(in, data.data() + 100, 32) && !std::memcmp(out, data.data() + 3000, 32),
+            "partial mode bytes differ");
+      check(part.ram_hits() == 1, "partial mode: expected one RAM hit");
+      part.stop(); }
     ram.stop(); check(unlink(name) == 0, "cleanup"); std::cout << "locked RAM, default reads, FP8/MXFP8, bounds, and failure checks passed\n";
 }

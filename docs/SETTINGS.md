@@ -906,6 +906,8 @@ skip any experts, and do not promise a speed increase over a warm page cache.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `DS4_ENGRAM_RAM` | `0` | `1`: map and lock both complete Engram tables before serving. The reader copies rows from the locked mappings, including FP8 scales; an unregistered range fails instead of reading the file. Supports Q6_K, MXFP8 and native FP8 + separate scales. Linux; explicitly requesting it on Windows fails. |
+| `DS4_ENGRAM_RAM_LAYERS` | unset | Comma list of Engram layer ids (e.g. `1`). Maps and locks only those layers' tables (weights and FP8 scales); their rows are copied from RAM, other layers keep the row cache and reader path. Opt-in, ignored when `DS4_ENGRAM_RAM=1`. An mlock failure keeps what was locked and never fails the start. Logs `Engram RAM layers 1: X / Y GB locked (Z% of rows)`. |
+| `DS4_ENGRAM_RAM_GB` | unset | With `DS4_ENGRAM_RAM_LAYERS`: cap on the locked bytes (all listed layers together). A table above the cap is locked as a prefix; rows inside it come from RAM, the rest from the files. Shrunk to `MemAvailable` minus 6 GB when larger. |
 | `DS4_REQUIRE_ALL_RAM` | `0` | `1`, with `--mmap-experts off`: copy every CPU-lane GGUF expert to anonymous RAM. Do not reduce the selection to the available-memory estimate or `DS4_COPY_GB`; insufficient allocation or an incomplete selection fails startup instead of silently leaving experts in their files. |
 
 The second option applies to the GGUF expert-copy path. It does not lock the experts: **locked Engram tables and
