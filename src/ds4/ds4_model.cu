@@ -1444,6 +1444,11 @@ struct Model::Impl {
         int64_t lookups = 0;
     };
     std::unique_ptr<EgAhead> eg_pre;
+    // A decode step's first token y is known before its drafts are (the drafter runs between): its rows of every Engram
+    // layer are asked for when draft() starts, one EgAhead a conversation, read behind every other read and into the
+    // row cache before the step's window asks for them - the same bytes, read earlier.  Off unless
+    // MAYA_DS4_EG_DECODE_AHEAD=1.
+    std::vector<std::unique_ptr<EgAhead>> eg_dpre;
     std::vector<uint8_t> eg_q6k;   // Engram layer li's row format: 1 ggml Q6_K (superblocks of 256), 2 IQ4_NL (blocks of
                                    // 32), 0 FP8
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
@@ -2223,6 +2228,7 @@ struct Model::Impl {
         if (cs_th.joinable()) cs_th.join();
         warm_end();
         eg_ahead_end();   // (its reads in flight: done before the reader stops)
+        eg_decode_ahead_end();
         eg_io.stop();   // (its threads write into h_eg)
         for (auto& w : workers) w->stop();
         for (size_t i = 0; i < chunks.size(); ++i)
@@ -10019,6 +10025,40 @@ struct Model::Impl {
         for (auto& b : eg_pre->b) eg_finish(*b, false);
         eg_pre.reset();
     }
+    // (eg_dpre) conversation's token y at position p0 (cto: its compressed ids so far, p0 of them) - its Engram rows asked for
+    void eg_decode_ahead(const std::vector<int32_t>& cto, int64_t p0, int y, bool img = false) {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_EG_DECODE_AHEAD");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (!on || pk.eg_layers <= 0 || eg_cache.capacity() == 0 || (int64_t) cto.size() != p0 || y < 0 || y >= g.vocab)
+            return;
+        const int cols = (pk.eg_ngram - 1) * pk.eg_heads, nl = pk.eg_layers;
+        const size_t per = (size_t) cols * (pk.eg_hd + pk.eg_hd / 32);
+        auto a = std::make_unique<EgAhead>();
+        a->seq = sq_bound;
+        a->at = p0;
+        a->k = 0;
+        const int64_t c0 = std::max<int64_t>(0, p0 - (pk.eg_ngram - 1));   // (the look-back's first position)
+        a->cts.assign(cto.begin() + c0, cto.end());
+        a->cts.push_back(img ? -1 : ctok(p0, y));
+        a->rows.resize((size_t) nl * per);
+        for (int li = 0; li < nl; ++li) {
+            a->b.emplace_back(new EgBatch());
+            EgBatch& b = *a->b.back();
+            eg_issue(p0, 1, li, a->rows.data() + (size_t) li * per, b, false, false, false, nullptr, a->cts.data(), c0);
+            a->lookups += b.lookups;
+            eg_io.submit(b, true);
+        }
+        st.eg_dahead += a->lookups;
+        eg_dpre.push_back(std::move(a));
+    }
+    // (eg_dpre) the rows read ahead, waited for and into the row cache (before the window's own lookups)
+    void eg_decode_ahead_end() {
+        for (auto& a : eg_dpre)
+            for (auto& b : a->b) eg_finish(*b, false);
+        eg_dpre.clear();
+    }
     // the chunked prompt path: rows of Engram layer `only` into dst, now (a helper thread, a chunk ahead)
     void engram_rows(int64_t p0, int T, int only, uint8_t* dst, bool account = true) {
         EgBatch b;
@@ -15660,6 +15700,8 @@ struct Model::Impl {
                int top_k, float min_p, uint64_t seed, uint64_t counter, int max_n, float conf_min, float cum_min,
                int min_n) {
         const double t0 = now_ms();
+        eg_decode_ahead_end();
+        eg_decode_ahead(ctoks, pos, y, y == img_tok && image_row(pos) != nullptr);
         // (with penalties the drafts are the drafter's argmax: its own draws know no history - verify() is as exact)
         drafts_q = temperature > 0.0f && sample_drafts && pen_n <= 0;
         dq_temp = temperature;
@@ -15982,6 +16024,11 @@ struct Model::Impl {
         const double t0 = now_ms();
         drafts_q = false;
         seq_park();   // (every conversation's position in sqs)
+        eg_decode_ahead_end();
+        for (int c = 0; c < n; ++c) {
+            const SeqState& q = sqs[(size_t) sv[c]];
+            eg_decode_ahead(q.ctoks, q.pos, ys[c]);
+        }
         const bool ok = draft_multi_(sv, ys, n, out, conf, err);
         seq_unpark();
         for (int c = 0; c < n && max_drafts > 0; ++c)
@@ -19423,6 +19470,7 @@ struct Model::Impl {
         // left of their reads by then is the window's Engram time
         const double te = now_ms();
         const int64_t eg_w0 = eg_wait_ns.load();
+        eg_decode_ahead_end();   // (draft()'s: the first token's rows are in the cache now)
         for (int li = 0; li < pk.eg_layers; ++li) {
             EgBatch& b = *eg_win[(size_t) li];
             if (b.live) eg_finish(b);   // (a window that failed midway: its reads end before h_eg is reused)
@@ -20699,6 +20747,7 @@ struct Model::Impl {
         bool ok = true;
         const double te = now_ms();
         const int64_t eg_w0 = eg_wait_ns.load();
+        eg_decode_ahead_end();
         for (int li = 0; li < pk.eg_layers; ++li) {
             EgBatch& b = *eg_win[(size_t) li];
             if (b.live) eg_finish(b);
