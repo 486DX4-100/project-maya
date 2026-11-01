@@ -2490,6 +2490,87 @@ struct Model::Impl {
                      kept > 0 ? (", " + std::to_string(kept >> 20) + " MiB left host-mapped (no room)").c_str() : "");
         p2p_todo.clear();
     }
+    // DS4_XFER_P2P=1: the pipeline's hand-off rows (a group's first member's h | pre | topk | cand, a chunk's and a
+    // window's) in that GPU's own memory instead of pinned host memory: the put is a local copy, the next group's
+    // members read it by peer access.  Their flags stay host-mapped.  Placed at the load's end like DS4_AR_P2P's
+    struct XfNote {
+        int dev;       // (index into devs: the sending member)
+        void** where;
+        size_t bytes;
+    };
+    std::vector<XfNote> xf_todo;
+    bool xnote(int di, uint8_t*& p, size_t bytes) {
+        static const bool want = std::getenv("DS4_XFER_P2P") != nullptr && std::atoi(std::getenv("DS4_XFER_P2P")) != 0;
+        if (want && devs[(size_t) di].mi == 0 && groups.size() > 1) xf_todo.push_back({di, (void**) &p, bytes});
+        return true;
+    }
+    void xfer_p2p_place() {
+        if (xf_todo.empty()) return;
+        int cur = 0;
+        cudaGetDevice(&cur);
+        // (the sending device -> the devices of the group of the layer after its group's last: L's group changes)
+        std::map<int, std::vector<int>> to;
+        for (int il = 0; il + 1 < g.nl; ++il)
+            if (L[(size_t) il + 1].grp != L[(size_t) il].grp)
+                for (int m = 0; m < L[(size_t) il + 1].nm; ++m) {
+                    std::vector<int>& v = to[L[(size_t) il].dev];
+                    if (std::find(v.begin(), v.end(), member(L[(size_t) il + 1], m).dev) == v.end())
+                        v.push_back(member(L[(size_t) il + 1], m).dev);
+                }
+        std::map<int, bool> peers;   // (sender: its receivers can reach it, its BAR1 is 1 GiB or more)
+        std::map<int, size_t> moved, kept;
+        for (const XfNote& n : xf_todo) {
+            const auto it = to.find(n.dev);
+            if (it == to.end()) continue;
+            const int home = devs[(size_t) n.dev].id;
+            if (!peers.count(n.dev)) {
+                // (a small BAR1 window hung the kernels' loads through it, as the all-reduce's: see gmap)
+                bool ok = bar1_bytes(home) >= ((size_t) 1 << 30);
+                for (int r : it->second) {
+                    const int rid = devs[(size_t) r].id;
+                    int can = 0;
+                    if (rid == home) continue;
+                    if (cudaDeviceCanAccessPeer(&can, rid, home) != cudaSuccess || !can) ok = false;
+                    if (!ok) continue;
+                    cudaSetDevice(rid);
+                    const cudaError_t pe = cudaDeviceEnablePeerAccess(home, 0);
+                    if (pe != cudaSuccess) (void) cudaGetLastError();
+                    if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) ok = false;
+                }
+                peers[n.dev] = ok;
+            }
+            void* v = nullptr;
+            if (peers[n.dev]) {
+                cudaSetDevice(home);
+                if (cudaMalloc(&v, n.bytes + 64) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    v = nullptr;
+                }
+            }
+            if (v == nullptr) {
+                kept[n.dev] += n.bytes;
+                continue;
+            }
+            cudaDeviceSynchronize();
+            devs[(size_t) n.dev].allocs.push_back(v);   // (freed with the GPU's others)
+            void* old = *n.where;
+            *n.where = v;
+            auto h = std::find(host_allocs.begin(), host_allocs.end(), old);
+            if (h != host_allocs.end()) host_allocs.erase(h);
+            cudaFreeHost(old);
+            moved[n.dev] += n.bytes;
+        }
+        cudaSetDevice(cur);
+        for (const auto& kv : to) {
+            std::string r;
+            for (int x : kv.second) r += (r.empty() ? "" : ",") + std::to_string(devs[(size_t) x].id);
+            std::fprintf(stderr, "ds4: DS4_XFER_P2P: hand-off CUDA%d -> CUDA%s: %s (%.1f MB in the sender's memory%s)\n",
+                         devs[(size_t) kv.first].id, r.c_str(), moved[kv.first] > 0 ? "peer-to-peer" : "host memory",
+                         moved[kv.first] / 1e6,
+                         kept[kv.first] > 0 ? (", " + std::to_string(kept[kv.first] >> 20) + " MiB left host-mapped").c_str() : "");
+        }
+        xf_todo.clear();
+    }
     template <class T>
     bool halloc(T*& p, size_t n, std::string& err) {
         void* v = nullptr;
@@ -4043,7 +4124,7 @@ struct Model::Impl {
             if ((int) di == head_dev && !dalloc(d, d.logits, (size_t) kWin * g.vocab, err)) return false;
             if (!halloc(d.bounce, bounce_bytes(), err)) return false;
             if (!dalloc(d, d.xcnt, 4, err) || !dalloc(d, d.hc_cnt, 2 * W, err) || !hmap(d.hand, bounce_bytes(), err) ||
-                !hmap(d.hand_flag, 32, err) || !dalloc(d, d.grp_ptr, P, err) || !dalloc(d, d.grp_start, P + 1, err) ||
+                !hmap(d.hand_flag, 32, err) || !xnote(di, d.hand, bounce_bytes()) || !dalloc(d, d.grp_ptr, P, err) || !dalloc(d, d.grp_start, P + 1, err) ||
                 !dalloc(d, d.grp_ent, P, err) || !dalloc(d, d.n_groups, 4, err))
                 return false;
             if (g.n_mtp > 0 && !dalloc(d, d.tap, (size_t) tap_cap * D, err)) return false;
@@ -4678,6 +4759,7 @@ struct Model::Impl {
         reset();
         blas_warm_start();
         p2p_place();
+        xfer_p2p_place();
         return true;
     }
 
@@ -5106,6 +5188,7 @@ struct Model::Impl {
             const bool hands = d.mi == 0 && groups.size() > 1;
             for (int sl = 0; sl < 2; ++sl) {
                 if (hands && (!hmap(c.hand[sl], chunk_hand_bytes(), err) || !hmap(c.hand_flag[sl], 32, err))) return false;
+                if (hands) xnote((int) di, c.hand[sl], chunk_hand_bytes());
                 if (has_first && !halloc(c.emb_host[sl], C * D, err)) return false;
                 if (has_eg && !halloc(c.eg_host[sl], C * pk.eg_layers * (size_t) cols * (ehd + ehd / 32), err)) return false;
                 CK(cudaEventCreateWithFlags(&c.emb_ev[sl], cudaEventDisableTiming));
