@@ -658,6 +658,8 @@ struct Dev {
     int mk_v0 = 0, mk_vn = 0;
     uint8_t* hand = nullptr;
     unsigned* hand_flag = nullptr;
+    uint8_t* hand1 = nullptr;   // (MAYA_DS4_MICROBATCH) the second micro-batch's hand-off
+    unsigned* hand_flag1 = nullptr;
     unsigned long long* grp_ptr = nullptr;
     int *grp_start = nullptr, *grp_ent = nullptr, *n_groups = nullptr;
     // the prompt path's borrowed room (Chunk::borrow): the last tail_k VRAM slots of each of the device's layers, one
@@ -963,12 +965,16 @@ struct Src {
     bool remote = false;
     uint8_t* x_stage = nullptr;
     unsigned* x_flag = nullptr;
+    uint8_t* x_stage_mb = nullptr;   // (MAYA_DS4_MICROBATCH) the second micro-batch's
+    unsigned* x_flag_mb = nullptr;
     // pipelined chunks: a second staging slot (slot 1; slot 0 is x_stage), its flag, and the readers' acknowledgements
     // [slot][device] (32 apart); readers: the devices outside the source's group that read it
     uint8_t* x_stage1 = nullptr;
     unsigned* x_flag1 = nullptr;
     unsigned* x_ack = nullptr;
     std::vector<int> readers;
+    uint8_t* mb_stage(int mb) const { return mb ? x_stage_mb : x_stage; }
+    unsigned* mb_flag(int mb) const { return mb ? x_flag_mb : x_flag; }
     uint8_t* stage(int slot) const { return slot ? x_stage1 : x_stage; }
     unsigned* flag(int slot) const { return slot ? x_flag1 : x_flag; }
 };
@@ -1048,6 +1054,9 @@ constexpr int kMaxL = 64;   // layers (the trunk's and the drafter's) a window p
 struct WinPlan {
     bool par = false, async = false;
     unsigned win = 0;
+    int r0 = 0;             // (micro-batch) the plan's first row among the step's: the shared row buffers' offset
+    bool mb = false;        // (micro-batch) a part of a step's rows
+    int slot = 0;           // (micro-batch) the hand-off buffer set (0: the usual, 1: the second micro-batch's)
     int k = 0;              // (a run of chunks) the chunk's index: its hand-off slot k % 2
     // (a run of chunks) the chunk's rows whose states before them the layers keep: row snap_t[i] into the layers'
     // snapshot set snap_ix[i], in row order
@@ -1594,6 +1603,18 @@ struct Model::Impl {
     unsigned* lane_done = nullptr;
     bool self_answer = std::getenv("DS4_SELF_ANSWER") == nullptr || std::atoi(std::getenv("DS4_SELF_ANSWER")) != 0;
     unsigned seq_issued = 0;
+    // MAYA_DS4_MICROBATCH=2: a plain multi step's rows in two micro-batches pipelined through the groups
+    int mb_n = [] {
+        const char* v = std::getenv("STRATA_DS4_MICROBATCH");
+        if (v == nullptr) v = std::getenv("MAYA_DS4_MICROBATCH");
+        if (v == nullptr) v = std::getenv("DS4_MICROBATCH");
+        return v != nullptr ? std::atoi(v) : 0;
+    }();
+    bool hand_ready_mb() const {   // (the second hand-off buffers exist)
+        return !devs.empty() && devs[0].hand1 != nullptr;
+    }
+    bool plan_noseq = false;   // (plan_window leaves the mailbox seqs to the micro-batch plans)
+    WinPlan mbplan[2];
     std::atomic<int> layer_of[kRing];
     std::thread service;
     std::atomic<bool> quit{false};
@@ -4144,7 +4165,8 @@ struct Model::Impl {
             if ((int) di == head_dev && !dalloc(d, d.logits, (size_t) kWin * g.vocab, err)) return false;
             if (!halloc(d.bounce, bounce_bytes(), err)) return false;
             if (!dalloc(d, d.xcnt, 4, err) || !dalloc(d, d.hc_cnt, 2 * W, err) || !hmap(d.hand, bounce_bytes(), err) ||
-                !hmap(d.hand_flag, 32, err) || !xnote(di, d.hand, bounce_bytes()) || !dalloc(d, d.grp_ptr, P, err) || !dalloc(d, d.grp_start, P + 1, err) ||
+                !hmap(d.hand_flag, 32, err) || !xnote(di, d.hand, bounce_bytes()) ||
+                (mb_n > 1 && (!hmap(d.hand1, bounce_bytes(), err) || !hmap(d.hand_flag1, 32, err) || !xnote(di, d.hand1, bounce_bytes()))) || !dalloc(d, d.grp_ptr, P, err) || !dalloc(d, d.grp_start, P + 1, err) ||
                 !dalloc(d, d.grp_ent, P, err) || !dalloc(d, d.n_groups, 4, err))
                 return false;
             if (g.n_mtp > 0 && !dalloc(d, d.tap, (size_t) tap_cap * D, err)) return false;
@@ -4172,6 +4194,8 @@ struct Model::Impl {
         }
         for (Src& sr : srcs) {
             if (sr.remote && (!hmap(sr.x_stage, x_cap() * (ckv_rb() + ik_rb()), err) || !hmap(sr.x_flag, 32, err)))
+                return false;
+            if (sr.remote && mb_n > 1 && (!hmap(sr.x_stage_mb, x_cap() * (ckv_rb() + ik_rb()), err) || !hmap(sr.x_flag_mb, 32, err)))
                 return false;
             if (sr.remote && chunk > 0 &&
                 (!hmap(sr.x_stage1, x_cap() * (ckv_rb() + ik_rb()), err) || !hmap(sr.x_flag1, 32, err) ||
@@ -19337,6 +19361,10 @@ struct Model::Impl {
             }
             wp.seq[il] = 0;
             if (wp.async && !host_free(l)) {
+                if (plan_noseq) {
+                    wp.seq[il] = 1;   // (a mark: the micro-batch plans number it)
+                    continue;
+                }
                 wp.seq[il] = ++seq_issued;
                 layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
             }
@@ -19362,13 +19390,13 @@ struct Model::Impl {
     // slots by seq (Vmax apart, the widest share's), a member reusing one once the lead acknowledged it.  gather
     // false: each member keeps its share (the drafter's markov steps over the group, mk_split)
     // (r0: the rows from r0 of xn and of the logits - a lone head's, the drafter's lazy one)
-    bool head_share(Dev& d, int mi, const float* xn, int rows, std::string& err, bool gather = true, int r0 = 0) {
+    bool head_share(Dev& d, int mi, const float* xn, int rows, std::string& err, bool gather = true, int r0 = 0, int orow = 0) {
         const int V = g.vocab, D = g.dim, nm = head_nm();
         int v0 = 0, vn = 0, Vmax = 0, z = 0;
         head_cols(nm, mi, v0, vn);
         head_cols(nm, 0, z, Vmax);
         Group& G = groups[(size_t) d.grp];
-        float* out = mi == 0 ? d.logits : d.logits_part;
+        float* out = mi == 0 ? d.logits + (size_t) orow * V : d.logits_part;   // (orow: micro-batch, its rows' place in the logits)
         const size_t ld = mi == 0 ? (size_t) V : (size_t) vn;
         cudaSetDevice(d.id);
         // (an EXL3 head: as many activations at a time as its split-K partials fit the scratch - 8 for a shared head, 4
@@ -19405,7 +19433,7 @@ struct Model::Impl {
             x.dst[0] = d.logits_part;
             x.bytes[0] = (size_t) rows * mn * 4;
             xfer_get(x, flag(m), seq, d.st);
-            CK(cudaMemcpy2DAsync(d.logits + (size_t) m0, (size_t) V * 4, d.logits_part, (size_t) mn * 4,
+            CK(cudaMemcpy2DAsync(d.logits + (size_t) orow * V + (size_t) m0, (size_t) V * 4, d.logits_part, (size_t) mn * 4,
                                  (size_t) mn * 4, (size_t) rows, cudaMemcpyDeviceToDevice, d.st));
         }
         set_flag(G.lg_ack + (size_t) slot * 32, seq, d.st);
@@ -19413,19 +19441,20 @@ struct Model::Impl {
     }
 
     // the head's rows (the last n_logits of the window) on head group member di (its h / pre: the group's)
-    bool head_rows_dev(int di, int T, std::string& err) {
+    bool head_rows_dev(int di, int T, std::string& err, int nl = -1, int orow = 0) {
         Dev& d = devs[(size_t) di];
         cudaSetDevice(d.id);
         const int D = g.dim, H = g.hc;
-        if (n_logits <= 0) return true;
-        const int t0 = T - n_logits;
-        hc_pre_norm(d.h + (size_t) t0 * H * D, d.pre + (size_t) t0 * 8, d.norm_w, D, H, n_logits, g.eps, d.x, d.st);
-        return head_share(d, d.mi, d.x, n_logits, err);
+        if (nl < 0) nl = n_logits;
+        if (nl <= 0) return true;
+        const int t0 = T - nl;
+        hc_pre_norm(d.h + (size_t) t0 * H * D, d.pre + (size_t) t0 * 8, d.norm_w, D, H, nl, g.eps, d.x, d.st);
+        return head_share(d, d.mi, d.x, nl, err, true, 0, orow);
     }
 
     // the DSpark drafter's taps: the streams' mean entering target layer il, on device d (after the last seeding read
     // h_taps)
-    bool tap(Dev& d, int il, int T, std::string& err) {
+    bool tap(Dev& d, int il, int T, std::string& err, int r0 = 0) {
         const auto it = std::find(g.d_targets.begin(), g.d_targets.end(), il);
         if (g.n_mtp == 0 || it == g.d_targets.end()) return true;
         const size_t j = (size_t) (it - g.d_targets.begin()), nt = g.d_targets.size();
@@ -19433,8 +19462,8 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         hc_mean(d.h, T, g.hc, D, d.tap, D, d.st);
         if (!wait_seed(d.st, err)) return false;
-        CK(cudaMemcpy2DAsync(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4, (size_t) T,
-                             cudaMemcpyDeviceToHost, d.st));
+        CK(cudaMemcpy2DAsync(h_taps + (size_t) r0 * nt * D + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4,
+                             (size_t) T, cudaMemcpyDeviceToHost, d.st));
         return true;
     }
 
@@ -19585,6 +19614,78 @@ struct Model::Impl {
         return true;
     }
 
+    // MAYA_DS4_MICROBATCH: a plain multi step's rows (wplan's, planned whole, mailbox seqs not yet numbered) as two
+    // micro-batches, A the first ta rows and B the rest, through the groups pipelined: each device's thread enqueues
+    // A's layers then B's on its stream, so group g+1 runs A while group g runs B.  The two have their own hand-off
+    // buffers (slot 0 / 1) and win seqs, their rows' places in the shared row buffers (r0), and the mailbox seqs are
+    // numbered in the order the pipeline will publish them (the service thread answers in seq order): A's first group,
+    // then B's first with A's second layer by layer, and so on - any order that keeps each micro-batch's layers in
+    // order and B's behind A's on a stream cannot deadlock
+    bool forward_mb(int ta, int T, std::string& err) {
+        const int tb = T - ta;
+        const int ts[2] = {ta, tb};
+        for (int m = 0; m < 2; ++m) {
+            WinPlan& w = mbplan[m];
+            w.par = wplan.par;
+            w.async = wplan.async;
+            w.vl = wplan.vl;
+            w.mb = true;
+            w.slot = m;
+            w.r0 = m == 0 ? 0 : ta;
+            w.nrow = ts[m];
+            for (int t = 0; t < ts[m]; ++t) {
+                w.rseq[t] = wplan.rseq[w.r0 + t];
+                w.rpos[t] = wplan.rpos[w.r0 + t];
+            }
+            for (int il = 0; il < g.nl; ++il)
+                for (int t = 0; t < ts[m]; ++t) {
+                    w.topk[il][t] = wplan.topk[il][w.r0 + t];
+                    w.cand[il][t] = wplan.cand[il][w.r0 + t];
+                }
+            for (int il = 0; il < kMaxL; ++il) w.seq[il] = 0;
+        }
+        // the groups' layers (the ones with a mailbox seq), in order
+        std::vector<std::vector<int>> gl;
+        for (int il = 0; il < g.nl; ++il) {
+            if (il == 0 || L[(size_t) il].grp != L[(size_t) il - 1].grp) gl.emplace_back();
+            if (wplan.seq[il] != 0) gl.back().push_back(il);
+        }
+        auto issue = [&](int m, int il) {
+            const unsigned sq = ++seq_issued;
+            mbplan[m].seq[il] = sq;
+            layer_of[sq % kRing].store(il, std::memory_order_release);
+        };
+        const int ng = (int) gl.size();
+        for (int k = 0; k <= ng; ++k) {
+            const std::vector<int> empty;
+            const std::vector<int>& X = k >= 1 ? gl[(size_t) k - 1] : empty;   // B's layers of group k - 1
+            const std::vector<int>& Y = k < ng ? gl[(size_t) k] : empty;       // A's layers of group k
+            size_t i = 0, j = 0;
+            while (i < X.size() || j < Y.size()) {
+                const bool takeX = j >= Y.size() || (i < X.size() && (i + 1) * Y.size() <= (j + 1) * X.size());
+                if (takeX) issue(1, X[i++]);
+                else issue(0, Y[j++]);
+            }
+        }
+        mbplan[0].win = ++win_seq;
+        mbplan[1].win = ++win_seq;
+        win_now.store(mbplan[1].win, std::memory_order_release);
+        std::vector<std::string> errs(devs.size());
+        for (size_t di = 0; di < devs.size(); ++di)
+            workers[di]->submit([this, di, ta, tb, &errs] {
+                std::string e;
+                if (!run_dev((int) di, 0, ta, mbplan[0], e, false) || !run_dev((int) di, 0, tb, mbplan[1], e, true))
+                    errs[di] = e.empty() ? "a device's thread failed" : e;
+            });
+        for (auto& w : workers) w->wait();
+        for (const std::string& e : errs)
+            if (!e.empty()) {
+                err = e;
+                return false;
+            }
+        return true;
+    }
+
     // the hand-off between groups: h | pre | topk | cand of device d <-> the host-mapped buffer
     Xfer hand_xfer(uint8_t* host, Dev& d, int T, bool put) const {
         const size_t nh = (size_t) T * g.hc * g.dim * 4, np = (size_t) T * 8 * 4, nk = (size_t) T * topk_stride() * 4,
@@ -19602,7 +19703,7 @@ struct Model::Impl {
         return x;
     }
 
-    bool run_dev(int di, int64_t p0, int T, const WinPlan& wp, std::string& err) {
+    bool run_dev(int di, int64_t p0, int T, const WinPlan& wp, std::string& err, bool last_mb = true) {
         Dev& d = devs[(size_t) di];
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
@@ -19618,12 +19719,12 @@ struct Model::Impl {
             if (!started) {   // the window's input: the embedding rows, or the previous group's hand-off
                 started = true;
                 if (il == 0) {
-                    CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
+                    CK(cudaMemcpyAsync(d.emb_rows, h_emb + (size_t) wp.r0 * D, (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
                     embed(d.emb_rows, T, d.h, D, H, s);
                     init_pre(d.pre, T, s);
                 } else {
                     const Dev& a = devs[(size_t) L[(size_t) il - 1].dev];
-                    xfer_get(hand_xfer(a.hand, d, T, false), a.hand_flag, wp.win, s);
+                    xfer_get(hand_xfer(wp.slot ? a.hand1 : a.hand, d, T, false), wp.slot ? a.hand_flag1 : a.hand_flag, wp.win, s);
                 }
             }
             // the compressed KV / index keys another group's source layer wrote this window
@@ -19652,14 +19753,17 @@ struct Model::Impl {
                 }
                 if (x.n > 0) xfer_get(x, sr.x_flag, wp.win, s);
             }
-            if (mi == 0 && !tap(d, il, T, err)) return false;
+            if (mi == 0 && !tap(d, il, T, err, wp.r0)) return false;
             if (!layer(L0, mi, p0, T, wp, err)) return false;
             if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, il, p0, T);
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
-            if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
+            if (last && mi == 0 && il + 1 < g.nl)
+                xfer_put(hand_xfer(wp.slot ? d.hand1 : d.hand, d, T, true), wp.slot ? d.hand_flag1 : d.hand_flag, wp.win, d.xcnt, s);
         }
-        if (d.grp == devs[(size_t) head_dev].grp && !head_rows_dev(di, T, err)) return false;
-        if (!idle_ev.empty()) {   // (its turn over: the expert cache's copies from here, copy_open)
+        if (d.grp == devs[(size_t) head_dev].grp &&
+            !(wp.mb ? head_rows_dev(di, T, err, T, wp.r0) : head_rows_dev(di, T, err)))
+            return false;
+        if (last_mb && !idle_ev.empty()) {   // (its turn over: the expert cache's copies from here, copy_open)
             CK(cudaEventRecord(idle_ev[(size_t) di], s));
             idle_win[(size_t) di].store(wp.win, std::memory_order_release);
         }
@@ -20122,16 +20226,16 @@ struct Model::Impl {
         if (j == 0) return true;
         Xfer x;
         x.src[0] = d.mstage;
-        x.dst[0] = sr.x_stage;
+        x.dst[0] = sr.mb_stage(wp.slot);
         x.bytes[0] = (size_t) j * ckv_rb();
         x.n = 1;
         if (with_ik) {
             x.src[1] = d.mstage + (size_t) kWin * ckv_rb();
-            x.dst[1] = sr.x_stage + x_cap() * ckv_rb();
+            x.dst[1] = sr.mb_stage(wp.slot) + x_cap() * ckv_rb();
             x.bytes[1] = (size_t) j * ik_rb();
             x.n = 2;
         }
-        xfer_put(x, sr.x_flag, wp.win, d.xcnt, s);
+        xfer_put(x, sr.mb_flag(wp.slot), wp.win, d.xcnt, s);
         return true;
     }
     // ... and on a reader of source sidx (device di): the rows multi_put gathered, each to its conversation's copy
@@ -20145,17 +20249,17 @@ struct Model::Impl {
         if (j == 0) return true;
         Xfer x;
         if (sr.ckv[(size_t) di] != nullptr) {
-            x.src[x.n] = sr.x_stage;
+            x.src[x.n] = sr.mb_stage(wp.slot);
             x.dst[x.n] = d.mstage;
             x.bytes[x.n++] = (size_t) j * ckv_rb();
         }
         if (sr.ik[(size_t) di] != nullptr) {
-            x.src[x.n] = sr.x_stage + x_cap() * ckv_rb();
+            x.src[x.n] = sr.mb_stage(wp.slot) + x_cap() * ckv_rb();
             x.dst[x.n] = d.mstage + (size_t) kWin * ckv_rb();
             x.bytes[x.n++] = (size_t) j * ik_rb();
         }
         if (x.n == 0) return true;
-        xfer_get(x, sr.x_flag, wp.win, s);
+        xfer_get(x, sr.mb_flag(wp.slot), wp.win, s);
         j = 0;
         for (int t = 0; t < wp.nrow; ++t) {
             const int64_t p = wp.rpos[t];
@@ -20201,7 +20305,7 @@ struct Model::Impl {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
             const size_t per = (size_t) cols * (ehd + ehd / 32);
             eg_finish(*eg_win[(size_t) l.eg]);   // (asked for when the window began)
-            uint8_t* src = h_eg + (size_t) l.eg * eg_cap * per;
+            uint8_t* src = h_eg + ((size_t) l.eg * eg_cap + (size_t) wp.r0) * per;
             for (int t = 0; t < T; ++t)   // [token][rows | scales] -> [all rows][all scales]
                 CK(cudaMemcpyAsync(d.eg_rows + (size_t) t * cols * ehd, src + (size_t) t * per, (size_t) cols * ehd,
                                    cudaMemcpyHostToDevice, s));
@@ -20759,14 +20863,18 @@ struct Model::Impl {
         const int D = g.dim;
         for (int t = 0; t < T; ++t)
             std::memcpy(h_emb + (size_t) t * D, embed_pinned + (size_t) tk[t] * D, (size_t) D * 2);
+        bool use_mb = mb_n > 1 && par && !spec && n >= 4 && helper_n == 0 && hand_ready_mb();
+        for (int i = 0; use_mb && i < n; ++i) use_mb = lens[i] == 1;
+        plan_noseq = use_mb;
         plan_window(0, T, wp);
-        if (helper_n > 0 && wp.async) helper_window(T, wp);
+        plan_noseq = false;
+        if (!use_mb && helper_n > 0 && wp.async) helper_window(T, wp);
         prof_window = prof_on && !spec;   // (DS4_PROF: the N-row window's per-device time too)
         n_logits = T;
         logits_all = false;
         const double tl = now_ms();
         spec_win = spec;
-        ok = par ? forward_par(0, T, err) : forward_serial(0, T, err);
+        ok = use_mb ? forward_mb((T + 1) / 2, T, err) : par ? forward_par(0, T, err) : forward_serial(0, T, err);
         spec_win = false;
         st.layer_ms += now_ms() - tl;
         if (spec) st.verify_ms += now_ms() - tl;

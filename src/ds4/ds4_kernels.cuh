@@ -341,7 +341,7 @@ void combine(const float* ed, const float* cpu, const float* sh, const Combine& 
 /// The mailboxes of a small window (decode, a draft's verification, the drafter's block): host-mapped memory, a ring of
 /// kRing.  The device publishes a layer's routing and its FFN inputs for the window's T tokens (seq written last, after
 /// a system fence); the host answers with the CPU lane's weighted part of each token that took a CPU-lane expert.
-constexpr int kRing = 64;
+constexpr int kRing = 128;   // (was 64: MAYA_DS4_MICROBATCH has two windows' ~86 requests in flight)
 constexpr int kMaxDim = 8192;
 constexpr int kAhead1 = 16, kAhead = kAhead1 + kPicks;   // a token's guesses for the next layer, then the one after
 struct Req {
