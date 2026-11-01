@@ -16001,8 +16001,19 @@ struct Model::Impl {
     // conversation) - and the trunk's head for all of them; then each conversation's markov chain and confidences, as
     // draft_() makes them for one.  The drafter's argmax only (no sampled drafts).  draft_() itself is not used here:
     // one conversation drafts exactly as before.
-    bool can_draft_multi(const int* sv, int n) const {
+    // the block rows a conversation takes in an n-conversation pass: the drafter's block, or (MAYA_DS4_MULTI_DRAFT_T=t,
+    // opt-in) the longest block <= t that still fits kWin rows for n conversations - n=4: 3 drafts a conversation
+    int multi_t(int n) const {
         const int T = g.d_block;
+        if (n * T <= kWin && n * (T + 1) <= kWin + 2) return T;
+        static const int cap = std::getenv("MAYA_DS4_MULTI_DRAFT_T") ? std::atoi(std::getenv("MAYA_DS4_MULTI_DRAFT_T")) : 0;
+        if (cap <= 0 || n < 1) return T;
+        int t = std::min(T, cap);
+        while (t > 1 && (n * t > kWin || n * (t + 1) > kWin + 2)) --t;
+        return t;
+    }
+    bool can_draft_multi(const int* sv, int n) const {
+        const int T = multi_t(n);
         if (g.n_mtp == 0 || sqs.empty() || n < 2 || T < 1 || n * T > kWin || n * (T + 1) > kWin + 2 ||
             dump_d != nullptr || lend_broken)
             return false;
@@ -16042,7 +16053,7 @@ struct Model::Impl {
     }
     bool draft_multi_(const int* sv, const int* ys, int n, std::vector<std::vector<int>>& out,
                       std::vector<std::vector<float>>& conf, std::string& err) {
-        const int T = g.d_block, D = g.dim, H = g.hc, V = g.vocab, R = g.d_rank, NR = n * T;
+        const int T = multi_t(n), D = g.dim, H = g.hc, V = g.vocab, R = g.d_rank, NR = n * T;
         WinPlan dp;   // (the rows: conversation sv[c]'s block at rows c * T .., its positions pos ..)
         dp.nrow = NR;
         int tk[kWin];
